@@ -4,6 +4,7 @@
 # For multiple programs using a single source file each,
 # we can just define 'progs' and create custom targets.
 PROGS	=	pkt-gen nmreplay bridge lb
+BINDIR	=	/usr/local/sbin
 
 CLEANFILES = $(PROGS) *.o
 MAN=
@@ -34,3 +35,8 @@ nmreplay: nmreplay.o
 
 lb: lb.o pkt_hash.o
 	$(CC) $(CFLAGS) -o lb lb.o pkt_hash.o $(LDFLAGS)
+
+install: ${PROGS}
+	for i in ${PROGS}; do \
+		install $$i ${DESTDIR}${BINDIR}; \
+	done
