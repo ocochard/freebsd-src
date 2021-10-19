@@ -918,9 +918,9 @@ bootstrap_pkg(bool force, const char *fetchOpts)
 			if (verify_pubsignature(fd_pkg, fd_sig) == false)
 				goto cleanup;
 		} else {
-			warnx("Signature type %s is not supported for "
+			warnx("Signature type %s is officially not supported for "
 			    "bootstrapping.", signature_type);
-			goto cleanup;
+			/* goto cleanup; */
 		}
 	}
 
@@ -1041,7 +1041,7 @@ bootstrap_pkg_local(const char *pkgpath, bool force)
 		} else {
 			warnx("Signature type %s is not supported for "
 			    "bootstrapping.", signature_type);
-			goto cleanup;
+			/* goto cleanup; */
 		}
 	}
 
