@@ -375,6 +375,7 @@ main(int argc, char *argv[])
 	int			 ch, fd, quiet = 0, i = 0;
 	int			 pipe_fd[2];
 	int			 immediate_daemon = 0;
+	uint32_t	  	 fib = 0;
 	struct passwd		*pw;
 	pid_t			 otherpid;
 	cap_rights_t		 rights;
@@ -395,6 +396,9 @@ main(int argc, char *argv[])
 			break;
 		case 'd':
 			no_daemon = 1;
+			break;
+		case 'f':
+			fib = atoi(optarg);
 			break;
 		case 'l':
 			path_dhclient_db = optarg;
@@ -444,6 +448,7 @@ main(int argc, char *argv[])
 	if (quiet)
 		log_perror = 0;
 
+	ifi->fib = fib;
 	tzset();
 	time(&cur_time);
 
@@ -575,7 +580,7 @@ usage(void)
 {
 
 	fprintf(stderr, "usage: %s [-bdqu] ", getprogname());
-	fprintf(stderr, "[-c conffile] [-l leasefile] interface\n");
+	fprintf(stderr, "[-c conffile] [-l leasefile] [-f fib] interface\n");
 	exit(1);
 }
 

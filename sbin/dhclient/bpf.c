@@ -180,6 +180,8 @@ if_register_send(struct interface_info *info)
 	if (setsockopt(sock, IPPROTO_IP, IP_HDRINCL, &on,
 	    sizeof(on)) == -1)
 		error("setsockopt(IP_HDRINCL): %m");
+	if (setsockopt(sock, SOL_SOCKET, SO_SETFIB, &info->fib, sizeof(info->fib)))
+		error("setsockopt(SOL_SOCKET, SO_SETFIB): %m");
 	info->ufdesc = sock;
 }
 

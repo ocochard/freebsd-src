@@ -216,6 +216,7 @@ struct interface_info {
 	int			 dead;
 	u_int16_t		 index;
 	int			 linkstat;
+	uint32_t	 	 fib;
 };
 
 struct timeout {
