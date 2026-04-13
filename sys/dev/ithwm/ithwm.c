@@ -121,7 +121,6 @@
 /* ------------------------------------------------------------------ */
 
 struct ithwm_softc {
-	device_t	dev;
 	struct resource	*io_res;
 	int		io_rid;
 	struct mtx	lock;
@@ -135,6 +134,7 @@ struct ithwm_softc {
 static uint8_t
 ithwm_readb(struct ithwm_softc *sc, uint8_t reg)
 {
+	mtx_assert(&sc->lock, MA_OWNED);
 	bus_write_1(sc->io_res, ITHWM_PORT_ADDR, reg);
 	return (bus_read_1(sc->io_res, ITHWM_PORT_DATA));
 }
@@ -160,8 +160,8 @@ ithwm_sysctl_temp(SYSCTL_HANDLER_ARGS)
 		ITHWM_REG_TEMP1, ITHWM_REG_TEMP2, ITHWM_REG_TEMP3
 	};
 
-	if (idx < 0 || idx >= ITHWM_NTEMPS)
-		return (EINVAL);
+	KASSERT(idx >= 0 && idx < ITHWM_NTEMPS,
+	    ("%s: idx %d out of range", __func__, idx));
 
 	mtx_lock(&sc->lock);
 	raw = (int8_t)ithwm_readb(sc, regs[idx]);
@@ -198,8 +198,8 @@ ithwm_sysctl_fan(SYSCTL_HANDLER_ARGS)
 	/* Divisor bits: fan1=bits[1:0], fan2=bits[3:2], fan3=bits[5:4] */
 	static const int divshift[ITHWM_NFANS] = { 0, 2, 4 };
 
-	if (idx < 0 || idx >= ITHWM_NFANS)
-		return (EINVAL);
+	KASSERT(idx >= 0 && idx < ITHWM_NFANS,
+	    ("%s: idx %d out of range", __func__, idx));
 
 	mtx_lock(&sc->lock);
 	lo = ithwm_readb(sc, lregs[idx]);
@@ -243,8 +243,8 @@ ithwm_sysctl_vin(SYSCTL_HANDLER_ARGS)
 		ITHWM_REG_VIN6, ITHWM_REG_VIN7, ITHWM_REG_VBAT
 	};
 
-	if (idx < 0 || idx > ITHWM_NVINS)
-		return (EINVAL);
+	KASSERT(idx >= 0 && idx <= ITHWM_NVINS,
+	    ("%s: idx %d out of range", __func__, idx));
 
 	mtx_lock(&sc->lock);
 	raw = ithwm_readb(sc, regs[idx]);
@@ -281,7 +281,6 @@ ithwm_attach(device_t dev)
 	char		name[8];
 
 	sc = device_get_softc(dev);
-	sc->dev = dev;
 
 	iobase = superio_get_iobase(dev);
 	if (iobase == 0 || iobase == 0xffff) {
@@ -304,13 +303,19 @@ ithwm_attach(device_t dev)
 	    &sc->io_rid, RF_ACTIVE);
 	if (sc->io_res == NULL) {
 		device_printf(dev, "can't map I/O space at 0x%x\n", iobase);
+		bus_delete_resource(dev, SYS_RES_IOPORT, sc->io_rid);
 		return (ENXIO);
 	}
 
 	mtx_init(&sc->lock, "ithwm", NULL, MTX_DEF);
 
-	/* Detect 16-bit tachometer mode from configuration register */
-	cfg = ithwm_readb(sc, ITHWM_REG_CFG);
+	/*
+	 * Detect 16-bit tachometer mode from the configuration register.
+	 * Read directly without ithwm_readb() since no concurrent access
+	 * is possible during attach.
+	 */
+	bus_write_1(sc->io_res, ITHWM_PORT_ADDR, ITHWM_REG_CFG);
+	cfg = bus_read_1(sc->io_res, ITHWM_PORT_DATA);
 	sc->tach16 = (cfg & ITHWM_CFG_TACH16) != 0;
 
 	if (bootverbose)
@@ -357,10 +362,16 @@ ithwm_detach(device_t dev)
 {
 	struct ithwm_softc *sc = device_get_softc(dev);
 
+	/*
+	 * Remove all sysctl OIDs and drain any handler that is currently
+	 * running before tearing down the hardware.  After this returns,
+	 * no sysctl handler can execute or will ever run again for this
+	 * device, so it is safe to destroy the mutex and release resources.
+	 */
+	sysctl_ctx_free(device_get_sysctl_ctx(dev));
+
 	mtx_destroy(&sc->lock);
-	if (sc->io_res != NULL)
-		bus_release_resource(dev, SYS_RES_IOPORT, sc->io_rid,
-		    sc->io_res);
+	bus_release_resource(dev, SYS_RES_IOPORT, sc->io_rid, sc->io_res);
 	return (0);
 }
 
