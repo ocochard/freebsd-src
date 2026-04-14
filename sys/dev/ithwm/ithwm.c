@@ -135,7 +135,7 @@ ithwm_sysctl_temp(SYSCTL_HANDLER_ARGS)
 	int		idx = arg2;
 	int8_t		raw;
 	int		val;
-	static const uint8_t regs[ITHWM_NTEMPS] = {
+	const uint8_t regs[ITHWM_NTEMPS] = {
 		ITHWM_REG_TEMP1, ITHWM_REG_TEMP2, ITHWM_REG_TEMP3
 	};
 
@@ -168,14 +168,14 @@ ithwm_sysctl_fan(SYSCTL_HANDLER_ARGS)
 	unsigned int	rpm;
 	uint8_t		lo, hi, divbyte;
 	int		divisor;
-	static const uint8_t lregs[ITHWM_NFANS] = {
+	const uint8_t lregs[ITHWM_NFANS] = {
 		ITHWM_REG_FAN1_L, ITHWM_REG_FAN2_L, ITHWM_REG_FAN3_L
 	};
-	static const uint8_t hregs[ITHWM_NFANS] = {
+	const uint8_t hregs[ITHWM_NFANS] = {
 		ITHWM_REG_FAN1_H, ITHWM_REG_FAN2_H, ITHWM_REG_FAN3_H
 	};
 	/* Divisor bits: fan1=bits[1:0], fan2=bits[3:2], fan3=bits[5:4] */
-	static const int divshift[ITHWM_NFANS] = { 0, 2, 4 };
+	const int divshift[ITHWM_NFANS] = { 0, 2, 4 };
 
 	KASSERT(idx >= 0 && idx < ITHWM_NFANS,
 	    ("%s: idx %d out of range", __func__, idx));
@@ -216,7 +216,7 @@ ithwm_sysctl_vin(SYSCTL_HANDLER_ARGS)
 	int		idx = arg2;
 	unsigned int	mv;
 	uint8_t		raw;
-	static const uint8_t regs[ITHWM_NVINS + 1] = {
+	const uint8_t regs[ITHWM_NVINS + 1] = {
 		ITHWM_REG_VIN0, ITHWM_REG_VIN1, ITHWM_REG_VIN2,
 		ITHWM_REG_VIN3, ITHWM_REG_VIN4, ITHWM_REG_VIN5,
 		ITHWM_REG_VIN6, ITHWM_REG_VIN7, ITHWM_REG_VBAT

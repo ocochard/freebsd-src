@@ -1,0 +1,86 @@
+.\" SPDX-License-Identifier: BSD-2-Clause
+.\"
+.\" Copyright (c) 2024 Olivier Cochard
+.\"
+.Dd April 14, 2026
+.Dt ITHWM 4
+.Os
+.Sh NAME
+.Nm ithwm
+.Nd hardware monitor driver for ITE IT87xx Super I/O chips
+.Sh SYNOPSIS
+To compile this driver into the kernel, place the following lines in your
+kernel configuration file:
+.Bd -ragged -offset indent
+.Cd "device superio"
+.Cd "device ithwm"
+.Ed
+.Pp
+Alternatively, to load the driver as a module at boot time, place the following
+line in
+.Xr loader.conf 5 :
+.Bd -literal -offset indent
+ithwm_load="YES"
+.Ed
+.Sh DESCRIPTION
+The
+.Nm
+driver exposes temperature sensors, fan speed counters, and voltage inputs
+on the hardware monitor logical device (LDN 4) of ITE IT87xx Super I/O chips
+via
+.Xr sysctl 8 .
+.Pp
+Register access uses the 8-byte I/O window provided by the
+.Xr superio 4
+bus via an index/data port pair.
+The driver auto-detects whether the chip operates in 16-bit or 8-bit
+tachometer mode from the hardware configuration register.
+.Pp
+The
+.Nm
+driver supports the following chips:
+.Pp
+.Bl -bullet -compact
+.It
+ITE IT8613E
+.El
+.Sh SYSCTL VARIABLES
+The following read-only
+.Xr sysctl 8
+variables are provided under
+.Va dev.ithwm.<unit> :
+.Bl -tag -width indent
+.It Va temp0 , temp1 , temp2
+Temperature sensor readings in degrees Celsius, reported using the
+.Dq IK
+(decikelvin) sysctl format as used by
+.Xr amdtemp 4
+and
+.Xr lm75 4 .
+.It Va fan0 , fan1 , fan2
+Fan tachometer readings in RPM.
+A value of 0 indicates a stalled or absent fan.
+.It Va vin0 Ns .. Ns Va vin7
+Voltage input readings in millivolts.
+Each ADC LSB represents approximately 16 mV.
+On-board voltage dividers for higher-voltage rails are board-specific;
+raw scaled millivolt values are reported.
+.It Va vbat
+Battery voltage in millivolts.
+.El
+.Sh SEE ALSO
+.Xr amdtemp 4 ,
+.Xr itwd 4 ,
+.Xr lm75 4 ,
+.Xr superio 4 ,
+.Xr sysctl 8
+.Sh HISTORY
+The
+.Nm
+driver first appeared in
+.Fx 15.0 .
+.Sh AUTHORS
+The
+.Nm
+driver was written by
+.An Olivier Cochard Aq Mt olivier@FreeBSD.org .

@@ -273,6 +273,7 @@ MAN=	aac.4 \
 	isp.4 \
 	ispfw.4 \
 	${_itwd.4} \
+	ithwm.4 \
 	iwi.4 \
 	iwifw.4 \
 	iwm.4 \
