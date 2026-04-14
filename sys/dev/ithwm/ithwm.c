@@ -1,7 +1,7 @@
 /*-
  * SPDX-License-Identifier: BSD-2-Clause
  *
- * Copyright (c) 2024 Olivier Cochard
+ * Copyright (c) 2026 Olivier Cochard
  */
 
 /*
