@@ -1,6 +1,7 @@
-.\" SPDX-License-Identifier: BSD-2-Clause
 .\"
 .\" Copyright (c) 2024 Olivier Cochard
+.\"
+.\" SPDX-License-Identifier: BSD-2-Clause
 .\"
 .Dd April 14, 2026
 .Dt ITHWM 4
@@ -9,36 +10,31 @@
 .Nm ithwm
 .Nd hardware monitor driver for ITE IT87xx Super I/O chips
 .Sh SYNOPSIS
-To compile this driver into the kernel, place the following lines in your
-kernel configuration file:
-.Bd -ragged -offset indent
 .Cd "device superio"
 .Cd "device ithwm"
-.Ed
-.Pp
-Alternatively, to load the driver as a module at boot time, place the following
-line in
-.Xr loader.conf 5 :
-.Bd -literal -offset indent
-ithwm_load="YES"
-.Ed
 .Sh DESCRIPTION
 The
 .Nm
 driver exposes temperature sensors, fan speed counters, and voltage inputs
-on the hardware monitor logical device (LDN 4) of ITE IT87xx Super I/O chips
+from the hardware monitor logical device (LDN 4) of ITE IT87xx Super I/O chips
 via
 .Xr sysctl 8 .
+.Pp
+To load the driver as a module at boot time, add the following line to
+.Xr loader.conf 5 :
+.Bd -literal -offset indent
+ithwm_load="YES"
+.Ed
 .Pp
 Register access uses the 8-byte I/O window provided by the
 .Xr superio 4
 bus via an index/data port pair.
 The driver auto-detects whether the chip operates in 16-bit or 8-bit
 tachometer mode from the hardware configuration register.
-.Pp
+.Sh HARDWARE
 The
 .Nm
-driver supports the following chips:
+driver supports the following Super I/O hardware monitor chips:
 .Pp
 .Bl -bullet -compact
 .It
