@@ -620,6 +620,13 @@ device		amdtemp
 device		ithwm
 
 #
+# Power sensors:
+#
+# amdpower: RAPL power sensors on AMD Family 17h/19h/1Ah (Zen and later) CPUs
+#
+device		amdpower
+
+#
 # CPU control pseudo-device. Provides access to MSRs, CPUID info and
 # microcode update feature.
 #

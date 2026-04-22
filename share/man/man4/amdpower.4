@@ -1,0 +1,156 @@
+.\"
+.\" Copyright (c) 2026 Olivier Cochard
+.\"
+.\" SPDX-License-Identifier: BSD-2-Clause
+.\"
+.Dd April 16, 2026
+.Dt AMDPOWER 4
+.Os
+.Sh NAME
+.Nm amdpower
+.Nd AMD CPU power sensor driver
+.Sh SYNOPSIS
+.Cd "device amdpower"
+.Sh DESCRIPTION
+The
+.Nm
+driver exposes average CPU package and per-physical-core power consumption
+for AMD Family 17h
+.Pq Zen, Zen+, Zen2 ,
+Family 19h
+.Pq Zen3, Zen4 ,
+and Family 1Ah
+.Pq Zen5
+processors via
+.Xr sysctl 8 .
+.Pp
+To load the driver as a module at boot time, add the following line to
+.Xr loader.conf 5 :
+.Bd -literal -offset indent
+amdpower_load="YES"
+.Ed
+.Pp
+Power is measured using the RAPL
+.Pq Running Average Power Limit
+energy counters documented in the AMD Processor Programming Reference
+.Pq PPR :
+.Bl -tag -width indent -compact
+.It Li 0xC0010299
+.Sy RAPL_PWR_UNIT :
+energy, power, and time unit exponents.
+.It Li 0xC001029A
+.Sy CORE_ENERGY_STATUS :
+per-physical-core energy accumulator
+.Pq 32-bit, wrapping .
+Reading this MSR on logical CPU
+.Va N
+returns the accumulated energy of the physical core that CPU
+.Va N
+belongs to.
+When SMT is active, both logical threads of a physical core return the
+same counter.
+.It Li 0xC001029B
+.Sy PKG_ENERGY_STATUS :
+package
+.Pq socket
+energy accumulator.
+The counter is 32-bit on Family 17h and 19h, and 64-bit on Family 1Ah.
+.El
+.Pp
+The driver identifies physical cores at attach time using CPUID leaf
+.Li 0x8000001E
+to determine the number of SMT threads per core, then reads each
+physical core's energy counter from the first logical CPU of that core.
+.Pp
+Power is computed as the energy delta between two snapshots divided by the
+elapsed time.
+Snapshots are taken every
+.Va interval_ms
+milliseconds via a callout.
+.Sh HARDWARE
+The
+.Nm
+driver supports AMD processors based on the following microarchitectures:
+.Pp
+.Bl -bullet -compact
+.It
+AMD Family 17h: Zen
+.Pq Summit Ridge, Naples ,
+Zen+
+.Pq Pinnacle Ridge, Picasso ,
+Zen2
+.Pq Matisse, Rome, Castle Peak, Renoir
+.It
+AMD Family 19h: Zen3
+.Pq Vermeer, Milan, Cezanne ,
+Zen3+
+.Pq Rembrandt ,
+Zen4
+.Pq Raphael, Genoa, Phoenix
+.It
+AMD Family 1Ah: Zen5
+.Pq Granite Ridge, Turin, Strix
+.El
+.Sh SYSCTL VARIABLES
+The following
+.Xr sysctl 8
+variables are provided under
+.Va dev.amdpower.<unit> :
+.Bl -tag -width indent
+.It Va pkg_power
+Read-only.
+Average package power in milliwatts over the last
+.Va interval_ms
+milliseconds.
+The package reading covers the entire processor package as defined by AMD.
+.It Va core0_power , core1_power , No ...
+Read-only.
+Average power in milliwatts for each physical core over the last
+.Va interval_ms
+milliseconds.
+The number of
+.Va core<N>_power
+variables matches the number of physical cores detected at attach time.
+The sysctl description includes the logical CPU number used to read each
+core's energy MSR.
+.It Va interval_ms
+Read-write.
+Measurement interval in milliseconds.
+Default is 250.
+Shorter values increase responsiveness; longer values reduce noise.
+.El
+.Sh IMPLEMENTATION NOTES
+Power readings are averages over the preceding
+.Va interval_ms
+milliseconds and are updated by a periodic callout, not on each
+.Xr sysctl 8
+read.
+The first reading after driver attach is always 0.
+.Pp
+The 32-bit per-core energy counter
+.Pq and the 32-bit package counter on Family 17h and 19h
+wraps; wrap is handled transparently by unsigned 32-bit subtraction of
+consecutive snapshots.
+At an energy unit shift of 16 and 300 W sustained draw, a 32-bit counter
+wraps in approximately 218 seconds, well within any realistic polling
+interval.
+The 64-bit package counter on Family 1Ah does not wrap in practice.
+.Pp
+Reading per-core energy MSRs requires briefly pinning the polling thread to
+each target CPU via
+.Fn sched_bind .
+This introduces minor scheduling perturbation proportional to the number of
+physical cores and the measurement frequency.
+.Sh SEE ALSO
+.Xr amdtemp 4 ,
+.Xr sysctl 8
+.Sh HISTORY
+The
+.Nm
+driver first appeared in
+.Fx 16.0 .
+.Sh AUTHORS
+The
+.Nm
+driver was written by
+.An Olivier Cochard Aq Mt olivier@FreeBSD.org .

@@ -66,6 +66,7 @@ dev/amdsmu/amdsmu.c		optional	amdsmu pci
 dev/amdsbwd/amdsbwd.c		optional	amdsbwd
 dev/amdsmn/amdsmn.c		optional	amdsmn | amdtemp
 dev/amdtemp/amdtemp.c		optional	amdtemp
+dev/amdpower/amdpower.c		optional	amdpower
 dev/arcmsr/arcmsr.c		optional	arcmsr pci
 dev/atkbdc/atkbd.c		optional	atkbd atkbdc
 dev/atkbdc/atkbd_atkbdc.c	optional	atkbd atkbdc
