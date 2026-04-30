@@ -163,10 +163,6 @@ macOS/XNU historically included a heavily modified version of DTrace, but Apple 
 - [Process Management — Scheduling and Lifecycle](../../../sys/kern/README_process.md)
 - [Locking Primitives — Mutexes, sx, rmlocks, and Atomics](../../../sys/kern/README_locking.md)
 
-- [Kernel Core — Structure and Entry Point](../../sys/README.md)
-- [Process Management — Scheduling and Lifecycle](../../../sys/kern/README_process.md)
-- [Locking Primitives — Mutexes, sx, rmlocks, and Atomics](../../../sys/kern/README_locking.md)
-
 
 
 - [Kernel Core — Structure and Entry Point](../../../README.md)

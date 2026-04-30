@@ -408,10 +408,6 @@ NetBSD and OpenBSD have experimental ZFS support, but neither includes it in the
 - [GEOM — Storage Framework](../../../sys/geom/README.md)
 - [Virtual Memory Subsystem — vm_page, UMA, and Pagers](../../../sys/vm/README.md)
 
-- [VFS — Virtual File System Layer](../../../sys/fs/README.md)
-- [GEOM — Storage Framework](../../../sys/geom/README.md)
-- [Virtual Memory Subsystem — vm_page, UMA, and Pagers](../../../sys/vm/README.md)
-
 
 
 - [Source Tree — Layout and Conventions](../README_internals.md)

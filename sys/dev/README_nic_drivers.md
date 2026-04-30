@@ -213,10 +213,6 @@ NetBSD and OpenBSD also use `ifnet`, but they have historically been slower to a
 - [Network Stack — Architecture and Packet Flow](../../../sys/net/README.md)
 - [Interrupt Handling — Threads, Filters, and Dispatch](../../../sys/kern/README_intr.md)
 
-- [Device Driver Framework — newbus and devclass](../../../sys/kern/README_driver.md)
-- [Network Stack — Architecture and Packet Flow](../../../sys/net/README.md)
-- [Interrupt Handling — Threads, Filters, and Dispatch](../../../sys/kern/README_intr.md)
-
 
 
 - [Kernel Core — Structure and Entry Point](../kern/README.md)

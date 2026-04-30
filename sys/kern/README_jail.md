@@ -153,11 +153,6 @@ macOS/XNU historically supported jails but deprecated them in favor of session-b
 - [Capsicum — Capability Mode and Sandboxing](../../../sys/kern/README_capsicum.md)
 - [Kernel Core — Structure and Entry Point](../../sys/README.md)
 
-- [Process Management — Scheduling and Lifecycle](../../../sys/kern/README_process.md)
-- [VNET — Virtual Network Stacks](../../../sys/net/README_vnet.md)
-- [Capsicum — Capability Mode and Sandboxing](../../../sys/kern/README_capsicum.md)
-- [Kernel Core — Structure and Entry Point](../../sys/README.md)
-
 
 
 - [Process Management — Scheduling and Lifecycle](kern/README_process.md)

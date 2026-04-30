@@ -128,10 +128,6 @@ macOS/XNU uses `pf` as well, inheriting it from OpenBSD, but modifies the hook r
 - [ipfw and dummynet — Native Firewall and Traffic Shaper](../../../../sys/netpfil/ipfw/README.md)
 - [VNET — Virtual Network Stacks](../../../sys/net/README_vnet.md)
 
-- [Network Stack — Architecture and Packet Flow](../../../sys/net/README.md)
-- [ipfw and dummynet — Native Firewall and Traffic Shaper](../../../../sys/netpfil/ipfw/README.md)
-- [VNET — Virtual Network Stacks](../../../sys/net/README_vnet.md)
-
 
 
 - [Source Tree — Layout and Conventions](../README_internals.md)

@@ -168,10 +168,6 @@ FreeBSD's `vm_map` is a red-black tree-based address space representation, while
 - [Boot Process — UEFI Bootloader to Kernel Handoff](../../../../stand/efi/loader/README.md)
 - [Process Management — Scheduling and Lifecycle](../../../sys/kern/README_process.md)
 
-- [Source Tree — Layout and Conventions](README_internals.md)
-- [Boot Process — UEFI Bootloader to Kernel Handoff](../../../../stand/efi/loader/README.md)
-- [Process Management — Scheduling and Lifecycle](../../../sys/kern/README_process.md)
-
 
 
 - [Source Tree — Layout and Conventions](../README_internals.md)

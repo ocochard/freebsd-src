@@ -682,10 +682,6 @@ macOS (XNU kernel) includes a variant of `ipfw` for compatibility, but has shift
 - [pf — OpenBSD-derived Packet Filter](../../../../sys/netpfil/pf/README.md)
 - [VNET — Virtual Network Stacks](../../../sys/net/README_vnet.md)
 
-- [Network Stack — Architecture and Packet Flow](../../../sys/net/README.md)
-- [pf — OpenBSD-derived Packet Filter](../../../../sys/netpfil/pf/README.md)
-- [VNET — Virtual Network Stacks](../../../sys/net/README_vnet.md)
-
 
 
 - [Network Stack — Architecture and Packet Flow](../../net/README.md)

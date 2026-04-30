@@ -272,10 +272,6 @@ NetBSD and OpenBSD use a model closer to FreeBSD's, with `intr_event` and `intr_
 - [Process Management — Scheduling and Lifecycle](../../../sys/kern/README_process.md)
 - [Locking Primitives — Mutexes, sx, rmlocks, and Atomics](../../../sys/kern/README_locking.md)
 
-- [Device Driver Framework — newbus and devclass](../../../sys/kern/README_driver.md)
-- [Process Management — Scheduling and Lifecycle](../../../sys/kern/README_process.md)
-- [Locking Primitives — Mutexes, sx, rmlocks, and Atomics](../../../sys/kern/README_locking.md)
-
 
 
 - `sys/kern/kern_intr.c` — Main interrupt dispatch framework

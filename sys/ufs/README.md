@@ -280,10 +280,6 @@ NetBSD and OpenBSD also maintain UFS implementations with their own variations:
 - [Buffer Cache — Block I/O Subsystem](../../../sys/vm/README_bcache.md)
 - [GEOM — Storage Framework](../../../sys/geom/README.md)
 
-- [VFS — Virtual File System Layer](../../../sys/fs/README.md)
-- [Buffer Cache — Block I/O Subsystem](../../../sys/vm/README_bcache.md)
-- [GEOM — Storage Framework](../../../sys/geom/README.md)
-
 
 
 - [Buffer Cache — Block I/O Subsystem](../vm/README_bcache.md) — How UFS interacts with the buffer cache

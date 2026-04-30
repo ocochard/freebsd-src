@@ -295,10 +295,6 @@ DTrace provides probes for VM subsystem debugging. FreeBSD defines SDT probes in
 - [Buffer Cache — Block I/O Subsystem](../../../sys/vm/README_bcache.md)
 - [VFS — Virtual File System Layer](../../../sys/fs/README.md)
 
-- [Kernel Core — Structure and Entry Point](../../sys/README.md)
-- [Buffer Cache — Block I/O Subsystem](../../../sys/vm/README_bcache.md)
-- [VFS — Virtual File System Layer](../../../sys/fs/README.md)
-
 
 
 - [Kernel Core — Structure and Entry Point](../README.md)

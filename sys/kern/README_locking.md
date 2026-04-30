@@ -592,9 +592,6 @@ NetBSD and OpenBSD share some similarities with FreeBSD:
 - [Interrupt Handling — Threads, Filters, and Dispatch](../../../sys/kern/README_intr.md)
 - [Kernel Core — Structure and Entry Point](../../sys/README.md)
 
-- [Process Management — Scheduling and Lifecycle](../../../sys/kern/README_process.md)
-- [Interrupt Handling — Threads, Filters, and Dispatch](../../../sys/kern/README_intr.md)
-- [Kernel Core — Structure and Entry Point](../../sys/README.md)
 
 
 - [Process Management — Scheduling and Lifecycle](kern/README_process.md) — for the scheduler integration with turnstiles and sleep queues.

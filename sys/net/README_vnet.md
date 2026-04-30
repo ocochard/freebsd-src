@@ -359,10 +359,6 @@ OpenBSD does not currently have a per-jail network stack virtualization feature.
 - [Jails — OS-level Isolation](../../../sys/kern/README_jail.md)
 - [pf — OpenBSD-derived Packet Filter](../../../../sys/netpfil/pf/README.md)
 
-- [Network Stack — Architecture and Packet Flow](../../../sys/net/README.md)
-- [Jails — OS-level Isolation](../../../sys/kern/README_jail.md)
-- [pf — OpenBSD-derived Packet Filter](../../../../sys/netpfil/pf/README.md)
-
 
 
 - [Jail — Process Isolation](../kern/README_jail.md) — the broader jail subsystem covering process, credential, and filesystem isolation

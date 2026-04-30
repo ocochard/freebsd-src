@@ -402,10 +402,6 @@ For example, a web server running in a jail can use capability mode to restrict 
 - [Process Management — Scheduling and Lifecycle](../../../sys/kern/README_process.md)
 - [VFS — Virtual File System Layer](../../../sys/fs/README.md)
 
-- [Jails — OS-level Isolation](../../../sys/kern/README_jail.md)
-- [Process Management — Scheduling and Lifecycle](../../../sys/kern/README_process.md)
-- [VFS — Virtual File System Layer](../../../sys/fs/README.md)
-
 
 
 - `sys/kern/sys_capability.c` — Main implementation of Capsicum

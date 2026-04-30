@@ -191,10 +191,6 @@ NetBSD and OpenBSD use a similar stackable storage model, but their implementati
 - [CAM — Common Access Method Storage Stack](../../../sys/cam/README.md)
 - [ZFS — Pooled Storage and Copy-on-Write Filesystem](../../../../sys/contrib/openzfs/README_freebsd.md)
 
-- [Buffer Cache — Block I/O Subsystem](../../../sys/vm/README_bcache.md)
-- [CAM — Common Access Method Storage Stack](../../../sys/cam/README.md)
-- [ZFS — Pooled Storage and Copy-on-Write Filesystem](../../../../sys/contrib/openzfs/README_freebsd.md)
-
 
 
 - [Buffer Cache — Block I/O Subsystem](../vm/README_bcache.md)

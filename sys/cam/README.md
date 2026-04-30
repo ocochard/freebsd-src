@@ -503,10 +503,6 @@ NetBSD implements storage I/O through the CAM subsystem, which is similar to Fre
 - [Device Driver Framework — newbus and devclass](../../../sys/kern/README_driver.md)
 - [Interrupt Handling — Threads, Filters, and Dispatch](../../../sys/kern/README_intr.md)
 
-- [GEOM — Storage Framework](../../../sys/geom/README.md)
-- [Device Driver Framework — newbus and devclass](../../../sys/kern/README_driver.md)
-- [Interrupt Handling — Threads, Filters, and Dispatch](../../../sys/kern/README_intr.md)
-
 
 
 - [GEOM — Storage Framework](../geom/README.md) — The GEOM storage framework that provides virtual storage providers

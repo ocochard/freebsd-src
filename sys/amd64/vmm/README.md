@@ -142,11 +142,6 @@ macOS/XNU's Hypervisor Framework takes a different approach, relying on a user-s
 - [Device Driver Framework — newbus and devclass](../../../sys/kern/README_driver.md)
 - [VNET — Virtual Network Stacks](../../../sys/net/README_vnet.md)
 
-- [Virtual Memory Subsystem — vm_page, UMA, and Pagers](../../../sys/vm/README.md)
-- [Process Management — Scheduling and Lifecycle](../../../sys/kern/README_process.md)
-- [Device Driver Framework — newbus and devclass](../../../sys/kern/README_driver.md)
-- [VNET — Virtual Network Stacks](../../../sys/net/README_vnet.md)
-
 
 
 - [Virtual Memory Subsystem — vm_page, UMA, and Pagers](../vm/README.md) for host physical memory management

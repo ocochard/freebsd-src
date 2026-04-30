@@ -197,11 +197,6 @@ macOS/XNU, derived from FreeBSD, also uses a similar process/thread model but ha
 - [Locking Primitives — Mutexes, sx, rmlocks, and Atomics](../../../sys/kern/README_locking.md)
 - [Jails — OS-level Isolation](../../../sys/kern/README_jail.md)
 
-- [Kernel Core — Structure and Entry Point](../../sys/README.md)
-- [Interrupt Handling — Threads, Filters, and Dispatch](../../../sys/kern/README_intr.md)
-- [Locking Primitives — Mutexes, sx, rmlocks, and Atomics](../../../sys/kern/README_locking.md)
-- [Jails — OS-level Isolation](../../../sys/kern/README_jail.md)
-
 
 
 - [Virtual Memory Subsystem — vm_page, UMA, and Pagers](vm/README.md)
