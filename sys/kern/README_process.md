@@ -410,8 +410,8 @@ NetBSD and OpenBSD share similar process management concepts with FreeBSD but di
 - [Locking Primitives — Mutexes, sx, rmlocks, and Atomics](README_locking.md)
 - [Jails — OS-level Isolation](README_jail.md)
 
-- [Source Tree — Layout and Conventions](../../README_internals.md)
-- [Virtual Memory Subsystem — vm_page, UMA, and Pagers](../vm/README.md)
+
+
 - `sys/kern/kern_fork.c` — Process creation
 - `sys/kern/kern_exit.c` — Process termination
 - `sys/kern/kern_thread.c` — Thread management

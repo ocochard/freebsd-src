@@ -131,7 +131,7 @@ FreeBSD's `prison` structure avoids the complexity of Linux's per-namespace refe
 - [Capsicum — Capability Mode and Sandboxing](README_capsicum.md)
 - [Kernel Core — Structure and Entry Point](../README.md)
 
-- [Locking Primitives — Mutexes, sx, rmlocks, and Atomics](README_locking.md)
+
 
 ---
 

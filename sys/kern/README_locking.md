@@ -240,8 +240,8 @@ macOS/XNU uses `os_unfair_lock` for high-performance locking, which is largely s
 - [Interrupt Handling — Threads, Filters, and Dispatch](README_intr.md)
 - [Kernel Core — Structure and Entry Point](../README.md)
 
-- [Virtual Memory Subsystem — vm_page, UMA, and Pagers](../vm/README.md)
-- [Buffer Cache — Block I/O Subsystem](../vm/README_bcache.md)
+
+
 - `sys/kern/kern_mutex.c`
 - `sys/kern/kern_sx.c`
 - `sys/kern/subr_turnstile.c`

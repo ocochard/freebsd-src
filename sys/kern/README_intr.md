@@ -106,6 +106,8 @@ NetBSD and OpenBSD use a similar filter/action split but implement deferred proc
 - [Process Management — Scheduling and Lifecycle](README_process.md)
 - [Locking Primitives — Mutexes, sx, rmlocks, and Atomics](README_locking.md)
 
+
+
 - Source directories: `sys/kern/`, `sys/x86/x86/`, `sys/arm64/arm64/`
 
 ---
