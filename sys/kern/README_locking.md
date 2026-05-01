@@ -8,9 +8,7 @@
   **All chapters:** [Source Tree — Layout and Conventions](../../README_internals.md) | [Boot Process — UEFI Bootloader to Kernel Handoff](../../stand/efi/loader/README.md) | [Kernel Core — Structure and Entry Point](../README.md) | [Build System — buildworld and buildkernel](../../share/mk/README.md) | [Virtual Memory Subsystem — vm_page, UMA, and Pagers](../vm/README.md) | [Process Management — Scheduling and Lifecycle](README_process.md) | [Buffer Cache — Block I/O Subsystem](../vm/README_bcache.md) | [GEOM — Storage Framework](../geom/README.md) ...
 ---
 
-
 > ⚠ **UNVERIFIED DRAFT** — revisions regressed; kept revision 2 (8/9 criteria) over revision 3 (7/9); reviewer did not explicitly approve this draft. Treat claims as suspect until manually reviewed.
-
 
 ## Quick Summary
 The FreeBSD kernel manages concurrent access to shared data structures using a hierarchy of locking primitives. When multiple threads execute simultaneously on different CPUs, the kernel must serialize access to mutable state to prevent data corruption and race conditions. The four primary primitives are the mutex (`mtx`), the reader/writer lock (`rwlock`), the shared/exclusive lock (`sx`), and the legacy `lockmgr` used heavily in the VFS layer. Each primitive expresses a different trade-off between mutual exclusion, concurrency, and overhead.
@@ -242,11 +240,8 @@ macOS/XNU uses `os_unfair_lock` for high-performance locking, which is largely s
 - [Interrupt Handling — Threads, Filters, and Dispatch](README_intr.md)
 - [Kernel Core — Structure and Entry Point](../README.md)
 
-
-
-- [Process Management — Scheduling and Lifecycle](kern/README_process.md)
-- [Virtual Memory Subsystem — vm_page, UMA, and Pagers](vm/README.md)
-- [Buffer Cache — Block I/O Subsystem](vm/README_bcache.md)
+- [Virtual Memory Subsystem — vm_page, UMA, and Pagers](../vm/README.md)
+- [Buffer Cache — Block I/O Subsystem](../vm/README_bcache.md)
 - `sys/kern/kern_mutex.c`
 - `sys/kern/kern_sx.c`
 - `sys/kern/subr_turnstile.c`

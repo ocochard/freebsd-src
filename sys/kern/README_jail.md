@@ -8,7 +8,6 @@
   **All chapters:** [Source Tree — Layout and Conventions](../../README_internals.md) | [Boot Process — UEFI Bootloader to Kernel Handoff](../../stand/efi/loader/README.md) | [Kernel Core — Structure and Entry Point](../README.md) | [Build System — buildworld and buildkernel](../../share/mk/README.md) | [Virtual Memory Subsystem — vm_page, UMA, and Pagers](../vm/README.md) | [Process Management — Scheduling and Lifecycle](README_process.md) | [Locking Primitives — Mutexes, sx, rmlocks, and Atomics](README_locking.md) | [Buffer Cache — Block I/O Subsystem](../vm/README_bcache.md) ...
 ---
 
-
 ## Quick Summary
 Jails provide OS-level process isolation by creating nested execution environments that restrict a set of processes from accessing system resources outside their designated boundaries. Unlike traditional `chroot`, which only changes the apparent root directory but leaves processes with full privileges over the underlying kernel, jails attach each group of processes to a `prison` structure that enforces strict boundaries on network access, mount points, device nodes, and kernel parameters. This design allows untrusted or multi-tenant workloads to run on a single FreeBSD kernel without risking host compromise.
 
@@ -132,13 +131,7 @@ FreeBSD's `prison` structure avoids the complexity of Linux's per-namespace refe
 - [Capsicum — Capability Mode and Sandboxing](README_capsicum.md)
 - [Kernel Core — Structure and Entry Point](../README.md)
 
-
-
-- [Process Management — Scheduling and Lifecycle](kern/README_process.md)
-- [Locking Primitives — Mutexes, sx, rmlocks, and Atomics](kern/README_locking.md)
-- [Virtual Network Stack — VIMAGE Internals](net/README_vimage.md)
-- [Resource Control — RACCT and RCTL](sys/README_rctl.md)
-- [Device Filesystem — devfs and Mount Namespaces](sys/README_devfs.md)
+- [Locking Primitives — Mutexes, sx, rmlocks, and Atomics](README_locking.md)
 
 ---
 

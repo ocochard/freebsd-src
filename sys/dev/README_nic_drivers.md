@@ -783,12 +783,12 @@ This pattern is common in OS development: as hardware capabilities grow, framewo
 
 
 
-- [Source Tree — Layout and Conventions](../README_internals.md)
-- [Virtual Memory Subsystem — vm_page, UMA, and Pagers](vm/README.md)
-- [Process Management — Scheduling and Lifecycle](kern/README_process.md)
-- [Locking Primitives — Mutexes, sx, rmlocks, and Atomics](kern/README_locking.md)
-- [Buffer Cache — Block I/O Subsystem](vm/README_bcache.md)
-- [GEOM — Storage Framework](geom/README.md)
+- [Source Tree — Layout and Conventions](../../README_internals.md)
+- [Virtual Memory Subsystem — vm_page, UMA, and Pagers](../vm/README.md)
+- [Process Management — Scheduling and Lifecycle](../kern/README_process.md)
+- [Locking Primitives — Mutexes, sx, rmlocks, and Atomics](../kern/README_locking.md)
+- [Buffer Cache — Block I/O Subsystem](../vm/README_bcache.md)
+- [GEOM — Storage Framework](../geom/README.md)
 
 ### Related Source Directories
 

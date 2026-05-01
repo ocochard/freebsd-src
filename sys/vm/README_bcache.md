@@ -8,7 +8,6 @@
   **All chapters:** [Source Tree — Layout and Conventions](../../README_internals.md) | [Boot Process — UEFI Bootloader to Kernel Handoff](../../stand/efi/loader/README.md) | [Kernel Core — Structure and Entry Point](../README.md) | [Build System — buildworld and buildkernel](../../share/mk/README.md) | [Virtual Memory Subsystem — vm_page, UMA, and Pagers](README.md) | [Process Management — Scheduling and Lifecycle](../kern/README_process.md) | [Locking Primitives — Mutexes, sx, rmlocks, and Atomics](../kern/README_locking.md) | [GEOM — Storage Framework](../geom/README.md) ...
 ---
 
-
 ## Quick Summary
 The buffer cache (often called the block I/O subsystem in FreeBSD) sits between the Virtual File System (VFS) layer and the storage drivers. Its primary job is to cache disk blocks in memory, reducing the need to read from or write to physical storage for every operation. When a filesystem requests a block, the buffer cache checks whether it is already resident in RAM. If it is, the kernel uses the cached copy; if not, it allocates a buffer, initiates a read, and waits for the hardware to complete the I/O.
 
@@ -142,9 +141,6 @@ macOS/XNU uses the `buf` structure but manages buffer lifecycles through the `bu
 - [GEOM — Storage Framework](../geom/README.md)
 - [UFS — FreeBSD's Native Filesystem](../ufs/README.md)
 
-- [Virtual Memory Subsystem — vm_page, UMA, and Pagers](vm/README.md)
-- [VFS — Virtual File System Layer](fs/README.md)
-- [GEOM — Storage Framework](geom/README.md)
 - `sys/kern/vfs_bio.c`
 - `sys/kern/vfs_cluster.c`
 - `sys/sys/buf.h`

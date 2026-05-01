@@ -8,9 +8,7 @@
   **All chapters:** [Source Tree — Layout and Conventions](../../README_internals.md) | [Boot Process — UEFI Bootloader to Kernel Handoff](../../stand/efi/loader/README.md) | [Kernel Core — Structure and Entry Point](../README.md) | [Build System — buildworld and buildkernel](../../share/mk/README.md) | [Virtual Memory Subsystem — vm_page, UMA, and Pagers](../vm/README.md) | [Process Management — Scheduling and Lifecycle](README_process.md) | [Locking Primitives — Mutexes, sx, rmlocks, and Atomics](README_locking.md) | [Buffer Cache — Block I/O Subsystem](../vm/README_bcache.md) ...
 ---
 
-
 > ⚠ **UNVERIFIED DRAFT** — reviewer did not explicitly approve this draft. Treat claims as suspect until manually reviewed.
-
 
 ## Quick Summary
 FreeBSD's interrupt handling subsystem bridges the gap between unpredictable hardware signals and deterministic software execution. When a device asserts an interrupt line, the kernel must respond quickly to acknowledge the signal while deferring complex processing to a safer execution context. To achieve this, FreeBSD splits interrupt handling into two phases: a fast, non-blocking filter that runs in interrupt context to check device registers, and a threaded action that runs in a dedicated kernel thread to perform the actual work. This design prevents drivers from blocking the CPU or holding locks for extended periods, which could otherwise starve other interrupts or deadlock the system.
@@ -108,10 +106,6 @@ NetBSD and OpenBSD use a similar filter/action split but implement deferred proc
 - [Process Management — Scheduling and Lifecycle](README_process.md)
 - [Locking Primitives — Mutexes, sx, rmlocks, and Atomics](README_locking.md)
 
-
-
-- [Locking Primitives — Mutexes, sx, rmlocks, and Atomics](kern/README_locking.md)
-- [Process Management — Scheduling and Lifecycle](kern/README_process.md)
 - Source directories: `sys/kern/`, `sys/x86/x86/`, `sys/arm64/arm64/`
 
 ---

@@ -8,9 +8,7 @@
   **All chapters:** [Source Tree — Layout and Conventions](../../README_internals.md) | [Boot Process — UEFI Bootloader to Kernel Handoff](../../stand/efi/loader/README.md) | [Kernel Core — Structure and Entry Point](../README.md) | [Build System — buildworld and buildkernel](../../share/mk/README.md) | [Virtual Memory Subsystem — vm_page, UMA, and Pagers](../vm/README.md) | [Locking Primitives — Mutexes, sx, rmlocks, and Atomics](README_locking.md) | [Buffer Cache — Block I/O Subsystem](../vm/README_bcache.md) | [GEOM — Storage Framework](../geom/README.md) ...
 ---
 
-
 > ⚠ **UNVERIFIED DRAFT** — reviewer did not explicitly approve this draft. Treat claims as suspect until manually reviewed.
-
 
 ## Quick Summary
 FreeBSD manages processes and threads through a layered architecture that separates the concept of a process (a unit of resource ownership) from a thread (a unit of CPU execution). When a program calls the `fork()` library function, the C library wrapper issues the `sys_fork` syscall, which enters the kernel and creates a new process that initially shares the parent's memory through copy-on-write semantics. Each process contains one or more threads, each representing an independent flow of execution with its own register state and kernel stack. The kernel's 4BSD scheduler places runnable threads into priority-based run queues and dispatches them to available CPUs using time-sliced round-robin scheduling within each priority level.
@@ -113,7 +111,6 @@ struct runq {
 ```
 
 `RQ_NQS` is the number of run queues, computed as `(RQ_MAX_PRIO + 1) / RQ_PPQ` where `RQ_MAX_PRIO` is 255 and `RQ_PPQ` is 1 (priority per queue). The `rq_status` field is a bit array (`rq_sw[RQSW_NB]`) that tracks which queues are non-empty, enabling O(1) finding of the highest-priority runnable thread via `RQSW_BSF` (bit scan first set). Each `rq_queue` is a `TAILQ_HEAD(rq_queue, thread)` — a TAILQ list of `struct thread` pointers at that priority level, defined as a typedef rather than a custom struct.
-
 
 ## Deep Dive
 
@@ -413,11 +410,8 @@ NetBSD and OpenBSD share similar process management concepts with FreeBSD but di
 - [Locking Primitives — Mutexes, sx, rmlocks, and Atomics](README_locking.md)
 - [Jails — OS-level Isolation](README_jail.md)
 
-
-
-- [Source Tree — Layout and Conventions](../README_internals.md)
-- [Virtual Memory Subsystem — vm_page, UMA, and Pagers](vm/README.md)
-- [Locking Primitives — Mutexes, sx, rmlocks, and Atomics](kern/README_locking.md)
+- [Source Tree — Layout and Conventions](../../README_internals.md)
+- [Virtual Memory Subsystem — vm_page, UMA, and Pagers](../vm/README.md)
 - `sys/kern/kern_fork.c` — Process creation
 - `sys/kern/kern_exit.c` — Process termination
 - `sys/kern/kern_thread.c` — Thread management

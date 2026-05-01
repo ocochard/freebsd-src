@@ -85,13 +85,13 @@ Under `stand/`, the boot loader code follows a similar pattern. The `stand/commo
 
 ```mermaid
 flowchart TD
-    subgraph TopLevel["/usr/src (Source Root)"]
+    subgraph TopLevel_grp["/usr/src (Source Root)"]
         Makefile["Makefile (build targets)"]
         README["README.md (directory map)"]
         COPYRIGHT["COPYRIGHT (BSD license)"]
     end
 
-    subgraph BaseBSD["Base BSD Code (2-clause BSD)"]
+    subgraph BaseBSD_grp["Base BSD Code (2-clause BSD)"]
         bin["bin/ (basic commands)"]
         sbin["sbin/ (system commands)"]
         lib["lib/ (system libraries)"]
@@ -105,14 +105,14 @@ flowchart TD
         tests["tests/ (Kyua test suite)"]
     end
 
-    subgraph ThirdParty["Third-Party Code"]
+    subgraph ThirdParty_grp["Third-Party Code"]
         contrib["contrib/ (general third-party)"]
         crypto["crypto/ (crypto, export-controlled)"]
         gnu["gnu/ (GPL/LGPL)"]
         cddl["cddl/ (CDDL: ZFS, DTrace)"]
     end
 
-    subgraph Special["Special Purpose"]
+    subgraph Special_grp["Special Purpose"]
         release["release/ (release engineering)"]
         tools["tools/ (dev utilities)"]
         targets["targets/ (DIRDEPS_BUILD)"]
