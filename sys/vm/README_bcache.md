@@ -3,63 +3,28 @@
 
 ---
 **Navigation:**
+  **Up:** [Virtual Memory Subsystem — vm_page, UMA, and Pagers](README.md) ▸ [Kernel Core — Structure and Entry Point](../README.md) ▸ [Source Tree — Layout and Conventions](../../README_internals.md)
   **Related:** [Virtual Memory Subsystem — vm_page, UMA, and Pagers](README.md) | [GEOM — Storage Framework](../geom/README.md) | [VFS — Virtual File System Layer](../fs/README.md) | [UFS — FreeBSD's Native Filesystem](../ufs/README.md)
   **All chapters:** [Source Tree — Layout and Conventions](../../README_internals.md) | [Boot Process — UEFI Bootloader to Kernel Handoff](../../stand/efi/loader/README.md) | [Kernel Core — Structure and Entry Point](../README.md) | [Build System — buildworld and buildkernel](../../share/mk/README.md) | [Virtual Memory Subsystem — vm_page, UMA, and Pagers](README.md) | [Process Management — Scheduling and Lifecycle](../kern/README_process.md) | [Locking Primitives — Mutexes, sx, rmlocks, and Atomics](../kern/README_locking.md) | [GEOM — Storage Framework](../geom/README.md) ...
 ---
 
 
 ## Quick Summary
-The buffer cache is FreeBSD''s mechanism for caching disk blocks in kernel memory, reducing the need for repeated disk accesses. At its heart lies the `struct buf`, a kernel data structure that represents a single block or cluster of blocks read from or written to disk. When a filesystem requests data, the buffer cache first checks whether the requested block is already resident in memory. If it is, the data is returned immediately; if not, the cache allocates a `struct buf`, submits an I/O request to the storage driver, and waits for completion.
+The buffer cache (often called the block I/O subsystem in FreeBSD) sits between the Virtual File System (VFS) layer and the storage drivers. Its primary job is to cache disk blocks in memory, reducing the need to read from or write to physical storage for every operation. When a filesystem requests a block, the buffer cache checks whether it is already resident in RAM. If it is, the kernel uses the cached copy; if not, it allocates a buffer, initiates a read, and waits for the hardware to complete the I/O.
 
-The buffer cache sits between the Virtual File System (VFS) layer and the GEOM storage framework. Filesystem code issues I/O requests through the buffer cache, which translates them into BIO operations. These operations flow down through the GEOM layer to device drivers, which perform the actual disk I/O. When I/O completes, the buffer cache updates the buffer state, wakes up any waiting threads, and marks the buffer as clean or dirty depending on the operation type.
+FreeBSD's buffer cache is integrated with the Virtual Memory (VM) subsystem. Each `struct buf` represents a cached block and is linked to a `vm_object` that acts as the backing store. This design unifies file caching and swap caching under a single abstraction. Dirty buffers—those that have been modified in memory but not yet written to disk—are tracked carefully to ensure data consistency. The system employs background daemons and explicit synchronization points to flush dirty buffers to storage, balancing performance with durability.
 
-FreeBSD''s buffer cache is closely integrated with the virtual memory subsystem. Each buffer is associated with a `struct bufobj`, which in turn is linked to a `struct vm_object`. This connection allows the buffer cache and the VM page cache to share data: when a file is read into buffers, those buffers'' data pages can be mapped into process address spaces without additional I/O. Dirty buffers — those modified in memory but not yet written to disk — are tracked separately and flushed periodically by the buffer daemon thread, ensuring data consistency without blocking foreground I/O.
-
-The buffer cache also implements read-ahead and write-behind through cluster I/O. When sequential reads are detected, the cache pre-fetches additional blocks ahead of the request. Similarly, when sequential writes are detected, the cache can defer writing dirty buffers and coalesce multiple small writes into larger, more efficient operations. These optimizations significantly improve performance for workloads with predictable access patterns.
+I/O operations flow from VFS through the buffer cache, which translates logical block requests into physical device commands. The buffer cache manages buffer states, handles clustering for sequential I/O, and coordinates with the GEOM storage framework to deliver data to and from disk drivers. By abstracting block I/O, FreeBSD allows filesystems to focus on metadata and layout while relying on a proven, highly tuned block layer for performance.
 
 ## Architecture
-The buffer cache architecture is built around three core abstractions: the `struct buf`, the `struct bufobj`, and the buffer domain/queue hierarchy. These are defined in `sys/sys/buf.h` and `sys/sys/bufobj.h`, with the main implementation in `sys/kern/vfs_bio.c` and cluster I/O support in `sys/kern/vfs_cluster.c`.
+The buffer cache implementation lives primarily in `sys/kern/vfs_bio.c`, with its public interface declared in `sys/sys/buf.h` and `sys/sys/bufobj.h`. The subsystem uses a domain-based queueing model to organize buffers. Each CPU domain maintains a set of `struct bufqueue` structures: one for the main buffer pool, one for dirty buffers, and one for clean buffers. This NUMA-aware layout reduces lock contention by keeping per-domain queue locks local to the CPU that owns the buffer, solving the problem of cross-core mutex contention under heavy I/O load.
 
-### Buffer Operations and bufobj
-Every buffer hangs from a `struct bufobj`, which acts as an abstract owner for the buffer cache. Originally, bufobjs were synonymous with vnodes, but the abstraction was generalized to support non-vnode users such as GEOM classes (raid3, raid5). The bufobj stores pointers to a `struct vm_object` for VM integration, and maintains two `struct bufv` structures — `bo_clean` and `bo_dirty` — tracking clean and dirty buffers respectively.
+The core I/O path begins when VFS calls `bufstrategy()` or `bufwrite()`. These functions route through the `buf_ops_bio` structure, which points to `bufstrategy()` for dispatch and `bufwrite()` for synchronous writes. `bufstrategy()` validates the request, checks for clustering opportunities via `cluster_read()` or `cluster_write()`, and ultimately submits the `struct buf` to the device driver's strategy routine. When the driver finishes I/O, it calls `biodone()`, which transitions the buffer to the `BUF_DONE` state and wakes up any waiters via `bdone()`.
 
-The bufobj also holds a pointer to a `struct buf_ops` table, which defines the I/O operations specific to this bufobj type. In the standard bio case, this is `buf_ops_bio` (defined in `sys/kern/vfs_bio.c`), which provides function pointers to `bufwrite`, `bufstrategy`, `bufsync`, and `bufbdflush`. Macros in `sys/sys/bufobj.h` provide convenient access:
-
-```c
-#define BO_STRATEGY(bo, bp)	((bo)->bo_ops->bop_strategy((bo), (bp)))
-#define BO_SYNC(bo, w)		((bo)->bo_ops->bop_sync((bo), (w)))
-#define BO_WRITE(bo, bp)	((bo)->bo_ops->bop_write((bp)))
-#define BO_BDFLUSH(bo, bp)	((bo)->bo_ops->bop_bdflush((bo), (bp)))
-```
-
-### Buffer Queues and Domains
-The buffer cache organizes buffers into a hierarchy of queues managed by `struct bufdomain` and `struct bufqueue` (defined in `sys/kern/vfs_bio.c`). Each CPU domain has its own set of subqueues, with separate dirty and clean queues. This per-domain organization reduces lock contention by allowing concurrent buffer operations on different CPUs.
-
-```c
-struct bufqueue {
-	struct mtx_padalign	bq_lock;
-	TAILQ_HEAD(, buf)	bq_queue;
-	uint8_t			bq_index;
-	uint16_t		bq_subqueue;
-	int			bq_len;
-} __aligned(CACHE_LINE_SIZE);
-
-struct bufdomain {
-	struct bufqueue	*bd_subq;
-	struct bufqueue bd_dirtyq;
-	struct bufqueue	*bd_cleanq;
-	...
-};
-```
-
-The dirty queue is particularly important for writeback: the buffer daemon thread (`buf_daemon`) scans the dirty queue and submits I/O for dirty buffers, ensuring that modifications are eventually persisted to disk.
-
-### Integration with GEOM
-When an I/O request is submitted via `bufstrategy()`, the buffer cache creates a BIO structure and passes it to the GEOM framework. GEOM provides a modular storage stack where classes can be chained together (e.g., RAID, encryption, compression). The BIO flows through GEOM to the appropriate device driver, which performs the actual hardware I/O.
+Dirty tracking relies on `bdirty()` and `bdwrite()`. When a buffer is marked dirty, it is moved to the per-domain dirty queue (`bd_dirtyq`). The `bufbdflush()` function, registered as `bop_bdflush` in `buf_ops_bio`, monitors dirty buffer counts and initiates writeback when thresholds are exceeded or when the system needs to reclaim memory. Synchronous writes use `bufsync()` or `bawrite()` to force immediate flushing, while asynchronous paths rely on the background flusher.
 
 ## Key Data Structures
-### `struct buf`
-Defined in `sys/sys/buf.h`, the `struct buf` is the fundamental unit of the buffer cache. It represents a single I/O operation and its associated data.
+The central structure is `struct buf`, defined in `sys/sys/buf.h`. It represents a single I/O operation or cached block.
 
 ```c
 struct buf {
@@ -73,259 +38,120 @@ struct buf {
 	long		b_resid;
 	void	(*b_iodone)(struct buf *);
 	void	(*b_ckhashcalc)(struct buf *);
-	uint64_t	b_ckhash
-	...
+	uint64_t	b_ckhash;
+	uint64_t	b_ckhashinit;
+	size_t		b_bufsize;	/* Size of the buffer */
+	vm_pindex_t	b_offset;	/* Offset in the bufobj */
+	b_xflags_t	b_xflags;
+	uint8_t		b_lock;
+	uint8_t		b_vflag;	/* BUF_* flags */
+	uint8_t		b_bio1_flags;	/* bio2.b_bio1.bi_flags */
+	uint8_t		b_dirtyoff;
+	uint8_t		b_dirtyend;
+	struct bio	b_bio1;
+	struct bio	b_bio2;
+	TAILQ_ENTRY(buf)	b_list;		/* Buffer list */
+	TAILQ_ENTRY(buf)	b_dep;		/* Dependency list */
+	LIST_ENTRY(buf)	b_freelist;	/* Free list */
+	LIST_ENTRY(buf)	b_hash;		/* Hash list */
+	LIST_ENTRY(buf)	b_dirty;	/* Dirty list */
+	LIST_ENTRY(buf)	b_clean;	/* Clean list */
+	LIST_ENTRY(buf)	b_lru;		/* LRU list */
 };
 ```
 
-Key fields:
-- `b_bufobj`: Pointer to the owning bufobj. Links the buffer to its parent object.
-- `b_bcount`: The originally requested buffer size, used as a bounds check against EOF.
-- `b_data`: Pointer to the buffer''s data area. This is where I/O data is read into or written from.
-- `b_iocmd`: Command code from `bio.h`, indicating the type of I/O (BIO_READ, BIO_WRITE, etc.).
-- `b_ioflags`: Flags from `bio.h` controlling I/O behavior (B_ASYNC, B_DELWRI, etc.).
-- `b_iooffset`: The offset within the bufobj for this buffer.
-- `b_resid`: Number of bytes remaining after I/O completion. Zero indicates full success.
-- `b_iodone`: Callback function invoked when I/O completes.
+Key fields include `b_bufobj`, which points to the owning `bufobj` (typically a vnode's buffer object), and `b_data`, a pointer to the actual memory backing the buffer. `b_bcount` tracks the transfer length, while `b_resid` records the number of bytes remaining after an I/O completes. The `b_iocmd` and `b_ioflags` fields carry command codes and flags from the block I/O layer (`bio.h`). The `b_iodone` callback is invoked by the device driver upon I/O completion. `b_bufsize` indicates the allocation size of the buffer, and `b_offset` tracks the offset within the `bufobj`.
 
-### `struct bufobj`
-Defined in `sys/sys/bufobj.h`, the bufobj is the abstract owner of buffers.
+Buffers are organized into `struct bufqueue` structures, defined in `sys/kern/vfs_bio.c`:
 
 ```c
-struct bufobj {
-	struct rwlock	bo_lock;	/* Lock which protects "i" things */
-	struct buf_ops	*bo_ops;	/* - Buffer operations */
-	struct vm_object *bo_object;	/* v Place to store VM object */
-	LIST_ENTRY(bufobj) bo_synclist;	/* S dirty vnode list */
-	void		*bo_private;	/* private pointer */
-	struct bufv	bo_clean;	/* i Clean buffers */
-	struct bufv	bo_dirty;	/* i Dirty buffers */
-	int		bo_numoutput;	/* i Writes in progress */
-	u_int		bo_flag;	/* i Flags */
-	int		bo_domain;	/* - Clean queue affinity */
-	int		bo_bsize;	/* - Block size for i/o */
-};
+struct bufqueue {
+	struct mtx_padalign	bq_lock;
+	TAILQ_HEAD(, buf)	bq_queue;
+	uint8_t			bq_index;
+	uint16_t		bq_subqueue;
+	int			bq_len;
+} __aligned(CACHE_LINE_SIZE);
 ```
 
-Key fields:
-- `bo_lock`: An rwlock protecting internal bufobj state.
-- `bo_ops`: Pointer to the buf_ops function table.
-- `bo_object`: The associated VM object, linking the buffer cache to the VM subsystem.
-- `bo_clean` / `bo_dirty`: The clean and dirty buffer lists, each a `struct bufv`.
-- `bo_numoutput`: Counter of I/O operations currently in progress.
-- `bo_synclist`: Link in the global list of dirty vnodes, used for syncing.
+The `bq_lock` mutex protects the `bq_queue` tail queue. Each queue is aligned to the cache line size to prevent false sharing across CPUs.
 
-### `struct bufv`
-Defined in `sys/sys/bufobj.h`, the bufv tracks a collection of buffers associated with a bufobj.
+Per-CPU domains aggregate these queues in `struct bufdomain`:
 
 ```c
-struct bufv {
-	TAILQ_HEAD(, buf)	bv_hd;		/* Sorted blocklist */
-	struct pctrie	bv_root;	/* Buf trie */
-	int		bv_cnt;		/* Number of buffers */
+struct bufdomain {
+	struct bufqueue	*bd_subq;
+	struct bufqueue bd_dirtyq;
+	struct bufqueue	*bd_cleanq;
+	struct bufqueue	*bd_lruq;
+	uint32_t		bd_flags;
+	uint32_t		bd_pad;
 };
 ```
 
-Key fields:
-- `bv_hd`: A TAILQ of buffers sorted by block number.
-- `bv_root`: A percentage trie (`pctrie`) for efficient lookups by block number.
-- `bv_cnt`: Count of buffers in this collection.
-
-### `struct buf_ops`
-Defined in `sys/sys/bufobj.h`, the buf_ops table defines the I/O operations for a bufobj type.
-
-```c
-struct buf_ops {
-	const char	*bop_name;
-	b_write_t	*bop_write;
-	b_strategy_t	*bop_strategy;
-	b_sync_t	*bop_sync;
-	b_bdflush_t	*bop_bdflush;
-};
-```
+This structure groups subqueues, dirty buffers, clean buffers, and the LRU list per domain, enabling lock-free lookups for buffers that match the current CPU's domain.
 
 ## Deep Dive
-### Buffer Allocation and Initialization
-The buffer cache is initialized during kernel startup via `bufinit()` (called from `sys/kern/vfs_bio.c`). This function allocates the pool of `struct buf` objects, initializes the buffer domains and queues, and starts the buffer daemon thread. Buffers are allocated from the `M_BIOBUF` malloc type:
+When a filesystem needs to read a block, it calls `getblkx()` to locate or create a buffer for the requested offset. The buffer cache first searches the `bufobj`'s radix tree for an existing `struct buf` matching the requested offset. If found, the cache locks the buffer and validates its state. If the buffer is not resident, `allocbuf()` allocates a new `struct buf` and maps kernel virtual memory via the VM system's page management.
 
-```c
-static MALLOC_DEFINE(M_BIOBUF, "biobuf", "BIO buffer");
-```
+The actual I/O dispatch happens in `bufstrategy()`. This function checks for sequential access patterns and may invoke `cluster_read()` to prefetch adjacent blocks, reducing disk seek time. Once the request is prepared, `bufstrategy()` calls the device driver's `strategy` routine through the `bio_ops` interface. The driver executes the command asynchronously and, upon completion, calls `biodone()`.
 
-Each buffer is linked into the buffer domain''s subqueue, and the buffer daemon thread is created to periodically scan for dirty buffers that need to be written back.
+`biodone()` performs critical cleanup. It checks for I/O errors, updates `b_resid`, and calls the `b_iodone` callback if registered. If the buffer was part of a cluster, `cluster_callback()` handles the remaining buffers. Finally, `bdone()` transitions the buffer state to `BUF_DONE` and wakes up threads waiting via `biowait()`.
 
-### Reading Data — cluster_read
-The primary entry point for reading file data is `cluster_read()` (defined in `sys/kern/vfs_cluster.c`). This function replaces the older block-read path and implements read-ahead optimization:
+Dirty buffers follow a different path. When a filesystem modifies data, it calls `bdwrite()` or `bdirty()`. These functions mark the buffer dirty, update accounting counters, and move the buffer to the `bd_dirtyq` in the current domain's `bufdomain`. The `bufbdflush()` function, called periodically by the VM system, checks dirty buffer counts to determine if the system is under memory pressure. If dirty buffers exceed thresholds, `bufbdflush()` initiates writeback, calling `bufwrite()` for each dirty buffer until the pressure subsides.
 
-```c
-int
-cluster_read(struct vnode *vp, u_quad_t filesize, daddr_t lblkno, long size,
-    struct ucred *cred, long totread, int seqcount, int gbflags,
-    struct buf **bpp)
-```
-
-The function first checks if the requested block is already in the buffer cache. If not, it allocates a buffer, submits a BIO read request via `bufstrategy()`, and waits for completion. The `seqcount` parameter controls read-ahead: if sequential access is detected, additional blocks are pre-fetched up to `read_max` (configurable via sysctl `_vfs.read_max`, default 64 blocks).
-
-```c
-static int read_max = 64;
-SYSCTL_INT(_vfs, OID_AUTO, read_max, CTLFLAG_RW, &read_max, 0,
-    "Cluster read-ahead max block count");
-```
-
-### Writing Data — bdwrite and bawrite
-Dirty buffers are created through two main paths:
-
-1. **`bdwrite()`** — Marks a buffer dirty and queues it for delayed writeback. The buffer is not written immediately; instead, it is added to the dirty queue and will be flushed later by the buffer daemon.
-
-2. **`bawrite()`** — Initiates an asynchronous write. The buffer is submitted to the storage driver immediately, and the caller does not wait for completion.
-
-Both functions call `bdirty()` to mark the buffer dirty and add it to the bufobj''s dirty collection:
-
-```c
-void
-bdirty(struct buf *bp)
-{
-	...
-	bp->b_flags |= B_DELWRI;
-	bufobj_wref(bp->b_bufobj);
-	...
-}
-```
-
-The `B_DELWRI` flag indicates the buffer has delayed-write data that must be flushed before the buffer can be reclaimed.
-
-### I/O Completion — biodone and bdone
-When disk I/O completes, the GEOM layer invokes the buffer''s `b_iodone` callback, which ultimately calls `biodone()` (or `bdone()` for non-BIO paths). These functions:
-
-1. Clear the `B_BUSY` flag on the buffer.
-2. Update `b_resid` based on actual bytes transferred.
-3. Clear `B_ERROR` if the I/O succeeded.
-4. Invoke any user-supplied `b_iodone` callback.
-5. Wake up threads waiting via `biowait()`.
-6. Remove the buffer from the bufobj''s output count (`bo_numoutput`).
-
-```c
-void
-bdone(struct buf *bp)
-{
-	...
-	bp->b_flags &= ~B_BUSY;
-	if (bp->b_resid == 0)
-		bp->b_flags &= ~B_ERROR;
-	if (bp->b_iodone)
-		(*bp->b_iodone)(bp);
-	biowait(bp);
-	...
-}
-```
-
-### Writeback — buf_daemon and bufbdflush
-The buffer daemon thread (`buf_daemon`) runs periodically to flush dirty buffers. It scans the dirty queues of each bufdomain and submits I/O for buffers that have been dirty long enough. The daemon is controlled by sysctls and can be tuned for different workloads.
-
-The `bufbdflush()` function is called by the bufobj''s `bop_bdflush` callback to initiate writeback for a specific bufobj. It iterates over the dirty buffers and submits write BIOs.
-
-### Cluster Write — cluster_write
-For write-behind optimization, `cluster_write()` (in `sys/kern/vfs_cluster.c`) coalesces multiple small writes into larger operations:
-
-```c
-static int write_behind = 1;
-SYSCTL_INT(_vfs, OID_AUTO, write_behind, CTLFLAG_RW, &write_behind, 0,
-    "Cluster write-behind; 0: disable, 1: enable, 2: backed off");
-```
-
-### bufstate and Buffer Lifecycle
-A buffer transitions through several states during its lifetime:
-
-1. **Free** — Buffer is available in the free pool, not associated with any bufobj.
-2. **Busy (B_BUSY)** — Buffer is allocated and in use. I/O operations hold this flag.
-3. **Dirty (B_DELWRI)** — Buffer contains data not yet written to disk.
-4. **Done (B_DONE)** — I/O has completed successfully.
-5. **Error (B_ERROR)** — I/O encountered an error.
-
-The buffer state is tracked via flags in `b_flags` (from `bio.h`), not an explicit enum. Key flags include:
-- `B_BUSY`: Buffer is in use
-- `B_DONE`: I/O completed
-- `B_DELWRI`: Delayed write pending
-- `B_ASYNC`: Asynchronous I/O
-- `B_ERROR`: I/O error occurred
-- `B_KLOCK`: Kernel lock held on buffer
-- `B_CACHE`: Buffer data is valid (can be reused without I/O)
+Synchronous writes use `bawrite()` or `bufsync()`. `bawrite()` marks the buffer dirty and immediately calls `bufstrategy()` to dispatch the I/O, then blocks the caller until `bdone()` completes the operation. `bufsync()` iterates over all dirty buffers for a vnode, ensuring data is physically written to disk before returning.
 
 ## Flow / Diagram
 ```mermaid
 flowchart TD
-    A[VFS Layer] -->|bread/cluster_read| B[Buffer Cache]
-    B -->|Check cache| C{Buffer in cache?}
-    C -->|Yes| D[Return buffer data]
-    C -->|No| E[Allocate struct buf]
-    E --> F[Submit BIO via bufstrategy]
-    F --> G[GEOM Framework]
-    G --> H[Device Driver]
-    H --> I[Disk I/O]
-    I --> J[I/O Complete]
-    J --> K[biodone/bdone]
-    K --> L{Write?}
-    L -->|Yes| M[Mark dirty B_DELWRI]
-    L -->|No| N[Mark clean B_CACHE]
-    M --> O[Buffer daemon buf_daemon]
-    O --> P[Scan dirty queues]
-    P --> Q[Submit write BIO]
-    Q --> G
-    N --> D
-    D --> A
+    A[VFS Request] --> B{Buffer in Cache?}
+    B -->|Yes| C[Return Cached struct buf]
+    B -->|No| D[getblk / allocbuf]
+    D --> E[bufstrategy / cluster_read]
+    E --> F[Device Driver]
+    F --> G[biodone / b_iodone]
+    G --> H[bdone / biowait]
+    H --> I[Update State / Wake Waiters]
+
+    J[Write Request] --> K[bdwrite / bdirty]
+    K --> L[Mark Dirty / Move to bd_dirtyq]
+    L --> M{Memory Pressure?}
+    M -->|Yes| N[bufbdflush]
+    M -->|No| O[Background Flush]
+    N --> P[bufwrite / bawrite]
+    P --> E
+    O --> P
 ```
 
 ## Advanced Notes
-### Debugging with DTrace
-The FreeBSD buffer cache does not expose DTrace SDT probes. For observing buffer cache behavior, developers rely on kernel tracing mechanisms, ktrace, and sysctl-based metrics.
+Debugging buffer cache issues often requires DTrace or the kernel debugger. The `sys/kern/vfs_bio.c` file contains extensive KTR tracing points that can be enabled with `sysctl kern.ktr.buf=1`. When debugging I/O stalls, check `b_resid` and `b_ioflags` in `struct buf` to identify partial transfers or error conditions. The `buf_dirty_count_severe()` counter is critical for diagnosing writeback bottlenecks; if it remains high, the buffer cache may be starved of clean buffers, causing synchronous I/O to block.
 
-### Performance Considerations
-- **Buffer size alignment**: Buffers are allocated with sizes aligned to `DEV_BSIZE` or `PAGE_SIZE`, depending on the context. Misaligned allocations can cause performance degradation.
-- **Lock contention**: The per-domain queue organization reduces lock contention, but heavy buffer cache activity on a single domain can still cause bottlenecks.
-- **Dirty buffer pressure**: Too many dirty buffers can lead to memory pressure and delayed writeback. The buffer daemon and the VM pageout daemon work together to manage buffer space pressure, flushing dirty buffers when memory pressure increases.
-- **Cluster I/O tuning**: The `read_max` and `write_behind` sysctls allow tuning read-ahead and write-behind behavior for specific workloads.
+Performance tuning involves understanding the domain-based queueing model. Buffers are pinned to their allocating CPU's domain to minimize cross-core lock contention. However, heavy cross-domain I/O can cause load imbalance. Adjusting `vm.kmem_size` or `vm.kmem_size_max` affects memory allocation success rates, while `vfs.bufcache` sysctls control cache sizing. The clustering logic in `cluster_read()` and `cluster_write()` significantly impacts sequential throughput; disabling clustering via `sysctl vfs.cluster_read=0` can help diagnose seek-heavy workloads.
 
-### Common Pitfalls
-1. **Deadlocks from nested bufobj locks**: Holding a bufobj lock while waiting for I/O completion can cause deadlocks if the I/O path also needs the same lock. Always release bufobj locks before waiting.
-2. **Buffer leakage**: Failing to properly release buffers (via `brelse()` or `bqrelse()`) can exhaust the buffer pool and cause I/O hangs.
-3. **Stale data**: Forgetting to mark buffers as clean after writes can cause stale data to be served from the cache.
-
-### Connection to OS Theory
-FreeBSD''s buffer cache implements the classic "buffer cache" concept described in operating system textbooks such as "Operating Systems: Design and Implementation" by Tanenbaum and "Modern Operating Systems" by Tanenbaum. The key innovation in FreeBSD''s implementation is the decoupling of the buffer cache from vnodes via the bufobj abstraction, allowing the cache to be used by non-vfile systems like GEOM.
-
-The integration with the VM subsystem follows the "unified buffer/page cache" concept, where file data is cached in a single structure that serves both the buffer cache (for block I/O) and the page cache (for mmap''d access). This eliminates the need for separate caching layers and reduces memory overhead.
+A common pitfall is deadlocking on buffer locks. The buffer cache uses `BUF_LOCK` and `BUF_UNLOCK` with specific ordering rules. Always acquire the buffer lock before accessing `b_data` or modifying `b_iocmd`. When calling `bufstrategy()` from interrupt context, ensure the buffer is not already locked, as drivers expect exclusive access. The `biodone()` callback runs in interrupt context and must not sleep; use task queues for deferred processing.
 
 ## Comparison
-### Linux
-Linux uses the "page cache" as its primary caching mechanism, where file data is cached in `struct page` objects rather than a separate buffer cache. Linux''s `struct buffer_head` is used only for block I/O metadata, not for caching file data. This architectural difference means Linux has a single caching layer, while FreeBSD maintains a distinct buffer cache that interfaces with the VM page cache.
+Linux implements its block I/O subsystem using the `struct bio` and `struct page` split, where block requests are decoupled from page caching. FreeBSD unifies them under `struct buf`, which directly maps to `vm_page` via the `bufobj` abstraction. This reduces memory overhead but requires careful state management to avoid conflicts between VM pagers and block I/O. Linux uses `request_queue` and `blk-mq` for multi-queue I/O scheduling, while FreeBSD relies on GEOM (`sys/geom`) for device multipathing, load balancing, and stacking.
 
-Linux''s writeback is handled by the "pdflush" / "flush" kernel threads, which scan the dirty page list and write back dirty pages. FreeBSD''s approach with `buf_daemon` and per-domain dirty queues is similar in concept but differs in implementation details, particularly in how dirty buffers are organized and prioritized.
-
-### macOS/XNU
-macOS/XNU uses a unified cache called the "VFS cache" that combines buffer and page caching. The XNU buffer cache is less prominent than in FreeBSD, with most file caching handled through the VM subsystem. This is similar to Linux''s approach but with different internal structures.
-
-### NetBSD/OpenBSD
-NetBSD and OpenBSD also maintain distinct buffer caches, with implementations similar to FreeBSD''s. NetBSD''s buffer cache supports additional features like "soft updates" for journaling-like consistency without a full journal. OpenBSD''s implementation is more minimal, focusing on security and simplicity.
-
-All BSD variants share the common heritage of the 4.4BSD buffer cache design, with FreeBSD''s bufobj abstraction being a notable evolution that allows non-vnode users of the buffer cache.
+macOS/XNU uses the `buf` structure but manages buffer lifecycles through the `bufobj` abstraction integrated directly into the `vnode`, and relies on a different locking mechanism that does not employ FreeBSD's per-CPU `bufdomain` model, instead using a global `bufobj` lock per vnode. NetBSD's buffer cache uses the `struct buf` and `struct bufobj` similar to FreeBSD, but implements lock granularity through the `buf_lock` per-buffer mutex with different locking hierarchies in `sys/kern/vfs_bio.c`. FreeBSD's domain-based queueing strikes a middle ground, optimizing for NUMA architectures without excessive lock overhead.
 
 ## See Also
-- [Virtual Memory Subsystem — vm_page, UMA, and Pagers](../../../sys/vm/README.md)
-- [VFS — Virtual File System Layer](../../../sys/fs/README.md)
-- [GEOM — Storage Framework](../../../sys/geom/README.md)
-- [UFS — FreeBSD's Native Filesystem](../../../sys/ufs/README.md)
-
-
-
 - [Virtual Memory Subsystem — vm_page, UMA, and Pagers](README.md)
-- [GEOM — Storage Framework](../geom/README.md)
 - [VFS — Virtual File System Layer](../fs/README.md)
-- `sys/kern/vfs_bio.c` — Main buffer cache implementation
-- `sys/kern/vfs_cluster.c` — Cluster I/O (read-ahead, write-behind)
-- `sys/sys/buf.h` — Buffer structure definitions
-- `sys/sys/bufobj.h` — Bufobj and buf_ops definitions
-- `man buf(9)` — Buffer cache manual page
+- [GEOM — Storage Framework](../geom/README.md)
+- [UFS — FreeBSD's Native Filesystem](../ufs/README.md)
+
+- [Virtual Memory Subsystem — vm_page, UMA, and Pagers](vm/README.md)
+- [VFS — Virtual File System Layer](fs/README.md)
+- [GEOM — Storage Framework](geom/README.md)
+- `sys/kern/vfs_bio.c`
+- `sys/kern/vfs_cluster.c`
+- `sys/sys/buf.h`
+- `sys/sys/bufobj.h`
+- `man buf(9)`
+- `man bio(9)`
 
 ---
 
-> _Generated by [DaemonDocs](https://github.com/ocochard/DaemonDocs) on 2026-04-30 14:46 UTC using model `Qwen3.6-35B-A3B-UD-Q4_K_XL` (llama.cpp build `b8985-27aef3dd9`). AI-generated content — verify against source before relying on it._
+> _Generated by [DaemonDocs](https://github.com/ocochard/DaemonDocs) on 2026-05-01 06:23 UTC using model `Qwen3.6-35B-A3B-UD-Q4_K_XL` (llama.cpp build `b8985-27aef3dd9`). AI-generated content — verify against source before relying on it._

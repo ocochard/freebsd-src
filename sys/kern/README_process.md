@@ -3,6 +3,7 @@
 
 ---
 **Navigation:**
+  **Up:** [Kernel Core — Structure and Entry Point](../README.md) ▸ [Source Tree — Layout and Conventions](../../README_internals.md)
   **Related:** [Kernel Core — Structure and Entry Point](../README.md) | [Locking Primitives — Mutexes, sx, rmlocks, and Atomics](README_locking.md) | [Interrupt Handling — Threads, Filters, and Dispatch](README_intr.md) | [Jails — OS-level Isolation](README_jail.md)
   **All chapters:** [Source Tree — Layout and Conventions](../../README_internals.md) | [Boot Process — UEFI Bootloader to Kernel Handoff](../../stand/efi/loader/README.md) | [Kernel Core — Structure and Entry Point](../README.md) | [Build System — buildworld and buildkernel](../../share/mk/README.md) | [Virtual Memory Subsystem — vm_page, UMA, and Pagers](../vm/README.md) | [Locking Primitives — Mutexes, sx, rmlocks, and Atomics](README_locking.md) | [Buffer Cache — Block I/O Subsystem](../vm/README_bcache.md) | [GEOM — Storage Framework](../geom/README.md) ...
 ---
@@ -12,203 +13,421 @@
 
 
 ## Quick Summary
-In FreeBSD, a process is the fundamental unit of work. It is not merely a container for memory but a distinct entity with its own address space, file descriptors, and execution context. However, the kernel does not schedule "processes" directly; it schedules threads. Every process must have at least one thread of execution, which carries the actual CPU state (registers, stack, and program counter) and scheduling metadata. This separation allows a single process to execute multiple tasks concurrently, much like threads in a user-space library, but with full kernel privileges and isolation.
+FreeBSD manages processes and threads through a layered architecture that separates the concept of a process (a unit of resource ownership) from a thread (a unit of CPU execution). When a program calls the `fork()` library function, the C library wrapper issues the `sys_fork` syscall, which enters the kernel and creates a new process that initially shares the parent's memory through copy-on-write semantics. Each process contains one or more threads, each representing an independent flow of execution with its own register state and kernel stack. The kernel's 4BSD scheduler places runnable threads into priority-based run queues and dispatches them to available CPUs using time-sliced round-robin scheduling within each priority level.
 
-The lifecycle of a process begins with creation, typically via the `fork()` system call. This operation duplicates the calling process, creating a child that inherits the parent's memory, open files, and environment. The child then usually calls `execve()` to replace its memory image with a new program. When a process finishes its work, it enters an exit state where it cleans up its resources and waits for its parent to collect its exit status, a mechanism that prevents "zombie" processes from consuming system resources indefinitely.
+Process creation is a multi-stage operation. The `sys_fork` entry point in `sys/kern/kern_fork.c` delegates to `fork1`, which allocates a new process structure, duplicates the parent's file descriptor table and virtual memory map, creates a new thread, and places it on a run queue. The `kern_execve()` function then replaces the process's memory image with a new program. When a process terminates via `exit`, the kernel reaps its resources, notifies the parent, and potentially re-parents any remaining child processes to init.
 
-Scheduling in FreeBSD is handled by the kernel's scheduler, which decides which thread gets to run on which CPU. The classic 4BSD scheduler uses a time-sharing algorithm that estimates a thread's CPU usage and adjusts its priority dynamically. More recent implementations, such as the ULE (Urgent Level Exponential) scheduler, use per-CPU run queues to reduce lock contention and improve interactive performance on multi-core systems. Together, these mechanisms ensure that the system remains responsive while fairly distributing CPU time among competing processes.
+The 4BSD scheduler, implemented in `sys/kern/sched_4bsd.c`, uses a hierarchical priority scheme that combines static priority (user-settable nice value, range -20 to 19) with dynamic priority based on CPU usage estimates. Threads are organized into run queues indexed by priority, with each queue holding threads at the same priority level. The scheduler performs round-robin dispatch within each queue, giving each thread a time slice that shrinks as the thread's estimated CPU usage increases. This design ensures that interactive processes receive responsive scheduling while CPU-bound processes do not starve I/O-bound ones.
+
+CPU assignment in FreeBSD is managed through the cpuset framework, which allows threads and processes to be bound to specific subsets of CPUs. The `cpuset` syscalls (`cpuset_setaffinity`, `cpuset_getaffinity`) manipulate these CPU masks, and the scheduler respects them when placing threads on CPUs. On SMP systems, each CPU maintains its own run queue, and the scheduler can steal threads from other CPUs' queues to balance load. The relationship between `struct proc` and `struct thread` is fundamental: a process is a container for resources (memory, file descriptors, signals), while threads are the actual schedulable entities that execute code.
 
 ## Architecture
-The process management subsystem is distributed across several core files in `sys/kern`. The creation of new processes is orchestrated by `sys/kern/kern_fork.c`, which implements `sys_fork()` and the internal `fork1()` function. Process termination and cleanup are handled in `sys/kern/kern_exit.c`, particularly by the `exit1()` function. The lifecycle of threads is managed in `sys/kern/kern_thread.c`, which handles thread creation (`kthread_add()`) and destruction.
+The process management subsystem spans several source files in `sys/kern/`, each responsible for a distinct phase of the process lifecycle:
 
-Scheduling is implemented through a modular architecture. The generic scheduling interface is defined in `sys/kern/sched.h`, while specific algorithms are implemented in scheduler modules. The classic 4BSD scheduler is found in `sys/kern/sched_4bsd.c`, and the ULE scheduler is in `sys/kern/sched_ule.c`. These modules manage per-CPU run queues directly within their respective implementation files.
+- **`sys/kern/kern_fork.c`**: Implements `sys_fork`, `sys_vfork`, `sys_clone`, and `sys_pdfork`. The entry point `sys_fork` prepares fork flags and calls `fork1(td, &fr)`, where the internal request structure is populated with flags like `RFFDG` (share file descriptors) and `RFPROC` (create process). The `fork1` function allocates a new `struct proc`, duplicates the file descriptor table via `fdcopy`, copies the virtual memory map via `vm_map_copy`, and creates a new thread via `fork_exit`. An SDT probe `proc:::create` fires for DTrace instrumentation.
 
-The kernel maintains a global list of all processes, accessible via the `allproc` list, which can be traversed using `LIST_FOREACH(p, &allproc, p_list)`. Each process contains a list of its threads, accessible via `LIST_FOREACH(td, &p->p_threads, td_threadq)`. The proctree lock (`proctree_lock`) protects the parent-child and session/process group relationships, while per-thread locks protect individual thread state.
+- **`sys/kern/kern_exit.c`**: Implements process termination. The `sys_exit` syscall calls `exit1`, which performs accounting (`acct_process`), sends `SIGCHLD` to the parent, detaches the thread from the process, and calls `sched_exit` to notify the scheduler. If the process has children, they are re-parented to the real parent via `proc_reparent`. The function `proc_realparent` walks the process tree under `proctree_lock` to find the correct ancestor.
+
+- **`sys/kern/kern_thread.c`**: Manages thread lifecycle. This file contains KBI (Kernel Binary Interface) assertions that verify the layout of `struct thread` and `struct proc` for module compatibility. It defines thread creation via `fork_exit` and thread teardown. The file includes `sys/sys/turnstile.h` for priority inheritance and `sys/sys/sleepqueue.h` for sleep/wakeup synchronization.
+
+- **`sys/kern/sched_4bsd.c`**: Implements the 4BSD timeshare scheduler. It defines `struct td_sched` which extends `struct thread` with scheduling metadata including `ts_estcpu` (estimated CPU usage), `ts_slptime` (seconds not running), `ts_slice` (remaining time slice), and `ts_pctcpu` (percentage CPU during sleep time). The scheduler uses `struct runq` from `sys/sys/runq.h` to organize threads by priority.
+
+- **`sys/kern/init_main.c`**: Contains `mi_startup`, the kernel's initialization loop that iterates the `sysinit` framework, and `initproc`, which initializes `proc0` (the idle process) and spawns `/sbin/init`.
+
+The `sysinit` framework in `init_main.c` uses ELF linker sets (`__start_set_sysinit`/`__stop_set_sysinit`) to register initialization functions in priority order. `mi_startup` calls `sysinit_compar` to sort entries by `si_sub` and `si_order`, then invokes each function. This ensures that virtual memory initialization (`SI_SUB_VM`) completes before process management (`SI_SUB_RUNCPU`) begins.
 
 ## Key Data Structures
-The two primary structures in FreeBSD process management are `struct proc` and `struct thread`.
 
-`struct proc` (defined in `sys/sys/proc.h`) represents the process as a whole. Key fields include:
-- `p_state`: The current state of the process (e.g., `PRS_ZOMBIE`, `PRS_RUNNING`).
-- `p_pid`: The process identifier.
-- `p_pptr`: Pointer to the parent process.
-- `p_vmspace`: Pointer to the virtual memory space.
-- `p_filedesc`: Pointer to the file descriptor table.
-- `p_threads`: A list of threads belonging to the process.
+### struct proc (from sys/sys/proc.h)
+The process structure represents a unit of resource ownership. Key fields include:
 
-`struct thread` (defined in `sys/sys/proc.h`) represents a single execution context. Key fields include:
-- `td_state`: The current state of the thread (e.g., `TS_RUN`, `TS_WAIT`).
-- `td_proc`: Pointer to the owning process.
-- `td_frame`: The kernel trap frame, containing the CPU registers when the thread was last in the kernel.
-- `td_pcb`: The process control block, containing machine-specific context (e.g., stack pointer).
-- `td_flags`: Flags indicating thread state, such as `TDF_RUNNING` or `TDF_SLEEPING`.
-- `td_sched`: A scheduler-specific extension structure.
+```c
+struct proc {
+    LIST_ENTRY(proc) p_list;    /* List of all processes. */
+    struct session *p_session;  /* Pointer to session. */
+    struct pgrp *p_pgrp;        /* Pointer to process group. */
+    struct thread *p_threads;   /* List of threads. */
+    void *p_sysmsg;             /* System call processing state. */
+    pid_t p_pid;                /* Process identifier. */
+    pid_t p_ppid;               /* Parent process id. */
+    struct proc *p_pptr;        /* Pointer to parent process. */
+    struct proc *p_oppid;       /* Saved p_pid of parent. */
+    struct filedesc *p_fd;      /* Open file information. */
+    struct vmspace *p_vmspace;  /* Address space. */
+    int p_flag;                 /* P_* flags. */
+    int p_stat;                 /* S* process status. */
+    char p_comm[MAXCOMLEN + 1]; /* Name, for p_comm. */
+    /* ... many more fields ... */
+};
+```
 
-For the 4BSD scheduler, `struct td_sched` (defined in `sys/kern/sched_4bsd.c`) contains:
+The `p_stat` field tracks process state: `SSLEEP` (sleeping), `SRUN` (runnable), `SZOMB` (zombie), `SSTOP` (stopped), and `SSIDL` (initializing). The `p_flag` field contains flags like `P_SA` (signal async), `P_TRACED` (being debugged), and `P_WEXIT` (exiting). The `proctree_lock` sx-lock protects the parent-child relationship in the process tree.
+
+### struct thread (from sys/sys/proc.h)
+The thread structure represents a schedulable execution context:
+
+```c
+struct thread {
+    struct proc *td_proc;       /* Back pointer to "current" proc. */
+    struct mdthread td_md;      /* Machine-dependent thread state. */
+    struct td_sched td_sched;   /* Scheduler-specific state. */
+    u_long td_flags;            /* TDF_* flags. */
+    struct pcb *td_pcb;         /* Process control block. */
+    caddr_t td_kstack;          /* Kernel stack. */
+    caddr_t td_sp;              /* Thread stack pointer. */
+    struct trapframe *td_frame; /* Kernel trap frame. */
+    /* ... many more fields ... */
+};
+```
+
+The `td_flags` field includes `TDF_RUNNING` (currently executing), `TDF_RUNQ` (on a run queue), `TDF_SLEEPING` (sleeping), and `TDF_SINTR` (interruptible sleep). The `td_sched` substructure contains the 4BSD scheduler's per-thread state. Each thread has its own kernel stack (`td_kstack`) and stack pointer (`td_sp`).
+
+### struct td_sched (from sys/kern/sched_4bsd.c)
+The 4BSD scheduler extends each thread with scheduling metadata:
+
 ```c
 struct td_sched {
-	fixpt_t		ts_pctcpu;	/* %cpu during p_swtime. */
-	u_int		ts_estcpu;	/* Estimated cpu utilization. */
-	int		ts_cpticks;	/* Ticks of cpu time. */
-	int		ts_slptime;	/* Seconds !RUNNING. */
-	int		ts_slice;	/* Remaining part of time slice. */
-	int		ts_flags;
-	struct runq	*ts_runq;	/* runq the thread is currently on */
+    fixpt_t     ts_pctcpu;      /* %cpu during p_swtime. */
+    u_int       ts_estcpu;      /* Estimated cpu utilization. */
+    int         ts_cpticks;     /* Ticks of cpu time. */
+    int         ts_slptime;     /* Seconds !RUNNING. */
+    int         ts_slice;       /* Remaining part of time slice. */
+    int         ts_flags;
+    struct runq *ts_runq;       /* runq the thread is currently on */
+#ifdef KTR
+    char        ts_name[TS_NAME_LEN];
+#endif
 };
 ```
-The `struct runq` (defined in `sys/kern/sched_4bsd.c`) is a set of priority queues:
+
+The `ts_estcpu` field tracks estimated CPU usage, computed from `ts_cpticks` (ticks of CPU time) over a decay window. The `ts_slptime` field counts seconds since the thread last ran, which reduces its dynamic priority. The `ts_slice` field is the remaining portion of the thread's time slice; when it reaches zero, the `TDF_SLICEEND` flag is set and the thread is rescheduled.
+
+### struct runq (from sys/sys/runq.h)
+The run queue structure organizes threads by priority:
+
 ```c
 struct runq {
-	struct rq_status	rq_status;
-	rq_queue		rq_queues[RQ_NQS];
+    struct rq_status    rq_status;
+    struct rq_queue     rq_queues[RQ_NQS];
 };
 ```
-It uses a bit array (`rq_status`) to quickly find the highest-priority non-empty queue.
+
+`RQ_NQS` is the number of run queues, computed as `(RQ_MAX_PRIO + 1) / RQ_PPQ` where `RQ_MAX_PRIO` is 255 and `RQ_PPQ` is 1 (priority per queue). The `rq_status` field is a bit array (`rq_sw[RQSW_NB]`) that tracks which queues are non-empty, enabling O(1) finding of the highest-priority runnable thread via `RQSW_BSF` (bit scan first set). Each `rq_queue` is a `TAILQ_HEAD(rq_queue, thread)` — a TAILQ list of `struct thread` pointers at that priority level, defined as a typedef rather than a custom struct.
+
 
 ## Deep Dive
-### Process Creation: `sys_fork()` / `fork1()`
-When a user-space program calls `fork()`, the kernel's `sys_fork()` function in `sys/kern/kern_fork.c` is invoked. It allocates a new process structure and prepares flags like `RFFDG` (share file descriptors) and `RFPROC` (create a process), then calls `fork1()`.
 
-The kernel-side implementation from `sys/kern/kern_fork.c`:
+### Process Creation: From sys_fork to a Runnable Thread
+
+When a user-space process calls the `fork()` library function, the C library wrapper issues the `sys_fork` syscall, which enters the kernel through the system call dispatch mechanism. In `sys/kern/kern_fork.c`, the `sys_fork` function is the entry point:
+
 ```c
 int
 sys_fork(struct thread *td, struct fork_args *uap)
 {
-	struct proc *p2;
-	int error, pid;
+    struct fork_req fr;
+    int error, pid;
 
-	error = fork1(td, &p2, &pid, RFFDG | RFPROC, NULL);
-	if (error == 0) {
-		td->td_retval[0] = pid;
-		td->td_retval[1] = 0;
-	}
-	return (error);
+    bzero(&fr, sizeof(fr));
+    fr.fr_flags = RFFDG | RFPROC;
+    fr.fr_pidp = &pid;
+    error = fork1(td, &fr);
+    if (error == 0) {
+        td->td_retval[0] = pid;
+        td->td_retval[1] = 0;
+    }
+    return (error);
 }
 ```
 
-`fork1()` is the core of the fork operation. It performs several critical steps:
-1. **Resource Limits**: Checks if the process has exceeded system limits for the number of processes or memory.
-2. **Memory Allocation**: Allocates a new `struct proc` and `struct thread` from the kernel's UMA zones.
-3. **State Copying**: Duplicates the parent's address space (`vmspace`), file descriptor table (`filedesc`), signal handlers, and other resources. This is a "copy-on-write" operation; the child initially shares the parent's physical memory pages.
-4. **Scheduling**: The child thread is placed on a run queue, ready to execute.
-5. **Return Values**: The function sets the return value for the child thread to `0`, while the parent receives the child's PID.
+The function initializes an internal request structure with `RFFDG` (share file descriptors with parent) and `RFPROC` (create a process). It passes the address of `pid` to receive the child's PID. The actual work happens in `fork1`, which performs these steps:
 
-### Process Execution: `do_execve()`
-After `fork()`, the child typically calls `execve()` to run a new program. This is handled by `do_execve()` in `sys/kern/kern_exec.c` (for ELF binaries). `execve()` is more destructive than `fork()`; it replaces the process's memory space entirely. Note that `execve()` is the user-space libc wrapper; the kernel entry point is `sys_execve()`.
+1. **Allocate a new process**: `malloc(sizeof(struct proc), M_PROC, M_WAITOK)` allocates a `struct proc` from the `M_PROC` malloc type.
 
-The kernel-side declaration from `sys/kern/kern_exec.c`:
+2. **Initialize the process**: The new process inherits the parent's session, process group, credentials, and resource limits. The file descriptor table is duplicated via `fdcopy`, which creates a new `struct filedesc` with references to the same underlying `struct file` objects.
+
+3. **Copy the virtual memory map**: `vm_map_copy` creates a copy-on-write copy of the parent's `vm_map`. This is efficient because pages are not physically duplicated; instead, they are marked read-only and a fault handler duplicates them on write.
+
+4. **Create a new thread**: `fork_exit` creates a new `struct thread` with its own kernel stack. The thread's register state is set up to return from the `fork` syscall with the child PID (0 for the child, parent PID for the parent).
+
+5. **Set up scheduling**: The new thread's `td_sched` structure is initialized with `ts_estcpu = 0`, `ts_slptime = 0`, and `ts_slice` based on the current time slice. The thread is placed on the run queue via `sched_add`.
+
+6. **Fire SDT probe**: `SDT_PROBE(proc, , , create, parent, child, pid)` fires a DTrace probe for process creation tracing.
+
+7. **Return**: The parent's `sys_fork` returns the child PID in `td->td_retval[0]`.
+
+The child thread becomes runnable and will be dispatched by the scheduler on the next clock tick or when the parent yields.
+
+### Thread Representation and the 4BSD Scheduler
+
+The 4BSD scheduler in `sys/kern/sched_4bsd.c` implements a priority-based, time-sliced scheduling algorithm. The key insight is that threads are organized into run queues indexed by priority, and each queue uses a TAILQ for FIFO ordering within the same priority.
+
+The scheduler tracks estimated CPU usage through `ts_estcpu`, which is updated in `statclock` (the periodic clock interrupt handler). The formula for `ts_estcpu` uses an exponential moving average:
+
 ```c
-static int do_execve(struct thread *td, struct image_args *args,
-    struct mac *mac_p, struct vmspace *oldvmspace);
+#define INVERSE_ESTCPU_WEIGHT (8 * smp_cpus)
+#define NICE_WEIGHT 1
+#define ESTCPULIM(e)     min((e), INVERSE_ESTCPU_WEIGHT *         (NICE_WEIGHT * (PRIO_MAX - PRIO_MIN) +          PRI_MAX_TIMESHARE - PRI_MIN_TIMESHARE)         + INVERSE_ESTCPU_WEIGHT - 1)
 ```
 
-The `do_execve()` flow involves:
-1. **Argument Parsing**: The kernel copies the command-line arguments and environment variables from user space into a kernel virtual address (`exec_args_kva`).
-2. **Image Activation**: The `imgact_elf` module identifies the binary format and loads the executable. It maps the new program's segments into the process's virtual address space.
-3. **Stack Setup**: A new user-space stack is created, and the arguments/environment are copied onto it.
-4. **Execution**: The thread's program counter is set to the entry point of the new binary, and it resumes execution in user mode.
+The `ts_estcpu` value ranges from 0 to `ESTCPULIM`, and the dynamic priority is computed as:
 
-### Process Termination: `exit1()`
-When a process calls `exit()` or returns from `main()`, the kernel's `exit1()` function in `sys/kern/kern_exit.c` is called. Note that `exit()` is the user-space libc wrapper; the kernel entry point is `sys_exit()`. This function:
-1. **Sends Signals**: Notifies the parent process (if any) via `SIGCHLD`.
-2. **Frees Resources**: Closes all file descriptors, releases memory (`vmspace`), and detaches from the terminal.
-3. **Zombie State**: The process is not immediately destroyed. It enters the `PRS_ZOMBIE` state, retaining its `struct proc` to store its exit status. This allows the parent to call `kern_wait()` to retrieve the status.
-4. **Reparenting**: If the parent is gone, the process is reparented to `init` (PID 1).
+```
+dynamic_priority = static_priority - (ts_estcpu / INVERSE_ESTCPU_WEIGHT)
+```
 
-### Scheduling: The 4BSD Algorithm
-The 4BSD scheduler (`sys/kern/sched_4bsd.c`) uses a time-sharing approach. Each thread has an estimated CPU usage (`ts_estcpu`) and a sleep time (`ts_slptime`). The scheduler dynamically adjusts priorities:
-- **Interactive Boost**: Threads that sleep frequently (e.g., waiting for I/O) are given higher priority to improve responsiveness.
-- **CPU Hog Detection**: Threads that run for long periods without sleeping have their priority reduced.
-- **Time Slicing**: Each thread is allocated a time slice (measured in clock ticks). When the slice expires, the thread is placed back on the run queue, and the next highest-priority thread is scheduled.
+This means that as a thread uses more CPU, its estimated usage increases, and its dynamic priority decreases (higher number = lower priority). The `ts_slptime` field tracks how long a thread has been sleeping, and sleeping threads get a priority boost:
 
-The ULE scheduler (`sys/kern/sched_ule.c`) improves on this by using per-CPU run queues (`struct tdq`). This reduces lock contention because each CPU can manage its own queue independently. ULE also supports thread migration, allowing a thread to run on a different CPU if it becomes idle, provided it is not pinned to a specific CPU.
+```c
+ts->ts_slptime++;
+if (ts->ts_slptime > 4) {
+    /* Give sleeping threads a priority boost */
+}
+```
+
+This boost ensures that interactive processes (which sleep waiting for I/O) remain responsive.
+
+When a thread is added to the run queue via `sched_add`, the scheduler:
+
+1. Computes the thread's priority based on `ts_estcpu`, `ts_slptime`, and the nice value.
+2. Calls `runq_add(&tdq->tdq_runq, td, 0)` to add the thread to the appropriate run queue.
+3. Sets the `TDF_RUNQ` flag on the thread.
+4. If this is the highest-priority thread on the CPU, it may trigger a context switch via `cpu_ast` (asynchronous system trap).
+
+The `runq_add` function in `sys/sys/runq.h` adds the thread to the TAILQ at the computed priority index and updates the status word:
+
+```c
+void
+runq_add(struct runq *rq, struct thread *td, int _flags)
+{
+    int idx;
+    idx = RQ_PRI_TO_QUEUE_IDX(td->td_priority);
+    runq_add_idx(rq, td, idx, _flags);
+}
+```
+
+The `RQ_PRI_TO_QUEUE_IDX` macro converts a priority value to a queue index:
+
+```c
+#define RQ_PRI_TO_QUEUE_IDX(pri) ((pri) / RQ_PPQ)
+```
+
+### Process Termination: From sys_exit to Resource Reaping
+
+When a process calls `exit()`, the kernel performs the following steps in `sys/kern/kern_exit.c`:
+
+1. **`sys_exit` entry**: The system call entry point receives the exit status code.
+
+2. **`exit1` function**: The main exit routine performs:
+   - `acct_process`: Writes accounting information if enabled.
+   - `exit_onexit`: Calls any registered exit handlers.
+   - `sched_exit`: Notifies the scheduler that the thread is exiting.
+   - Sends `SIGCHLD` to the parent process.
+   - Detaches the thread from the process.
+   - Re-parents any children to the real parent via `proc_reparent`.
+   - Frees the process's resources (memory, file descriptors, etc.).
+   - Sets the process state to `SZOMB` (zombie).
+
+3. **`proc_reparent`**: Walks the process tree under `proctree_lock` and re-parents orphaned children to their real parent (the parent's parent, or init if the parent was init).
+
+4. **Zombie state**: The process remains in `SZOMB` state until the parent calls the user-space `wait()` library function (described in `man 2 wait`) to reap it. The zombie's exit status is stored in the process structure.
+
+The `proc_realparent` function in `kern_exit.c` finds the correct parent:
+
+```c
+struct proc *
+proc_realparent(struct proc *child)
+{
+    struct proc *p, *parent;
+
+    sx_assert(&proctree_lock, SX_LOCKED);
+    if ((child->p_treeflag & P_TREE_ORPHANED) == 0)
+        return (child->p_pptr->p_pid == child->p_oppid ?
+            child : child->p_pptr);
+    /* ... handle orphaned case ... */
+}
+```
 
 ## Flow / Diagram
-The following Mermaid diagram illustrates the lifecycle of a process from creation to termination:
 
 ```mermaid
 sequenceDiagram
     participant User as User Space
-    participant Kernel as Kernel
-    participant Fork as kern_fork.c
-    participant Sched as Scheduler
-    participant Proc as struct proc
+    participant Fork as sys_fork (kern_fork.c)
+    participant Fork1 as fork1 (kern_fork.c)
+    participant VM as Virtual Memory
+    participant Sched as 4BSD Scheduler
+    participant Runq as Run Queue
     participant Thread as struct thread
-    participant Parent as Parent Process
+    participant Proc as struct proc
+    participant Exec as kern_execve (kern_exec.c)
+    participant Exit as sys_exit (kern_exit.c)
 
-    User->>Kernel: fork()
-    Kernel->>Fork: sys_fork()
-    Fork->>Fork: fork1()
-    Fork->>Proc: Allocate new struct proc
-    Fork->>Thread: Allocate new struct thread
-    Fork->>Thread: Copy parent state (vmspace, filedesc)
-    Fork->>Sched: sched_add()
-    Sched->>Thread: Add to run queue
-    Fork-->>User: Return PID (parent), 0 (child)
+    User->>Fork: fork() syscall
+    Fork->>Fork1: fork1(td, &fr)
+    Fork1->>Proc: malloc(M_PROC)
+    Fork1->>Proc: Initialize process fields
+    Fork1->>VM: vm_map_copy (copy-on-write)
+    Fork1->>VM: fdcopy (share file descriptors)
+    Fork1->>Thread: Create new thread
+    Thread->>Sched: sched_add
+    Sched->>Runq: runq_add (by priority)
+    Runq-->>Sched: Thread queued
+    Sched-->>Fork1: Thread added to run queue
+    Fork1-->>Fork: Return success
+    Fork-->>User: Return child PID
 
-    User->>Kernel: execve()
-    Kernel->>Fork: do_execve()
-    Fork->>Proc: Free old vmspace
-    Fork->>Proc: Map new executable
-    Fork->>Thread: Set new PC
-    Thread-->>User: New program starts
+    Note over User,Exec: Later: Child calls kern_execve()
+    User->>Exec: execve("/bin/sh", ...)
+    Exec->>VM: exec_new_vmspace
+    Exec->>VM: exec_map_stack
+    Exec->>VM: exec_copyout_strings
+    Exec-->>User: Return 0
 
-    User->>Kernel: exit()
-    Kernel->>Fork: exit1()
-    Fork->>Sched: sched_remove()
-    Fork->>Proc: Set PRS_ZOMBIE
-    Fork-->>User: Process waits for parent
-    Parent->>Kernel: kern_wait()
-    Kernel->>Fork: Collect exit status
-    Fork->>Proc: Free struct proc
+    Note over User,Exit: Eventually: Process exits
+    User->>Exit: exit(status) syscall
+    Exit->>Exit: exit1
+    Exit->>Sched: sched_exit
+    Exit->>Exit: acct_process
+    Exit->>Exit: Send SIGCHLD to parent
+    Exit->>Exit: proc_reparent children
+    Exit->>Exit: Free resources
+    Exit-->>Proc: State = SZOMB
 ```
 
 ## Advanced Notes
-### Debugging with DTrace
-FreeBSD provides DTrace probes for process management. The `proc:::create` probe fires when a new process is created, providing pointers to the parent and child `struct proc`. The `proc:::exit` probe fires when a process enters the zombie state. These probes are defined in `sys/kern/kern_fork.c` and `sys/kern/kern_exit.c` using `SDT_PROBE_DEFINE`.
 
-Example DTrace script to trace process creation:
-```c
-proc:::create
-{
-    printf("PID %d created by PID %d
-", arg0->p_pid, arg1->p_pid);
-}
+### Debugging with DTrace
+
+FreeBSD's 4BSD scheduler exposes several SDT (Static DTrace Tr probes for debugging:
+
+- **`proc:::create`**: Fires when a new process is created. Arguments: parent proc, child proc, child PID.
+- **`proc:::exit`**: Fires when a process exits. Argument: exit status.
+- **`proc:::exec`**: Fires when a process executes a new program. Argument: path.
+
+To trace process creation:
+```
+dtrace -n 'proc:::create { printf("Created PID %d from PID %d\n", arg2, arg1); }'
+```
+
+To trace process execution:
+```
+dtrace -n 'proc:::exec { printf("Exec: %s\n", str(arg0)); }'
 ```
 
 ### Performance Implications
-The choice of scheduler has a significant impact on system performance. The 4BSD scheduler, with its single global run queue, can suffer from lock contention on multi-core systems. The ULE scheduler mitigates this by using per-CPU run queues, allowing for better scalability. However, thread migration between CPUs can cause cache misses, which is why ULE tries to keep threads on their "home" CPU when possible.
 
-### Common Pitfalls
-- **Zombie Processes**: If a parent process does not call `kern_wait()`, its children will remain in the zombie state, consuming kernel resources. This is a common issue in long-running daemon processes that fork children but do not reap them.
-- **Resource Leaks**: Failure to close file descriptors or release memory in `exit1()` can lead to resource exhaustion. The kernel's resource management handles cleanup automatically, but user-space bugs can still cause issues.
-- **Priority Inversion**: In real-time systems, a high-priority thread waiting for a low-priority thread to release a lock can cause priority inversion. FreeBSD's mutexes support priority inheritance to mitigate this.
+The 4BSD scheduler's use of a bit-array status word (`rq_sw`) for run queue status enables O(1) finding of the highest-priority runnable thread. The `RQSW_BSF` macro uses `ffsl` (find first set bit) to scan the status word:
+
+```c
+#define RQSW_BSF(word) __extension__ ({     int _res = ffsl((long)(word));     MPASS(_res > 0);     _res - 1; })
+```
+
+This is significantly faster than iterating through all queues. On x86_64, `ffsl` compiles to the `bsf` instruction, which returns the index of the first set bit in a single cycle.
+
+The time slice calculation in the 4BSD scheduler is designed to balance interactivity and throughput. Interactive processes that sleep frequently get a priority boost proportional to their sleep time, up to a maximum boost. This ensures that GUI applications and interactive shells remain responsive even under heavy CPU load.
+
+The `ts_estcpu` field uses an exponential moving average with a decay factor that depends on the number of CPUs (`INVERSE_ESTCPU_WEIGHT = 8 * smp_cpus`). This means that on multi-CPU systems, the estimation window is longer, which smooths out short-term fluctuations in CPU usage.
+
+### Race Conditions and Locking
+
+The scheduler uses several locks to protect its data structures:
+
+- **`sched_lock`**: A mutex that protects the run queues and `td_sched` fields. All run queue operations (`runq_add`, `runq_remove`) acquire this lock.
+- **`proctree_lock`**: An sx-lock that protects the parent-child relationship in the process tree. Used by `proc_reparent` and `proc_realparent`.
+- **`td->td_lock`**: A per-thread lock that protects thread-specific fields.
+
+A common pitfall is deadlocking when acquiring multiple locks in inconsistent order. The kernel enforces a strict lock ordering: `sched_lock` must be acquired before `proctree_lock`, and both must be acquired before `td->td_lock`.
+
+Another pitfall is the "thundering herd" problem when many threads wake up simultaneously. The scheduler mitigates this by using turnstiles (from `sys/sys/turnstile.h`) for priority inheritance and wakeup optimization.
+
+### Connection to OS Theory
+
+The 4BSD scheduler implements a variant of the Multilevel Feedback Queue (MLFQ) algorithm, as described in Silberschatz, Galvin, and Gagne's "Operating System Concepts". The key differences from the textbook MLFQ are:
+
+1. **Priority decay**: Instead of demoting threads to lower queues after using their time slice, the 4BSD scheduler adjusts the dynamic priority based on `ts_estcpu`, which is a continuous function of CPU usage.
+
+2. **Sleep priority boost**: The 4BSD scheduler gives sleeping threads a priority boost proportional to their sleep time, which is not explicitly described in the basic MLFQ algorithm.
+
+3. **Nice value integration**: The nice value is integrated into the priority calculation as an offset, rather than as a separate queue level.
+
+These modifications make the 4BSD scheduler more suitable for interactive systems while maintaining throughput for batch jobs.
+
+### ULE Scheduler Overview (from sys/kern/sched_ule.c)
+
+FreeBSD also includes the ULE (last three letters of "schedule") scheduler in `sys/kern/sched_ule.c`, which provides an alternative scheduling policy. Unlike the 4BSD scheduler that uses a single `struct td_sched` embedded in `struct thread`, ULE defines its own `struct td_sched` with different fields:
+
+```c
+struct td_sched {
+    short       ts_flags;       /* TSF_* flags. */
+    int         ts_cpu;         /* CPU we are on, or were last on. */
+    u_int       ts_rltick;      /* Real last tick, for affinity. */
+    u_int       ts_slice;       /* Ticks of slice remaining. */
+    u_int       ts_ftick;       /* %CPU window's first tick */
+    u_int       ts_ltick;       /* %CPU window's last tick */
+    u_int       ts_slptime;     /* Number of ticks we vol. slept */
+    u_int       ts_runtime;     /* Number of ticks we were running */
+    u_int       ts_ticks;       /* pctcpu window's running tick count */
+#ifdef KTR
+    char        ts_name[TS_NAME_LEN];
+#endif
+};
+```
+
+Key differences between 4BSD and ULE:
+
+- **Tick-based accounting**: ULE tracks `ts_runtime` and `ts_slptime` in ticks rather than seconds, providing finer-grained scheduling decisions.
+- **Affinity tracking**: ULE maintains `ts_rltick` (real last tick) for CPU affinity decisions, allowing threads to be pinned or migrated based on recent execution history.
+- **Flag-based binding**: The `TSF_BOUND` flag (`0x0001`) indicates a thread cannot migrate, while `TSF_XFERABLE` (`0x0002`) marks threads eligible for transfer between CPUs.
+- **Independent CPU run queues**: ULE supports independent per-CPU run queues with fine-grain locking, providing superior interactive performance under load even on uni-processor systems.
+
+The ULE scheduler is the default scheduler on FreeBSD 6.x and later, while the 4BSD scheduler remains available for compatibility and comparison purposes.
 
 ## Comparison
-FreeBSD's process management differs significantly from Linux. Linux uses a single `task_struct` to represent both processes and threads, whereas FreeBSD uses separate `struct proc` and `struct thread` structures. This separation allows FreeBSD to have a cleaner abstraction for multi-threaded processes.
 
-Linux's Completely Fair Scheduler (CFS) uses a red-black tree to manage run queues, focusing on fairness and minimizing latency. FreeBSD's 4BSD scheduler uses a set of priority queues with dynamic priority adjustment, which is simpler but can be less predictable under heavy load. The ULE scheduler brings FreeBSD closer to CFS in terms of performance but retains the queue-based approach.
+### FreeBSD vs Linux
 
-macOS/XNU, derived from FreeBSD, also uses a similar process/thread model but has a more complex scheduler that integrates real-time and user-space priorities. NetBSD and OpenBSD share many similarities with FreeBSD but have their own scheduling algorithms and process management details.
+FreeBSD's process model differs from Linux's in several key ways:
+
+- **Process vs Thread**: FreeBSD has a clear separation between `struct proc` (resource container) and `struct thread` (execution context). Linux uses `task_struct` for both, with threads being lightweight processes (`CLONE_THREAD`). This makes FreeBSD's model more explicit about resource ownership.
+
+- **Scheduler**: FreeBSD's 4BSD scheduler uses priority-based run queues with time-sliced round-robin within each queue. Linux's CFS (Completely Fair Scheduler) uses a red-black tree keyed on virtual runtime, providing finer-grained fairness. FreeBSD's approach is simpler and has lower overhead, while CFS provides more predictable latency.
+
+- **Run Queues**: FreeBSD maintains per-CPU run queues (`struct runq`), while Linux uses per-CPU runqueues (`struct rq`) with additional load-balancing mechanisms. FreeBSD's run queue status word (`rq_sw`) enables O(1) priority finding, while Linux's red-black tree provides O(log n) operations.
+
+- **Memory Management**: FreeBSD uses UMA (Uniform Memory Allocator) for kernel object allocation, while Linux uses SLUB. FreeBSD's `vm_map` uses a red-black tree with `struct vm_map_entry` nodes that contain both `left` and `right` pointers for tree navigation, whereas Linux's `vm_area_struct` uses a simple linked list (`vm_next`/`vm_prev`) for its address space entries. FreeBSD's copy-on-write implementation shares `vm_object` structures between parent and child after `fork()`.
+
+### FreeBSD vs NetBSD/OpenBSD
+
+NetBSD and OpenBSD share similar process management concepts with FreeBSD but differ in implementation details:
+
+- **NetBSD** uses a scheduler similar to 4BSD but with different priority calculations. NetBSD's `struct proc` includes `p_vnet` (a pointer to `struct vnode` for virtual network namespace state) and `p_cred` with separate `p_ucred` for user credentials and `p_racct` for resource accounting fields that FreeBSD keeps in separate structures.
+
+- **OpenBSD** emphasizes security and has simplified the process model. OpenBSD's `struct proc` in `sys/sys/proc.h` uses `LIST_ENTRY(proc) p_list` for the process list (same as FreeBSD) but defines `struct pcpu` per-CPU data differently. OpenBSD's scheduler in `sys/kern/sched_mbi.c` uses a simpler priority scheme with 128 priority levels (vs FreeBSD's 256) and calculates priority as `PRI_TIMESHARE + p_nice` without the exponential moving average decay that FreeBSD's `ts_estcpu` provides. OpenBSD also lacks the `struct td_sched` extension — scheduling metadata is stored directly in `struct thread` without a separate embedded structure.
+
+- **macOS/XNU**: XNU uses the Mach microkernel's `task` and `thread` abstraction where `struct mach_task_basic` contains a `thread_act_array_t` of threads, and scheduling is handled by `bsd_sched` which maps BSD priorities to Mach `policy_priority_t`. Unlike FreeBSD's `struct proc`/`struct thread` split, XNU's `struct proc` contains a pointer to `struct task` which contains the thread list. XNU's scheduler uses `thread_t` with `thread_policy_t` for real-time scheduling (`SCHED_RR`, `SCHED_FIFO`) and `bsd_sched` for BSD timeshare, providing both Mach-level real-time and BSD-level scheduling in a single framework.
 
 ## See Also
-- [Kernel Core — Structure and Entry Point](../../sys/README.md)
-- [Interrupt Handling — Threads, Filters, and Dispatch](../../../sys/kern/README_intr.md)
-- [Locking Primitives — Mutexes, sx, rmlocks, and Atomics](../../../sys/kern/README_locking.md)
-- [Jails — OS-level Isolation](../../../sys/kern/README_jail.md)
+- [Kernel Core — Structure and Entry Point](../README.md)
+- [Interrupt Handling — Threads, Filters, and Dispatch](README_intr.md)
+- [Locking Primitives — Mutexes, sx, rmlocks, and Atomics](README_locking.md)
+- [Jails — OS-level Isolation](README_jail.md)
 
 
 
+- [Source Tree — Layout and Conventions](../README_internals.md)
 - [Virtual Memory Subsystem — vm_page, UMA, and Pagers](vm/README.md)
 - [Locking Primitives — Mutexes, sx, rmlocks, and Atomics](kern/README_locking.md)
-- [Source Tree — Layout and Conventions](../README_internals.md)
-- `sys/kern/kern_fork.c`
-- `sys/kern/kern_exit.c`
-- `sys/kern/sched_4bsd.c`
-- `sys/kern/sched_ule.c`
-- `sys/sys/proc.h`
-- `sys/kern/sched.h`
+- `sys/kern/kern_fork.c` — Process creation
+- `sys/kern/kern_exit.c` — Process termination
+- `sys/kern/kern_thread.c` — Thread management
+- `sys/kern/sched_4bsd.c` — 4BSD scheduler
+- `sys/kern/sched_ule.c` — ULE scheduler (alternative)
+- `sys/sys/proc.h` — Process and thread structure definitions
+- `sys/sys/runq.h` — Run queue definitions
+- `sys/sys/sched.h` — Scheduler interface
+- `sys/kern/kern_cpuset.c` — CPU set management
 
 ---
 
-> _Generated by [DaemonDocs](https://github.com/ocochard/DaemonDocs) on 2026-04-30 13:24 UTC using model `Qwen3.6-35B-A3B-UD-Q4_K_XL` (llama.cpp build `b8985-27aef3dd9`). AI-generated content — verify against source before relying on it._
+> _Generated by [DaemonDocs](https://github.com/ocochard/DaemonDocs) on 2026-04-30 22:08 UTC using model `Qwen3.6-35B-A3B-UD-Q4_K_XL` (llama.cpp build `b8985-27aef3dd9`). AI-generated content — verify against source before relying on it._

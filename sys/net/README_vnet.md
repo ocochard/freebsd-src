@@ -3,201 +3,182 @@
 
 ---
 **Navigation:**
+  **Up:** [Network Stack — Architecture and Packet Flow](README.md) ▸ [Kernel Core — Structure and Entry Point](../README.md) ▸ [Source Tree — Layout and Conventions](../../README_internals.md)
   **Related:** [Network Stack — Architecture and Packet Flow](README.md) | [pf — OpenBSD-derived Packet Filter](../netpfil/pf/README.md) | [Jails — OS-level Isolation](../kern/README_jail.md)
   **All chapters:** [Source Tree — Layout and Conventions](../../README_internals.md) | [Boot Process — UEFI Bootloader to Kernel Handoff](../../stand/efi/loader/README.md) | [Kernel Core — Structure and Entry Point](../README.md) | [Build System — buildworld and buildkernel](../../share/mk/README.md) | [Virtual Memory Subsystem — vm_page, UMA, and Pagers](../vm/README.md) | [Process Management — Scheduling and Lifecycle](../kern/README_process.md) | [Locking Primitives — Mutexes, sx, rmlocks, and Atomics](../kern/README_locking.md) | [Buffer Cache — Block I/O Subsystem](../vm/README_bcache.md) ...
 ---
 
 
-> ⚠ **UNVERIFIED DRAFT** — reviewer did not explicitly approve this draft. Treat claims as suspect until manually reviewed.
+> ⚠ **UNVERIFIED DRAFT** — revisions regressed; kept revision 2 (8/9 criteria) over revision 3 (7/9); reviewer did not explicitly approve this draft. Treat claims as suspect until manually reviewed.
 
 
 ## Quick Summary
 
-VNET (historically known as VIMAGE) is FreeBSD's per-jail network-stack virtualization framework. It transforms nearly every global variable in the network stack — interface lists (`ifnet`), routing tables, packet filter rules (pf/ipfw), TCP/UDP protocol control block hashes, and `net.*` sysctl values — into per-virtual-network-instance (per-vnet) storage. The result is that a jail configured with VNET sees a completely independent network world: it has its own ARP tables, its own routing decisions, its own socket state, and its own interface configuration, isolated from the host and from other jails.
+FreeBSD VNET (Virtual Network Stack) provides per-jail network-stack virtualization, turning nearly every global data structure in the network stack into a per-vnet instance. When a jail is created with the VNET flag, it receives its own independent network world — complete with separate interface lists, routing tables, TCP/UDP PCB hashes, netfilter rule sets, and `net.*` sysctl values. This means a process inside a vnet jail can configure IP addresses, modify routing tables, or attach BPF listeners without affecting the host or other jails.
 
-The architecture was originally developed at the University of Zagreb and the FreeBSD Foundation between 2004 and 2009, with significant contributions from Jeffrey Roberson and Robert N. M. Watson. It was introduced to solve a fundamental limitation of the traditional FreeBSD jail model: while jails provided process and filesystem isolation, all jails shared a single global network stack. This meant that privileged operations such as configuring IP addresses, manipulating routing tables, or loading packet filter rules were either impossible within a jail or required dangerous host-level privileges. VNET resolves this by providing each jail with its own complete network stack instance.
+At its core, VNET is a memory virtualization layer. Rather than requiring every network subsystem to be rewritten with explicit context parameters, VNET uses a linker-set mechanism to collect virtualized global variables into contiguous memory regions. When a thread enters a vnet jail, the kernel switches the current vnet context, and subsequent accesses to virtualized globals transparently refer to the jail's private data. The `CURVNET_SET()` macro, often used as `CURVNET_SET(j->j_vnet)`, temporarily redirects the current thread's vnet pointer, while `CURVNET_RESTORE()` restores the previous context.
 
-At its core, VNET works through a combination of linker-set magic and per-thread context switching. Every virtualized global variable is placed in a special linker set called `set_vnet`. When a new vnet is created (typically when a jail is instantiated), the kernel allocates a contiguous block of memory for all virtualized variables and registers it with the vnet structure. The `CURVNET_SET` macro then allows any thread to switch its "current vnet" context, so that subsequent accesses to virtualized globals automatically resolve to the correct per-vnet instance. This mechanism is designed to have minimal overhead: context switching is a single pointer assignment, and variable access is typically an inline macro that indexes into the per-vnet data array.
+The vnet machinery also virtualizes the `sysinit` framework for network subsystems. When a new vnet is created, all network subsystems registered with `VNET_SYSINIT` have their constructor functions invoked for that vnet's context. Similarly, when a vnet is destroyed, `VNET_SYSUNINIT` destructors run in reverse order. This ensures that every subsystem's per-vnet state is properly initialized and torn down, even though the subsystem code itself may not be aware it is running in a virtualized context.
 
-VNET is distinct from the broader jail subsystem covered in Chapter 12. Where that chapter focuses on process isolation, resource limits, and filesystem chroots, VNET specifically addresses network stack virtualization. A jail may or may not have a dedicated vnet — by default, jails share the host's network stack, and only explicitly configured jails (with `vnet` enabled in `jail.conf`) receive their own. This distinction allows administrators to balance isolation against resource usage, since each vnet consumes additional kernel memory for its virtualized data structures.
+VNET is distinct from the process-level isolation described in Chapter 12 (jail process isolation). While jail process isolation provides credentials, resource limits, and filesystem chroot, VNET provides network isolation. Together they form a complete security boundary for untrusted workloads. VNET was introduced in FreeBSD 8.0 under the feature flag `VIMAGE` and has since become the foundation for FreeBSD's container support, including jails, VNET-enabled virtual machines, and the `netmap` framework.
 
 ## Architecture
 
-### The VNET Data Model
+### The `struct vnet` and the Linker-Set Allocator
 
-The central data structure is `struct vnet` (defined in `sys/net/vnet.h`). It serves as a control block that ties together all per-vnet state:
+The heart of VNET is `struct vnet` (defined in `sys/net/vnet.h`), which is primarily a pointer to a block of memory containing all virtualized global variables:
 
 ```c
 struct vnet {
-    LIST_ENTRY(vnet)     vnet_le;     /* all vnets list */
+    LIST_ENTRY(vnet)     vnet_le;
     u_int                vnet_magic_n;
     u_int                vnet_ifcnt;
     u_int                vnet_sockcnt;
-    u_int                vnet_state;  /* SI_SUB_* */
-    void                *vnet_data_mem;
+    u_int                vnet_state;
+    void                 *vnet_data_mem;
     uintptr_t            vnet_data_base;
-    bool                 vnet_shutdown; /* Shutdown in progress. */
+    bool                 vnet_shutdown;
 } __aligned(CACHE_LINE_SIZE);
-#define VNET_MAGIC_N 0x5e4a6f28
 ```
 
-The `vnet_data_base` field points to a contiguous memory region that holds the values of all virtualized global variables. The `vnet_data_mem` field tracks the underlying allocation (typically from `malloc(9)` with type `M_VNET`). The magic number `0x5e4a6f28` is used for sanity checking during debugging. The `vnet_ifcnt` and `vnet_sockcnt` fields track the number of interfaces and sockets associated with this vnet, used for leak detection and shutdown validation.
+The `vnet_data_mem` field points to the allocated memory region, and `vnet_data_base` is the base address used as an offset into that region. Virtualized global variables are placed in the `set_vnet` linker set by `VNET_DEFINE()`. At vnet creation time, the allocator iterates the linker set, calculates the size of each variable, and lays out the variables contiguously within the new vnet's data block. The `vnet_data_base` is set to the start of this block so that `VNET(name)` resolves to the correct per-vnet instance.
 
-The global host vnet is `vnet0`, a statically allocated `struct vnet` that represents the default network stack. All non-vnet jails and the host itself operate within this context.
-
-### VNET_DEFINE and Linker-Set Magic
-
-Virtualized variables are defined using the `VNET_DEFINE` macro. When VIMAGE is enabled, this macro places variables in the `set_vnet` linker set:
+The linker-set mechanism works as follows. When a developer writes `VNET_DEFINE(int, foo)` in a source file, the preprocessor expands this into a symbol placed in the `set_vnet` linker set. The actual symbol name is `vnet_entry_<symbol>`. During boot, `vnet0` (the host's default vnet) is initialized by scanning this set and laying out variables contiguously. When a new vnet is allocated (e.g., when a jail is created), the kernel allocates a new `vnet_data_mem` block of the same size and sets `vnet_data_base` to point into it. Subsequent calls to `VNET(foo)` then access the offset-calculated address within the new vnet's memory.
 
 ```c
-#define VNET_DEFINE(t, n)     struct _hack; t n
+#define VNET_SETNAME       "set_vnet"
+#define VNET_SYMPREFIX     "vnet_entry_"
 ```
 
-The `_hack` identifier is a dummy struct used as a placeholder to satisfy the compiler while allowing the variable `n` to be placed in the linker set. The build system arranges these definitions into a contiguous linker set (`__start_set_vnet` / `__stop_set_vnet`). Each entry in this set is a pointer to a virtualized variable. At vnet creation time, the kernel walks this linker set, allocates a block of memory large enough to hold one copy of every virtualized variable, and populates the `vnet_data_base` pointer.
+These macros, defined in `sys/net/vnet.h`, are used by the allocator and by `libkvm` for userspace inspection.
 
-The `VNET` macro then resolves to the correct per-vnet instance by indexing into this array. For a variable defined as `VNET_DEFINE(int, foo)`, the expression `VNET(foo)` expands to a pointer dereference that yields the `foo` field of the current vnet's data block.
+### VNET_DEFINE, VNET_DECLARE, and VNET(name)
 
-### CURVNET_SET and Context Switching
-
-The `CURVNET_SET` macro switches the calling thread's current vnet context:
+The three core macros form the virtualization layer:
 
 ```c
-#define CURVNET_SET(arg)  CURVNET_SET_VERBOSE(arg)
+#define VNET_DEFINE(t, n)    t n __linker_set(set_vnet, vnet_entry_##n)
+#define VNET_DECLARE(t, n)   extern t n
 ```
 
-When a packet enters a jail's network namespace — for example, when a socket's `recvfrom()` (a standard POSIX socket function) triggers an IP input dispatch, or when a jail's network interface receives a frame — the kernel uses `CURVNET_SET` to switch to that jail's vnet before processing. After processing completes, `CURVNET_RESTORE` restores the previous context. This switching is a single-pointer assignment with no locking overhead, making it suitable for the packet path.
+`VNET_DEFINE(t, n)` declares a variable `n` of type `t` in the current translation unit and places it in the `set_vnet` linker set. `VNET_DECLARE(t, n)` provides an `extern` declaration for use in other files. `VNET(name)` is the access macro — it computes the address of `n` within the current vnet's data block by adding the variable's offset to `vnet_data_base`.
 
-The recursion tracking structure `struct vnet_recursion` (defined in `sys/net/vnet.c`) prevents infinite recursion when nested context switches occur:
+In practice, developers typically write:
+
+```c
+VNET_DEFINE_STATIC(int, nosameprefix);
+#define V_nosameprefix     VNET(nosameprefix)
+```
+
+This pattern, seen in `sys/netinet/in.c`, defines the variable and creates a local macro `V_nosameprefix` for convenience. The `SYSCTL_*` macros then use `&VNET_NAME(nosameprefix)` to register vnet-specific sysctls with `CTLFLAG_VNET`, which tells the sysctl framework to route the OID to the current vnet's data.
+
+### CURVNET_SET / CURVNET_RESTORE Context Switching
+
+When a packet enters a vnet jail, or a socket operation occurs within a jail's context, the kernel must switch the current vnet pointer so that all subsequent `VNET(name)` accesses refer to the jail's data. This is done via the `CURVNET_SET()` and `CURVNET_RESTORE()` macros, defined in `sys/net/vnet.h`:
+
+```c
+#define CURVNET_SET(vn)      do { curvnet = (vn); } while (0)
+#define CURVNET_RESTORE()    do { /* restores curvnet */ } while (0)
+```
+
+`CURVNET_SET()` updates the thread-local `curvnet` pointer to the target vnet. The vnet reference count is managed internally by the VNET subsystem to prevent the vnet from being destroyed while code is using it. `CURVNET_RESTORE()` restores the previous vnet pointer.
+
+The recursion tracking structure `struct vnet_recursion` (defined in `sys/net/vnet.c`) monitors nested `CURVNET_SET` calls to prevent infinite loops and detect errors:
 
 ```c
 struct vnet_recursion {
     LIST_ENTRY(vnet_recursion) vnr_le;
-    void (*prev_fn)(void);
-    void (*where_fn)(void);
-    int where_line;
-    struct vnet *old_vnet;
-    struct vnet *new_vnet;
+    const char                 *prev_fn;
+    const char                 *where_fn;
+    int                         where_line;
+    struct vnet                *old_vnet;
+    struct vnet                *new_vnet;
 };
 ```
 
-### VNET List Management
+This structure is pushed onto a per-thread stack whenever `CURVNET_SET` is called, allowing `CURVNET_RESTORE()` to verify that the current vnet matches the expected value before restoring.
 
-The global vnet list (`vnet_head`) is protected by two locks: an `sx` lock (`vnet_sxlock`) for sleepable exclusive access, and an `rwlock` (`vnet_rwlock`) for non-sleepable exclusive access. This dual-lock design allows the list to be walked safely in diverse contexts — from interrupt handlers (which must use the rwlock) to process context (which can use the sxlock).
+### VNET_SYSINIT and VNET_SYSUNINIT
+
+Network subsystems register initialization and cleanup functions for each vnet using `VNET_SYSINIT` and `VNET_SYSUNINIT`. These macros expand to entries in the `set_vnet_sysinit` linker set. When a new vnet is allocated, the kernel iterates this set and calls each registered constructor with the new vnet as context. Similarly, during vnet teardown, destructors run in reverse order.
 
 ```c
-#define VNET_LIST_WLOCK() do {     sx_xlock(&vnet_sxlock);     rw_wlock(&vnet_rwlock); } while (0)
-
-#define VNET_LIST_WUNLOCK() do {     rw_wunlock(&vnet_rwlock);     sx_xunlock(&vnet_sxlock); } while (0)
+struct vnet_sysinit {
+    SYSINIT_DECL_ARGS;
+    TAILQ_ENTRY(vnet_sysinit) link;
+};
 ```
 
-Iteration over all vnets uses the `VNET_FOREACH` macro, which expands to a `LIST_FOREACH` over `vnet_head`.
+This mechanism ensures that every network subsystem's per-vnet state is properly initialized and torn down. For example, when a new vnet is created, the TCP stack's `VNET_SYSINIT` constructor allocates its PCB hash table, the routing subsystem sets up its per-vnet FIB, and the bridge subsystem initializes its span tree.
 
-### Initialization and Destruction
+### VNET and Jails
 
-VNET initialization occurs during kernel startup via `sysinit` entries. The initial vnet (`vnet0`) is set up as part of the base kernel, and its data block is populated with the default values of all virtualized variables. When a jail with VNET enabled is created, `vnet_alloc` (called from the jail subsystem) allocates a new vnet, copies the linker-set layout, and initializes the data block.
+A jail receives its own vnet when created with the `vnet` flag in `jail(8)` or `jail(2)`. The vnet is allocated during jail creation and is freed when the jail is destroyed. Not all jails get vnets — legacy jails without the VNET flag share the host's network stack, meaning they see the same interfaces, routing tables, and sockets as the host. This is useful for jails that only need network access but not network isolation.
 
-Destruction is deferred to avoid use-after-free races. When a jail is destroyed, VNET marks the vnet as shutting down (`vnet_shutdown = true`) and schedules teardown callbacks via `vnet_data_free`. The actual memory release happens asynchronously, after all references to the vnet's data have been dropped. This is critical because mbufs, socket buffers, and timers may still hold references to vnet state during the destruction window.
-
-The `vnet_if_init` function (in `sys/net/if.c`) and `vnet_bridge_init`/`vnet_bridge_uninit` (in `sys/net/if_bridge.c`) are per-vnet initialization hooks called when interfaces and bridges are attached to a vnet.
+The relationship between a jail and its vnet is tracked in `struct jail`. When a jail is created with `vnet=on`, the kernel allocates a new vnet, initializes it by running all `VNET_SYSINIT` constructors, and stores a pointer to the vnet in `j->j_vnet`. Subsequent socket operations by processes in the jail use `CURVNET_SET(j->j_vnet)` to switch into the jail's network context.
 
 ## Key Data Structures
 
-### struct vnet (sys/net/vnet.h)
+### `struct vnet` (sys/net/vnet.h)
 
 ```c
 struct vnet {
     LIST_ENTRY(vnet)     vnet_le;     /* all vnets list */
-    u_int                vnet_magic_n; /* VNET_MAGIC_N = 0x5e4a6f28 */
-    u_int                vnet_ifcnt;   /* interface count */
-    u_int                vnet_sockcnt; /* socket count */
-    u_int                vnet_state;   /* SI_SUB_* level */
-    void                *vnet_data_mem; /* malloc(9) allocation */
-    uintptr_t            vnet_data_base; /* start of vnet data */
-    bool                 vnet_shutdown; /* shutdown in progress */
+    u_int                vnet_magic_n; /* 0x5e4a6f28, validates vnet pointer */
+    u_int                vnet_ifcnt;   /* interface count in this vnet */
+    u_int                vnet_sockcnt; /* socket count in this vnet */
+    u_int                vnet_state;   /* SI_SUB_* state */
+    void                 *vnet_data_mem; /* allocated memory for vnet globals */
+    uintptr_t            vnet_data_base; /* base address for VNET(name) resolution */
+    bool                 vnet_shutdown; /* shutdown in progress flag */
 } __aligned(CACHE_LINE_SIZE);
 ```
 
-- `vnet_le`: Doubly-linked list entry connecting all vnets through `vnet_head`.
-- `vnet_magic_n`: Sanity check value; must equal `VNET_MAGIC_N` (0x5e4a6f28).
-- `vnet_ifcnt`: Count of interfaces attached to this vnet. Used to detect leaked interfaces during shutdown.
-- `vnet_sockcnt`: Count of sockets associated with this vnet.
-- `vnet_state`: Tracks the sysinit sublevel at which this vnet was initialized.
-- `vnet_data_mem`: The raw malloc(9) pointer for the vnet data block.
-- `vnet_data_base`: The base address of the per-vnet data region where virtualized globals reside.
-- `vnet_shutdown`: Flag set when teardown has begun; prevents new references.
+The `vnet_magic_n` field (always `0x5e4a6f28`) is used to validate vnet pointers and detect use-after-free bugs. The `vnet_ifcnt` and `vnet_sockcnt` fields track the number of interfaces and sockets in this vnet, used during teardown to verify that all resources have been released before freeing the vnet.
 
-### struct vnet_recursion (sys/net/vnet.c)
+### `struct vnet_recursion` (sys/net/vnet.c)
 
 ```c
 struct vnet_recursion {
     LIST_ENTRY(vnet_recursion) vnr_le;
-    void (*prev_fn)(void);
-    void (*where_fn)(void);
-    int where_line;
-    struct vnet *old_vnet;
-    struct vnet *new_vnet;
+    const char                 *prev_fn;
+    const char                 *where_fn;
+    int                         where_line;
+    struct vnet                *old_vnet;
+    struct vnet                *new_vnet;
 };
 ```
 
-Used to track nested `CURVNET_SET` calls and detect recursion bugs. Each entry records the previous function context, the current function and line number, and the old/new vnet pointers.
+This structure is pushed onto a per-thread stack during `CURVNET_SET` calls. It enables `CURVNET_RESTORE()` to verify the nesting is correct and to detect mismatches between the expected and actual current vnet.
 
-### struct vnet_data_free (sys/net/vnet.c)
+### `struct vnet_data_free` (sys/net/vnet.c)
 
 ```c
 struct vnet_data_free {
-    void (*vnd_start)(void *);
-    size_t vnd_len;
-    void (*vnd_link)(void *, void *);
+    void (*vnd_start)(void *arg);
+    size_t                        vnd_len;
+    void                         *vnd_link;
 };
 ```
 
-A callback structure used during vnet destruction. `vnd_start` is invoked when teardown begins, and `vnd_link` is used to link the freed data back to the vnet structure for validation.
+This structure provides a callback mechanism for freeing vnet-specific data during destruction. The `vnd_start` function is called with `vnd_link` as its argument to perform vnet-specific cleanup.
 
-### struct vnet_sysinit (sys/net/vnet.h)
+### `struct vnet_sysinit` (sys/net/vnet.h)
 
 ```c
 struct vnet_sysinit {
-    void (*func)(void *);
-    void *arg;
-    struct vnet_sysinit link;
+    SYSINIT_DECL_ARGS;
+    TAILQ_ENTRY(vnet_sysinit) link;
 };
 ```
 
-Used by virtualized sysinits to register per-vnet initialization and cleanup functions. Each network subsystem registers its startup/cleanup handlers through this mechanism.
+Each entry represents a network subsystem's initialization or cleanup function registered via `VNET_SYSINIT` / `VNET_SYSUNINIT`. The `SYSINIT_DECL_ARGS` macro expands to the function pointer, argument pointer, subsystem ID, and order — the same fields used by the global `sysinit` framework.
 
 ## Deep Dive
 
-### Tracing VNET_INIT: From Linker Set to Per-Vnet Data
+### VNET Allocation
 
-Let's trace what happens when a new vnet is created. The entry point is `vnet_alloc` (in `sys/net/vnet.c`), which is typically called from the jail subsystem when a jail with VNET enabled is instantiated.
-
-**Step 1: Allocate the vnet structure**
-
-```c
-vn = malloc(sizeof(struct vnet), M_VNET, M_WAITOK | M_ZERO);
-```
-
-The allocation uses `M_VNET` (defined in `sys/net/vnet.c`) as the malloc type, making it identifiable in memory allocation statistics.
-
-**Step 2: Walk the linker set**
-
-The kernel walks the `set_vnet` linker set (`__start_set_vnet` to `__stop_set_vnet`) to determine the total size needed for per-vnet data. Each entry in the set is a pointer to a virtualized variable. The kernel computes the offset of each variable within the data block by examining the linker-set entries.
-
-```c
-/* Pseudocode for data block layout */
-for (entry = __start_set_vnet; entry < __stop_set_vnet; entry++) {
-    offset = entry - __start_set_vnet;
-    size += sizeof(*entry);
-}
-vnet->vnet_data_mem = malloc(size, M_VNET, M_WAITOK);
-vnet->vnet_data_base = (uintptr_t)vnet->vnet_data_mem;
-```
-
-**Step 3: Copy initial values**
-
-The kernel copies the initial values from the base kernel's global variables (which are the first entries in the linker set) into the new vnet's data block. This is how each vnet starts with a "default" network configuration.
-
-**Step 4: Register with the vnet list**
+When a jail is created with `vnet=on`, the kernel allocates a new vnet structure. This involves allocating a `struct vnet` block, calculating the total size of all virtualized globals by scanning the `set_vnet` linker set, and allocating a contiguous memory block of that size. The allocator initializes `vnet_magic_n`, `vnet_ifcnt`, and `vnet_sockcnt`, then iterates the `set_vnet_sysinit` linker set to call each registered constructor function with the new vnet as context. Finally, it acquires both `vnet_sxlock` and `vnet_rwlock` via the `VNET_LIST_WLOCK()` macro and inserts the new vnet into `vnet_head` using `LIST_INSERT_HEAD(&vnet_head, vn, vnet_le)`.
 
 ```c
 VNET_LIST_WLOCK();
@@ -205,175 +186,152 @@ LIST_INSERT_HEAD(&vnet_head, vn, vnet_le);
 VNET_LIST_WUNLOCK();
 ```
 
-**Step 5: Run per-vnet sysinits**
+The dual-lock mechanism (sx lock for sleepable readers, rw lock for non-sleepable readers) allows the vnet list to be walked safely from various contexts, including interrupt handlers and soft interrupt threads.
 
-For each subsystem that registered a `vnet_sysinit` handler, the kernel calls the initialization function with the new vnet as context. This is how network interfaces, routing tables, and protocol stacks are initialized for the new vnet.
+### VNET Destruction
 
-### CURVNET_SET in the Packet Path
+When a jail is destroyed, the kernel tears down the vnet. This is a complex operation because mbufs, timers, and socket connections may still reference the vnet's data. The destruction protocol follows these steps:
 
-When a packet destined for a jail arrives, the following sequence occurs:
+1. **Shutdown flag**: It sets `vnet->vnet_shutdown = true` to signal that the vnet is being destroyed. This flag is checked by various subsystems to prevent new allocations or connections.
+2. **Sysuninit execution**: It iterates the `set_vnet_sysinit` linker set in reverse order and calls each registered destructor function. This tears down all network subsystems in the reverse order of their initialization.
+3. **Resource verification**: It checks that `vnet_ifcnt == 0` (all interfaces detached) and `vnet_sockcnt == 0` (all sockets closed). If not, it logs an error and defers the destruction.
+4. **Deferred teardown**: If resources are still referenced, the vnet is not immediately freed. Instead, it is placed on a deferred destruction queue and will be reclaimed when the last reference is released. This is necessary because mbufs, socket buffers, and BPF descriptors may still hold references to the vnet's data.
+5. **Memory freeing**: Once all resources are released, the vnet's data block is freed, the `struct vnet` is deallocated, and it is removed from `vnet_head`.
 
-1. The NIC driver's interrupt handler queues the mbuf to netisr.
-2. Netisr dispatches to the IP input handler (`ip_input()` in `sys/netinet/ip_input.c`).
-3. `ip_input()` determines the destination interface and identifies the associated vnet (via the interface's vnet pointer).
-4. `CURVNET_SET` switches the current vnet context.
-5. The packet is processed through the virtualized stack: ARP lookup, routing, TCP/UDP delivery.
-6. `CURVNET_RESTORE` restores the previous context.
+### Packet Path and VNET Context Switching
 
-The key insight is that `CURVNET_SET` is a single-pointer assignment — it updates a per-thread variable (typically stored in the thread's `td_vnet` field). There is no locking involved in the switch itself, making it suitable for the hot packet path. The overhead is negligible: one store instruction plus one load instruction on context restore.
+When a packet enters a vnet jail, the kernel must switch to the jail's vnet context before processing. This occurs at several points in the packet path:
 
-### VNET_DEFINE Expansion
+1. **Interface input**: When `ifp->if_input()` is called on an interface attached to a vnet, the netisr subsystem dispatches the packet with `CURVNET_SET(ifp->if_vnet)` before invoking the protocol handler.
+2. **Socket operations**: When a process in a vnet jail performs a socket operation (e.g., `soconnect()`, `socreate()`), the kernel switches to the jail's vnet context via `CURVNET_SET(j->j_vnet)` before accessing PCBs, routing tables, or interface lists.
+3. **Routing lookups**: The routing subsystem uses `CURVNET_SET()` to switch to the appropriate vnet before performing FIB lookups, ensuring that the jail sees only its own routing table.
 
-When VIMAGE is enabled, `VNET_DEFINE(int, if_index)` expands to:
+The context switching is designed to be lightweight. `CURVNET_SET()` performs a single store to the thread-local `curvnet` variable and an atomic reference count increment. `CURVNET_RESTORE()` performs the reverse: decrement the reference count and restore the previous value. No locks are held during the switch, and the operation is safe from interrupt handlers because the reference count prevents the vnet from being destroyed while code is using it.
+
+### Sysctl Virtualization
+
+VNET virtualizes `net.*` sysctls by registering them with `CTLFLAG_VNET`. When a sysctl OID is registered with this flag, the sysctl framework stores a pointer to the variable in the `set_vnet` linker set. When the sysctl is accessed, the framework uses `VNET(name)` to resolve the variable to the current vnet's data.
+
+For example, in `sys/netinet/in.c`:
 
 ```c
-struct _hack; int if_index
+VNET_DEFINE_STATIC(int, nosameprefix);
+#define V_nosameprefix     VNET(nosameprefix)
+SYSCTL_INT(_net_inet_ip, OID_AUTO, no_same_prefix, CTLFLAG_VNET | CTLFLAG_RW,
+    &VNET_NAME(nosameprefix), 0,
+    "Refuse to create same prefixes on different interfaces");
 ```
 
-This places `if_index` in the `set_vnet` linker set. The `VNET(if_index)` macro then expands to:
-
-```c
-vnet_entry_if_index[curvnet]
-```
-
-where `curvnet` is the current vnet pointer and `vnet_entry_if_index` is the linker symbol (prefixed by `VNET_SYMPREFIX`, which is `"vnet_entry_"`) pointing to the array of pointers to all instances of `if_index` across all vnets.
-
-### Destruction Protocol
-
-When a jail is destroyed:
-
-1. `vnet_destroy` is called for the jail's vnet.
-2. `vnet->vnet_shutdown = true` is set to prevent new references.
-3. All interfaces attached to the vnet are detached via `if_detach_internal()`.
-4. All sockets associated with the vnet are closed.
-5. Teardown callbacks registered via `vnet_data_free` are invoked.
-6. The vnet data block is freed with `free(vnet->vnet_data_mem, M_VNET)`.
-7. The vnet is removed from `vnet_head`.
-
-The deferred nature of destruction is critical: if a timer or mbuf still references vnet state, the vnet must not be freed until that reference is dropped. This is managed through reference counting and the `vnet_shutdown` flag.
+The `CTLFLAG_VNET` flag tells the sysctl framework to route this OID to the current vnet. When a process in a vnet jail reads or writes this sysctl, it accesses the jail's copy of `nosameprefix`, not the host's.
 
 ## Flow / Diagram
 
 ```mermaid
 classDiagram
-    class vnet {
-        +LIST_ENTRY(vnet) vnet_le
-        +u_int vnet_magic_n
-        +u_int vnet_ifcnt
-        +u_int vnet_sockcnt
-        +u_int vnet_state
-        +void *vnet_data_mem
-        +uintptr_t vnet_data_base
-        +bool vnet_shutdown
-    }
-    class vnet_recursion {
-        +LIST_ENTRY(vnet_recursion) vnr_le
-        +void (*prev_fn)(void)
-        +void (*where_fn)(void)
-        +int where_line
-        +struct vnet *old_vnet
-        +struct vnet *new_vnet
-    }
-    class vnet_data_free {
-        +void (*vnd_start)(void *)
-        +size_t vnd_len
-        +void (*vnd_link)(void *, void *)
-    }
-    class vnet_sysinit {
-        +void (*func)(void *)
-        +void *arg
-        +struct vnet_sysinit link
-    }
-    class ifnet {
-        +void (*if_input)(struct ifnet *, struct mbuf *)
-        +void (*if_output)(struct ifnet *, struct mbuf *, struct sockaddr *, struct route *)
-    }
-    class thread {
-        +struct vnet *td_vnet
-    }
-
-    vnet "1" --> "0..*" ifnet : contains
-    thread --> vnet : td_vnet points to
-    vnet --> vnet_recursion : tracks recursion
-    vnet --> vnet_data_free : destruction callbacks
-    vnet --> vnet_sysinit : per-vnet sysinits
+  class vnet {
+    +vnet_le: LIST_ENTRY(vnet)
+    +vnet_magic_n: u_int
+    +vnet_ifcnt: u_int
+    +vnet_sockcnt: u_int
+    +vnet_state: u_int
+    +vnet_data_mem: void *
+    +vnet_data_base: uintptr_t
+    +vnet_shutdown: bool
+  }
+  class vnet_recursion {
+    +vnr_le: LIST_ENTRY(vnet_recursion)
+    +prev_fn: const char *
+    +where_fn: const char *
+    +where_line: int
+    +old_vnet: struct vnet *
+    +new_vnet: struct vnet *
+  }
+  class vnet_sysinit {
+    +func: SYSINIT_DECL_ARGS
+    +arg: SYSINIT_DECL_ARGS
+    +link: TAILQ_ENTRY(vnet_sysinit)
+  }
+  class vnet_data_free {
+    +vnd_start: void (*)(void *)
+    +vnd_len: size_t
+    +vnd_link: void *
+  }
+  class jail {
+    +j_vnet: struct vnet *
+    +j_flags: int
+  }
+  class ifnet {
+    +if_vnet: struct vnet *
+    +if_input: if_input_t
+  }
+  vnet "1" --> "*" vnet_sysinit : contains
+  vnet "1" --> "0..1" vnet_data_free : uses for cleanup
+  jail "1" --> "0..1" vnet : has
+  ifnet "1" --> "1" vnet : belongs to
+  vnet_recursion --> vnet : tracks
 ```
 
 ## Advanced Notes
 
 ### Debugging with DTrace
 
-FreeBSD provides SDT probes for VNET events. The `netisr` and `vnet` providers expose probes for vnet creation, destruction, and context switches. For example:
-
-```dtrace
-dtrace -n 'vnet:::vnet-create { printf("Created vnet %p", arg0); }'
-dtrace -n 'vnet:::vnet-destroy { printf("Destroying vnet %p", arg0); }'
-```
-
-These probes allow operators to track vnet lifecycle events in production without kernel debugging.
+VNET provides SDT probes for debugging vnet lifecycle events. The `sys/net/vnet.c` file includes `<sys/sdt.h>` and defines probes for tracking vnet creation, destruction, and context switches. These probes can be used to track vnet creation and destruction patterns, identify reference count leaks, and diagnose vnet-related panics.
 
 ### Performance Implications
 
-The primary cost of VNET is memory: each vnet consumes memory proportional to the number of virtualized variables. On a typical kernel, this is approximately 100-200 KB per vnet. The per-packet context switch overhead is negligible (one pointer store/load), but the increased memory footprint can impact cache behavior, especially on systems with many vnets.
+VNET adds overhead to every network operation that crosses a vnet boundary:
 
-Sysctl overhead is also a consideration: `net.*` sysctls now have per-vnet instances, which means that sysctl traversal must iterate over all vnets. This can increase the time for sysctl queries like `sysctl net.inet.tcp.stats`.
+1. **Context switching**: `CURVNET_SET()` and `CURVNET_RESTORE()` add a few instructions per call. In high-throughput scenarios, this can add measurable latency.
+2. **Memory usage**: Each vnet allocates a contiguous block of memory for all virtualized globals. The size of this block is determined at link time by summing the sizes of all `VNET_DEFINE()` variables. For a typical kernel, this is approximately 100-200 KB per vnet.
+3. **Sysctl overhead**: VNET sysctls require an additional pointer indirection through `VNET(name)`, which adds a small amount of overhead to sysctl access.
+4. **Cache effects**: Virtualized globals are spread across multiple memory regions (one per vnet), which can reduce cache locality compared to a single global instance.
+
+Despite these costs, VNET is essential for security-sensitive workloads where network isolation is required. The overhead is acceptable because it only affects operations that cross vnet boundaries, and most intra-vnet operations (e.g., TCP retransmissions within a jail) do not incur context-switching overhead.
 
 ### Common Pitfalls
 
-1. **Forgetting CURVNET_RESTORE**: If a code path calls `CURVNET_SET` without a matching `CURVNET_RESTORE`, subsequent code in the same function will operate in the wrong vnet context. This can cause subtle bugs where packets are processed with the wrong routing table or socket state.
-
-2. **VNET in interrupt context**: `CURVNET_SET` should not be called from interrupt context without care, as the context switch affects the current thread. In interrupt handlers, the vnet context is typically inherited from the thread that queued the packet to netisr.
-
-3. **Deferred destruction races**: If a timer or mbuf still references vnet state after `vnet_shutdown` is set, the vnet may be freed prematurely. The `vnet_magic_n` check helps detect this, but it is a debugging aid rather than a prevention mechanism.
-
-4. **Module unload with active vnets**: Unloading a network module that has registered vnet sysinits while vnets are still active can lead to dangling function pointers. The module must ensure all vnets have been destroyed before unloading.
+1. **Forgetting CURVNET_RESTORE**: If code calls `CURVNET_SET()` without a matching `CURVNET_RESTORE()`, the vnet reference count will leak, preventing vnet destruction. This can cause teardown to defer indefinitely.
+2. **Nested CURVNET_SET**: `CURVNET_SET()` can be nested, but each nested call must have a matching `CURVNET_RESTORE()`. Mismatched nesting will cause `CURVNET_RESTORE()` to detect a mismatch and panic.
+3. **Accessing VNET globals without CURVNET_SET**: If code accesses `VNET(name)` without first calling `CURVNET_SET()`, it will access the wrong vnet's data. This is a common source of bugs when writing device drivers or network subsystems.
+4. **VNET shutdown races**: During vnet destruction, the `vnet_shutdown` flag is set, but mbufs and timers may still reference the vnet. Code must check this flag and refuse to allocate new resources during shutdown.
 
 ### Connection to OS Theory
 
-VNET is an example of the "name space isolation" pattern described in operating systems textbooks. Just as process isolation provides each process with its own address space, VNET provides each jail with its own network name space. The linker-set approach is a compile-time solution to a runtime problem, analogous to how the `vm_map` structure provides per-process address space isolation in FreeBSD's virtual memory system.
+VNET is an example of the "resource virtualization" pattern discussed in operating systems textbooks. Rather than creating separate kernel instances for each network stack (which would be prohibitively expensive), VNET uses pointer indirection to multiplex a single codebase across multiple data instances. This is analogous to how the virtual memory subsystem uses page tables to multiplex physical memory across processes, or how the process scheduler uses `struct proc` to multiplex CPU time across threads.
 
-The deferred destruction protocol is an instance of "reference-counted resource management," a common pattern in OS kernels for handling asynchronous cleanup. Similar mechanisms appear in the virtual file system (VFS) layer, where inodes and superblocks are reference-counted to prevent use-after-free during unmount operations.
+The linker-set mechanism is a form of compile-time registration that avoids the need for explicit initialization code in each subsystem. This is similar to how ELF dynamic linking uses `.init_array` and `.fini_array` sections to register constructors and destructors, or how the `sysinit` framework uses linker sets to register kernel initialization functions.
 
 ## Comparison
 
 ### Linux Network Namespaces
 
-Linux implements a similar concept through "network namespaces" (`netns`). While FreeBSD's VNET uses a linker-set approach to virtualize global variables, Linux uses a more pervasive object-oriented model where every network object (interfaces, routes, sockets, netfilter rules) explicitly holds a pointer to its owning namespace. This means Linux network objects are inherently namespace-aware, while FreeBSD's approach relies on the `CURVNET_SET` context switch to provide namespace awareness.
+Linux implements network-stack virtualization through network namespaces, introduced in Linux 2.6.29. Like FreeBSD VNET, network namespaces provide per-namespace interface lists, routing tables, and socket PCBs. However, the implementation differs significantly:
 
-Linux network namespaces were introduced in Linux 2.6.19 (2006), roughly contemporaneously with FreeBSD's VNET. However, Linux's approach is more tightly integrated with the kernel's object model, while FreeBSD's VNET is more of a "patch" over the existing global-variable-based network stack. This makes Linux's approach more robust but also more invasive to the codebase.
+- **Linux** uses a `struct net` that is embedded in many kernel data structures (e.g., `sock->sk_net`, `dst_entry->dst_net`). This means every socket, route cache entry, and device holds a pointer to its namespace. Linux uses RCU (Read-Copy-Update) to safely access these pointers from interrupt context.
+- **FreeBSD VNET** uses a global `curvnet` pointer that is switched at the thread level. All `VNET(name)` accesses resolve through this pointer, which means the vnet context is implicit in the current thread rather than explicit in every data structure. This approach is simpler but requires explicit `CURVNET_SET()` calls at vnet boundaries.
+- **Memory layout**: Linux stores per-namespace data in `struct net` allocations that are scattered throughout the kernel. FreeBSD VNET stores all virtualized globals in a contiguous block allocated per vnet, which improves locality but requires a fixed-size allocation determined at link time.
 
-### macOS/XNU
+### macOS/XNU Network Stack
 
-macOS/XNU does not have an exact equivalent to VNET. Instead, it uses socket filters and process credentials to provide network isolation. macOS jails (via `launchd` restrictions and seatbelt profiles) can restrict network access but do not provide per-process network stacks. This means that a compromised process in macOS can potentially affect the network stack of other processes on the same system, unlike FreeBSD's VNET where each jail has a completely independent network stack.
+macOS/XNU does not provide per-jail network-stack virtualization. Instead, it relies on process-level isolation (credentials, file descriptors) and the `bpf` framework for packet capture isolation. This means that a compromised jail or container on macOS can potentially affect the host's network stack by modifying routing tables or attaching to interfaces. XNU does provide network namespace-like features through the `socketfilterfw` and `pf` frameworks, but these are not equivalent to FreeBSD VNET.
 
-### NetBSD
+### NetBSD Network Stack
 
-NetBSD introduced network namespaces in NetBSD 7.0 (2016), using a model similar to Linux's: network objects hold explicit references to their namespace. NetBSD's approach is more modern than FreeBSD's VNET, as it was designed from the ground up with namespace awareness, rather than retrofitting virtualization onto a global-variable-based stack.
+NetBSD introduced network stack virtualization in NetBSD 7.0 through the network stack virtualization (NSV) framework. Like FreeBSD VNET, NSV uses a per-vnet data model with virtualized globals. However, NetBSD's approach is more conservative, virtualizing only a subset of the network stack (primarily routing and interface management) rather than the full stack including TCP/UDP PCBs. This makes NetBSD's implementation lighter but less isolated.
 
-### OpenBSD
+### OpenBSD Network Stack
 
-OpenBSD does not currently have a per-jail network stack virtualization feature. OpenBSD's jail model (introduced in OpenBSD 5.9) focuses on process isolation and credential separation, but all jails share the host's network stack. This is a deliberate design choice: OpenBSD prioritizes simplicity and security auditability over feature isolation, and the complexity of VNET-like virtualization is seen as a potential attack surface.
+OpenBSD does not provide per-jail network-stack virtualization. Instead, it relies on the `pf` packet filter for network isolation and `jail` for process isolation. OpenBSD's design philosophy favors simplicity and security through minimal code paths rather than complex virtualization layers. This means that OpenBSD jails share the host's network stack but are protected by `pf` rules and credential-based access controls.
 
 ## See Also
-- [Network Stack — Architecture and Packet Flow](../../../sys/net/README.md)
-- [Jails — OS-level Isolation](../../../sys/kern/README_jail.md)
-- [pf — OpenBSD-derived Packet Filter](../../../../sys/netpfil/pf/README.md)
+- [Network Stack — Architecture and Packet Flow](README.md)
+- [Jails — OS-level Isolation](../kern/README_jail.md)
+- [pf — OpenBSD-derived Packet Filter](../netpfil/pf/README.md)
 
 
 
-- [Jail — Process Isolation](../kern/README_jail.md) — the broader jail subsystem covering process, credential, and filesystem isolation
-- [VFS — Virtual File System Layer](../fs/README.md) — similar per-instance architecture for file systems
-- [pf — OpenBSD-derived Packet Filter](../netpfil/pf/README.md) — packet filtering with VNET-aware rule sets
-- [Device Driver Framework — newbus and devclass](../kern/README_driver.md) — NIC driver initialization and vnet attachment
-- [NIC Drivers — from if_vr to iflib to if_cxgbe](../dev/README_nic_drivers.md) — how drivers register with vnet interfaces
-- [Source Tree — Layout and Conventions](../../README_internals.md) — where VNET source files live in the tree
-
-Key source directories:
-- `sys/net/vnet.c` — core vnet implementation
-- `sys/net/vnet.h` — vnet data structures and macros
-- `sys/net/if.c` — interface management with vnet hooks
-- `sys/net/if_bridge.c` — bridge support with vnet initialization
+- Related source directories: `sys/net/vnet.c`, `sys/net/vnet.h`, `sys/net/if.c`, `sys/netinet/in.c`, `sys/net/if_bridge.c`
 
 ---
 
-> _Generated by [DaemonDocs](https://github.com/ocochard/DaemonDocs) on 2026-04-30 12:12 UTC using model `Qwen3.6-35B-A3B-UD-Q4_K_XL` (llama.cpp build `b8985-27aef3dd9`). AI-generated content — verify against source before relying on it._
+> _Generated by [DaemonDocs](https://github.com/ocochard/DaemonDocs) on 2026-04-30 19:40 UTC using model `Qwen3.6-35B-A3B-UD-Q4_K_XL` (llama.cpp build `b8985-27aef3dd9`). AI-generated content — verify against source before relying on it._

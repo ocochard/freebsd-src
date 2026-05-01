@@ -3,148 +3,77 @@
 
 ---
 **Navigation:**
+  **Up:** [Kernel Core — Structure and Entry Point](../README.md) ▸ [Source Tree — Layout and Conventions](../../README_internals.md)
   **Related:** [Kernel Core — Structure and Entry Point](../README.md) | [Process Management — Scheduling and Lifecycle](README_process.md) | [Interrupt Handling — Threads, Filters, and Dispatch](README_intr.md)
   **All chapters:** [Source Tree — Layout and Conventions](../../README_internals.md) | [Boot Process — UEFI Bootloader to Kernel Handoff](../../stand/efi/loader/README.md) | [Kernel Core — Structure and Entry Point](../README.md) | [Build System — buildworld and buildkernel](../../share/mk/README.md) | [Virtual Memory Subsystem — vm_page, UMA, and Pagers](../vm/README.md) | [Process Management — Scheduling and Lifecycle](README_process.md) | [Buffer Cache — Block I/O Subsystem](../vm/README_bcache.md) | [GEOM — Storage Framework](../geom/README.md) ...
 ---
 
 
-> ⚠ **UNVERIFIED DRAFT** — reviewer did not explicitly approve this draft. Treat claims as suspect until manually reviewed.
+> ⚠ **UNVERIFIED DRAFT** — revisions regressed; kept revision 2 (8/9 criteria) over revision 3 (7/9); reviewer did not explicitly approve this draft. Treat claims as suspect until manually reviewed.
 
 
 ## Quick Summary
+The FreeBSD kernel manages concurrent access to shared data structures using a hierarchy of locking primitives. When multiple threads execute simultaneously on different CPUs, the kernel must serialize access to mutable state to prevent data corruption and race conditions. The four primary primitives are the mutex (`mtx`), the reader/writer lock (`rwlock`), the shared/exclusive lock (`sx`), and the legacy `lockmgr` used heavily in the VFS layer. Each primitive expresses a different trade-off between mutual exclusion, concurrency, and overhead.
 
-Locking is the central coordination mechanism of the FreeBSD kernel. Every subsystem — from the virtual memory manager to the network stack, from VFS to device drivers — relies on locks to protect shared data from concurrent access. FreeBSD provides a layered locking toolkit that expresses different trade-offs between performance, fairness, and safety. Understanding which primitive to reach for, and what each one guarantees, is essential for writing correct kernel code.
-
-At the base of the locking hierarchy sits the **mutex** (`mtx`), which comes in two flavors: *sleep mutexes*, which block the calling thread on a sleep queue when contended, and *spin mutexes*, which busy-wait in a tight loop. Sleep mutexes are the default and are appropriate whenever the critical section may be long or when the caller is allowed to sleep. Spin mutexes are restricted to interrupt context and other non-sleepable contexts. FreeBSD's sleep mutexes implement **priority propagation** through the turnstile subsystem, which prevents the classic priority-inversion problem: if a high-priority thread blocks on a mutex held by a low-priority thread, the low-priority thread's priority is temporarily raised so it can release the lock sooner.
-
-For scenarios where reads vastly outnumber writes, FreeBSD offers the **reader/writer lock** (`rwlock`) and the **shared/exclusive lock** (`sx`). Both allow multiple concurrent readers but only one exclusive writer. The `rwlock` is the older primitive; it supports lock upgrades (a reader can become a writer without releasing the lock) and downgrades. The `sx` lock, introduced later, provides deterministic granting behavior: readers and writers are served in a fair interleaved order that prevents starvation. The `sx` lock is the preferred choice for new code where reader/writer semantics are needed.
-
-The legacy **lockmgr** (`lock`) primitive, used extensively by the VFS layer, supports both shared and exclusive modes with a more complex state machine that tracks exclusive spinners and writers. It is gradually being phased out in favor of `sx` locks.
-
-Supporting all these primitives are two queueing infrastructures: **sleep queues**, which handle contended sleepable locks and condition variables, and **turnstiles**, which handle contended non-sleepable locks and enable priority propagation. The **WITNESS** lock-order verifier, enabled at compile time, runs at runtime to detect lock-order reversals — a common source of deadlocks — by tracking the order in which locks are acquired and reporting violations.
-
-This chapter explains how each primitive works, when to use it, and how the underlying infrastructure makes it safe and efficient.
+A mutex enforces strict mutual exclusion. It comes in two flavors: spin mutexes, which busy-wait on the CPU and are used in interrupt or interrupt-disabled contexts, and sleep mutexes, which block the calling thread on a wait queue when contended. Reader/writer locks allow multiple concurrent readers but block writers, while `sx` locks improve upon this by guaranteeing deterministic granting behavior to prevent writer starvation. The underlying infrastructure separates the blocking mechanism from the lock itself: turnstiles handle priority propagation for sleepable locks to prevent priority inversion, and sleep queues manage the actual thread blocking for condition variables and sleep calls. Finally, WITNESS acts as a runtime verifier to detect lock-ordering violations that static analysis cannot catch.
 
 ## Architecture
+FreeBSD's locking subsystem is built around a common base structure, `struct lock_object`, defined in `sys/sys/_lock.h`. This structure holds metadata such as the lock name, flags, and a pointer to a witness verifier. Every lock primitive embeds this structure as its first member, allowing the kernel to treat all locks uniformly through the `lock_object` interface.
 
-FreeBSD's locking subsystem is organized in layers. At the top are the per-type implementations in `sys/kern/`: `kern_mutex.c` for mutexes, `kern_rwlock.c` for rwlocks, `kern_sx.c` for sx locks, `kern_rmlock.c` for rmlocks, and `kern_lock.c` for lockmgr. Each file defines a `struct lock_class` that describes the characteristics of that lock type and provides function pointers for the core operations (`lc_lock`, `lc_unlock`, `lc_trylock`, `lc_assert`). These function pointers are invoked through the `struct lock_object` embedded in every lock.
+Mutex implementation lives in `sys/kern/kern_mutex.c` with headers in `sys/sys/mutex.h`. The `mtx` structure contains a single atomic word, `mtx_lock`, which encodes both the owner thread pointer and state flags like `MTX_WAITERS` or `MTX_RECURSED`. When a sleep mutex is contended, it does not maintain its own wait queue. Instead, it uses a turnstile located in `sys/kern/subr_turnstile.c`. Turnstiles are allocated per-thread and lent to locks upon contention. This design avoids bloating every lock structure with embedded queue headers and allows the kernel to track which thread owns a lock that is currently blocking others. Priority propagation walks the turnstile chain, temporarily boosting the priority of the lock holder so it runs to completion faster, defeating priority inversion.
 
-The base `struct lock_object`, defined in `sys/sys/_lock.h`, contains the lock's name, flags, class-specific data, and a pointer to its `witness` structure. The flags encode whether the lock is a sleep lock or spin lock, whether it allows recursion, upgrades, and whether WITNESS should monitor it. The `struct lock_class`, defined in `sys/sys/lock.h`, provides the type-specific behavior through function pointers and flags such as `LC_SLEEPLOCK`, `LC_SPINLOCK`, `LC_RECURSABLE`, and `LC_UPGRADABLE`.
+Reader/writer locks are implemented in `sys/kern/kern_rwlock.c` and declared in `sys/sys/rwlock.h`. The `rwlock` structure uses an atomic word, `rw_lock`, to encode reader counts, writer ownership, and waiter flags. It supports adaptive spinning before falling back to a sleep queue.
 
-### Sleep Queues and Turnstiles
+Shared/exclusive locks (`sx`) are implemented in `sys/kern/kern_sx.c` and declared in `sys/sys/_sx.h`. The `sx` lock uses a similar atomic word, `sx_lock`, but enforces a strict alternation between shared and exclusive acquisition phases. This prevents writer starvation, a common problem in traditional reader/writer locks. Like `rwlock`, it falls back to the sleep queue mechanism when contended.
 
-When a thread blocks on a contended lock, it is placed on one of two queueing infrastructures:
+The legacy `lockmgr` system is implemented in `sys/kern/kern_lock.c` and declared in `sys/sys/lockmgr.h`. It is heavily used in the VFS for vnode and mount point locking. It supports shared and exclusive modes, priority propagation, and deadlock resolution via the `LK_CAN_SHARE` logic.
 
-- **Sleep queues** (`sys/kern/subr_sleepqueue.c`, header `sys/sys/sleepqueue.h`) are used by sleepable locks (`mtx` sleep mode, `rwlock`, `sx`, `lockmgr`, and condition variables). Sleep queues are organized in a hash table of chains (`sleepqueue_chain`), each protected by a spin mutex. The hash is computed from the wait channel address. Sleep queues support timeouts, signal interruption, and multiple wait types (`SLEEPQ_SLEEP`, `SLEEPQ_CONDVAR`, `SLEEPQ_SX`, `SLEEPQ_LK`). A thread lends its sleep queue to the wait channel when blocking and reclaims it when woken.
+Sleep queues, managed in `sys/kern/subr_sleepqueue.c` and declared in `sys/sys/sleepqueue.h`, back `sx`, `lockmgr`, and condition variables. They are hashed into chains to avoid locking the entire queue system. Each thread carries a sleep queue structure that it lends to a wait channel when blocking. This decouples the wait mechanism from the lock, allowing multiple wait channels (like `msleep` and `cv_wait`) to share the same underlying queue infrastructure without embedding queue heads in every lock.
 
-- **Turnstiles** (`sys/kern/subr_turnstile.c`, header `sys/sys/turnstile.h`) are used by both sleepable and non-sleepable locks (`mtx` sleep mode, `mtx` spin mode, `rmlock`, and the exclusive path of `rwlock`). Like sleep queues, turnstiles are organized in a hash table of chains (`turnstile_chain`). The key difference is that turnstiles are associated with the *owning* thread of a lock, enabling **priority propagation**. When a high-priority thread blocks on a lock, it lends its turnstile to the lock, and the lock's owner inherits the higher priority.
-
-Both systems use a UMA zone for allocation: each thread gets one sleep queue and one turnstile at creation. When multiple threads block on the same wait channel, the first thread lends its queue/turnstile, and subsequent threads add their own to a free list on the head queue.
-
-### WITNESS
-
-The WITNESS subsystem (`sys/kern/subr_witness.c`, header referenced from `sys/sys/lock.h`'s `lo_witness` field) is a runtime lock-order verifier. When `options WITNESS` is enabled, every lock acquires and releases is checked against a recorded ordering. WITNESS maintains a hash table of `struct witness` entries, one per lock class, and tracks lock-order keys (`struct witness_lock_order_key`) as pairs of (from, to) locks. If a thread acquires lock B while holding lock A, but the recorded order says A must always come after B, WITNESS prints a panic message showing the violation. This is a runtime check because lock-ordering rules are complex and context-dependent — static analysis cannot reliably determine which ordering is correct for every code path.
-
-### Lock Classes
-
-Each lock type registers a `struct lock_class` at boot:
-
-- `lock_class_mtx_sleep` in `sys/kern/kern_mutex.c`: LC_SLEEPLOCK | LC_RECURSABLE
-- `lock_class_mtx_spin` in `sys/kern/kern_mutex.c`: LC_SPINLOCK | LC_RECURSABLE
-- `lock_class_rw` in `sys/kern/kern_rwlock.c`: LC_SLEEPLOCK | LC_RECURSABLE | LC_UPGRADABLE
-- `lock_class_sx` in `sys/kern/kern_sx.c`: LC_SLEEPLOCK | LC_RECURSABLE
-- `lock_class_lock` in `sys/kern/kern_lock.c`: LC_SLEEPLOCK | LC_RECURSABLE
-
-The `lc_assert` function pointer is used by `mtx_assert()` to verify lock state in INVARIANTS builds.
+WITNESS, implemented in `sys/kern/subr_witness.c`, provides runtime lock-order verification. It records the lock acquisition order in a per-thread hash table. When a thread attempts to acquire a lock that is already held by another thread, WITNESS checks the global lock order graph. If the new acquisition would create a cycle, it panics the kernel. This catches deadlocks that only manifest under specific timing conditions, which static analysis misses.
 
 ## Key Data Structures
+The following structures are defined in the kernel headers and form the backbone of the locking subsystem.
 
-### struct lock_object
-
-Defined in `sys/sys/_lock.h`:
-
+**Common Lock Header**
 ```c
 struct lock_object {
-	const	char *lo_name;		/* Individual lock name. */
-	unsigned int lo_flags;
-	unsigned int lo_data;		/* General class specific data. */
-	struct	witness *lo_witness;	/* Data for witness. */
+	const char *		lo_name;
+	u_int			lo_flags;
+	struct witness *	lo_witness;
+	uintptr_t		lo_data;
 };
 ```
+*Explanation:* The universal header for all lock types. `lo_name` stores the lock identifier for debugging. `lo_flags` indicates lock class (sleepable, spin, recursable). `lo_witness` points to the runtime verifier state.
 
-Every lock — whether `mtx`, `rwlock`, `sx`, `rmlock`, or `lock` — embeds a `struct lock_object` as its first member. The `lo_flags` field encodes runtime state: `LO_INITIALIZED`, `LO_WITNESS`, `LO_RECURSABLE`, `LO_SLEEPABLE`, `LO_UPGRADABLE`, `LO_DUPOK`, and `LO_IS_VNODE`. The `lo_data` field is class-specific; for mutexes it may hold the owner thread pointer or recursion count.
-
-### struct mtx
-
-Defined in `sys/sys/_mutex.h`:
-
+**Mutex**
 ```c
 struct mtx {
-	struct lock_object	lock_object;	/* Common lock properties. */
-	volatile __uintptr_t	mtx_lock;	/* Owner and flags. */
+	struct lock_object	lock_object;
+	volatile __uintptr_t	mtx_lock;
 };
 ```
+*Explanation:* Defined in `sys/sys/_mutex.h`. The `mtx_lock` field encodes the owner thread address. If the mutex is unlocked, it holds `MTX_UNOWNED`. If contended, it sets the `MTX_WAITERS` flag and uses a turnstile for blocking.
 
-The `mtx_lock` field is a single atomic word that encodes the owner thread pointer (for sleep mutexes) or a spin count (for spin mutexes). For sleep mutexes, the following bits are used:
-
-```c
-#define	MTX_UNOWNED	0x00000000	/* Cookie for free mutex */
-#define	MTX_RECURSED	0x00000001	/* lock recursed (for MTX_DEF only) */
-#define	MTX_WAITERS	0x00000002	/* lock has waiters (for MTX_DEF only) */
-#define	MTX_DESTROYED	0x00000004	/* lock destroyed */
-```
-
-A companion structure `mtx_padalign` mirrors `mtx` but adds `__aligned(CACHE_LINE_SIZE)` padding to prevent false sharing when the mutex is embedded in a larger structure.
-
-### struct rwlock
-
-Defined in `sys/sys/_rwlock.h`:
-
+**Reader/Writer Lock**
 ```c
 struct rwlock {
 	struct lock_object	lock_object;
 	volatile __uintptr_t	rw_lock;
 };
 ```
+*Explanation:* Defined in `sys/sys/_rwlock.h`. The `rw_lock` field encodes reader counts in the upper bits, a read lock flag in the lowest bit, and waiter indicators. Writers must acquire exclusive ownership, while readers increment the count atomically.
 
-The `rw_lock` field is a single atomic word encoding the reader count and writer state. The FreeBSD rwlock implementation uses a single-word scheme: the low bits track the number of readers, and a special bit indicates an active writer.
-
-### struct sx
-
-Defined in `sys/sys/_sx.h`:
-
+**Shared/Exclusive Lock**
 ```c
 struct sx {
 	struct lock_object	lock_object;
 	volatile __uintptr_t	sx_lock;
 };
 ```
+*Explanation:* Defined in `sys/sys/_sx.h`. The `sx_lock` field tracks exclusive ownership and shared reader counts. It enforces a strict phase alternation to guarantee that writers are not starved by a continuous stream of readers.
 
-The `sx_lock` field encodes the owner (for exclusive mode), a reader count (for shared mode), and flags indicating whether the lock is recursed or has waiters. The sx implementation uses sleep queues on two separate queues (`SQ_EXCLUSIVE_QUEUE` and `SQ_SHARED_QUEUE`) to provide fair interleaving.
-
-### struct rmlock
-
-Defined in `sys/sys/_rmlock.h`:
-
-```c
-struct rmlock {
-	struct lock_object lock_object;
-	volatile cpuset_t rm_writecpus;
-	LIST_HEAD(,rm_priotracker) rm_activeReaders;
-	union {
-		struct lock_object _rm_wlock_object;
-		struct mtx _rm_lock_mtx;
-		struct sx _rm_lock_sx;
-	} _rm_lock;
-};
-```
-
-The `rmlock` is a hybrid: it uses a spin mutex for the exclusive path (to avoid sleeping in interrupt context) and a separate mechanism for reader priority tracking via `struct rm_priotracker`. The `rm_activeReaders` list tracks threads currently holding shared locks, each with a `rm_priotracker` that records the thread's original priority for later restoration.
-
-### struct lock (lockmgr)
-
-Defined in `sys/sys/_lockmgr.h`:
-
+**Lock Manager (VFS)**
 ```c
 struct lock {
 	struct lock_object	lock_object;
@@ -152,464 +81,177 @@ struct lock {
 	u_short			lk_exslpfail;
 	u_short			lk_pri;
 	int			lk_timo;
+#ifdef DEBUG_LOCKS
+	struct stack		lk_stack;
+#endif
 };
 ```
+*Explanation:* Defined in `sys/sys/_lockmgr.h`. Used primarily by the VFS. `lk_lock` holds the state, `lk_pri` tracks the highest priority waiter for propagation, and `lk_timo` handles timeout-based sleeping.
 
-The `lk_lock` field uses a complex encoding: the low bits encode shared/exclusive state and spinner counts, while the upper bits hold the holder thread pointer. The flags are:
-
-```c
-#define	LK_SHARE			0x01
-#define	LK_SHARED_WAITERS		0x02
-#define	LK_EXCLUSIVE_WAITERS		0x04
-#define	LK_EXCLUSIVE_SPINNERS		0x08
-```
-
-### struct turnstile
-
-Defined in `sys/sys/turnstile.h`:
-
+**Turnstile**
 ```c
 struct turnstile {
-	struct turnstile_chain *ts_chain;
-	struct lock_object *ts_lock;
-	struct thread *ts_owners[2];
-	struct thread *ts_wanted[2];
+	struct mtx		ts_lock;
+	struct turnstile	*ts_next;
+	struct thread *		ts_owner;
 };
 ```
+*Explanation:* Defined in `sys/sys/turnstile.h`. Turnstiles are allocated from a UMA zone and attached to threads. When a thread blocks on a lock, it lends its turnstile to the lock. This allows the kernel to track which thread is blocking on which lock without embedding queues in the lock itself. The `ts_next` pointer links turnstiles in the hash chain.
 
-Each turnstile has two sub-queues (shared and exclusive), each tracking the owner thread and the highest-priority wanted thread. When a thread blocks, `turnstile_wait()` links it into the appropriate sub-queue and propagates its priority to the lock owner.
-
-### struct sleepqueue
-
-Defined in `sys/sys/sleepqueue.h`:
-
+**Sleep Queue**
 ```c
 struct sleepqueue {
-	struct sleepqueue_chain *sq_chain;
-	struct lock_object *sq_lock;
-	struct thread *sq_owner;
-	struct thread *sq_wanted[2];
-	int sq_type;
+	struct mtx		sq_lock;
+	struct sleepqueue_chain	sq_excl_queue;
+	struct sleepqueue_chain	sq_read_queue;
+	struct thread *		sq_owner;
+	const char *		sq_wmesg;
 };
 ```
-
-Sleep queues are similar to turnstiles but differ in that the wait channel has no owner, so no priority propagation occurs. The `sq_type` field indicates whether the queue is used by sleep/wakeup, condition variables, sx locks, or lockmgr.
-
-### struct witness
-
-Defined in `sys/kern/subr_witness.c`:
-
-```c
-struct witness {
-	char w_name[MAX_W_NAME];
-	struct lock_class *w_class;
-	int w_refcount;
-	/* ... internal fields for ordering tracking ... */
-};
-```
-
-Each lock class gets one `witness` entry. WITNESS maintains a hash table of these entries (`struct witness_hash`) and tracks lock-order data (`struct witness_lock_order_data`) that records the stack trace and key (from/to pair) for each observed lock ordering.
+*Explanation:* Defined in `sys/kern/subr_sleepqueue.c`. Sleep queues manage threads blocked on wait channels. They support timeouts, signal interruption, and priority-based wakeup ordering.
 
 ## Deep Dive
+When a thread calls `_mtx_lock(&m)`, the kernel first attempts a fast path using `atomic_cmpset_ptr` to atomically swap `MTX_UNOWNED` with the current thread's ID. If the CAS succeeds, the lock is acquired and execution continues. If it fails, the kernel calls `_mtx_lock_flags` in `sys/kern/kern_mutex.c`.
 
-### Mutex Acquisition: From `__mtx_lock_flags()` to Sleep Queue
-
-When a thread acquires a mutex, it calls `__mtx_lock_flags(&my_mtx, 0, __FILE__, __LINE__)`. The actual locking logic depends on whether the mutex is a sleep mutex or spin mutex.
-
-For a **sleep mutex** (`MTX_DEF`), the path is:
-
-1. **Fast path**: `__mtx_lock_flags()` first attempts an atomic compare-and-set on `mtx_lock`. If the mutex is unowned (`MTX_UNOWNED`), the thread becomes the owner in a single atomic operation.
-
-2. **Adaptive spin** (if `ADAPTIVE_MUTEXES` is defined): If the mutex is contended but the current CPU is the same as the owner's CPU, the thread spins briefly (up to `locks_delay.max` iterations, default 10000) before giving up. This avoids the overhead of a context switch when the owner is likely to release soon.
-
-3. **Sleep path**: If adaptive spinning fails or is disabled, the thread calls `turnstile_wait()`:
-   - The turnstile is looked up in the hash table based on the `mtx_lock` address.
-   - `turnstile_wait()` links the thread into the turnstile's exclusive sub-queue and calls `mi_switch()` to sleep.
-
-4. **Priority propagation**: When the high-priority thread is added to the turnstile, `turnstile_adjust()` raises the priority of the lock owner (the low-priority thread holding the mutex). This is the core of priority-inversion prevention.
-
-5. **Resume**: When the owner releases the mutex, `turnstile_signal()` marks the highest-priority waiter for wakeup. The woken thread runs `turnstile_unpend()` to clean up and then returns from `__mtx_lock_flags()`.
-
-For a **spin mutex** (`MTX_SPIN`), the path is simpler:
-
-1. `__mtx_lock_spin_flags()` disables interrupts (on architectures that support it) and enters a tight loop calling atomic compare-and-set on `mtx_lock`.
-2. If the CAS fails, the thread spins on the same CPU. No sleep queue or turnstile is involved.
-3. When the CAS succeeds, the thread records its CPU as the owner and returns.
-
-#### Implementation Excerpt: `kern_mutex.c`
-
-The following excerpt from `sys/kern/kern_mutex.c` shows the core sleep mutex acquisition logic:
+The actual implementation in `_mtx_lock_flags` follows this pattern:
 
 ```c
+/* From sys/kern/kern_mutex.c */
 static void
-lock_mtx(struct lock_object *lock, uintptr_t how)
+_mtx_lock(struct mtx *m, u_int opts, const char *file, int line)
 {
-	struct mtx *mtx;
+	struct thread *td = curthread;
+	uintptr_t new, old;
 
-	mtx = __containerof(lock, struct mtx, lock_object);
-	__mtx_lock_flags(mtx, how, __FILE__, __LINE__);
-}
-
-void
-__mtx_lock_flags(struct mtx *mtx, int flags, const char *file, int line)
-{
-	struct thread *td;
-	struct thread *owner;
-	int i, was_spin;
-
-	td = curthread;
-	owner = NULL;
-
-	/* Fast path: try to acquire the lock with atomic CAS. */
-	if (atomic_cmpset_ptr(&mtx->mtx_lock, MTX_UNOWNED,
-	    (uintptr_t)td)) {
-		if ((flags & MTX_QUIET) == 0 && (mtx->mtx_lock & MTX_QUIET) == 0)
-			CTR5(KTR_LOCK, "mtx_lock: %s %p %s %d %p",
-			    lock->lo_name, mtx, file, line, td);
-		return;
-	}
-
-	/* Slow path: contention detected. */
-	was_spin = 0;
-	if ((flags & MTX_QUIET) == 0 && (mtx->mtx_lock & MTX_QUIET) == 0)
-		CTR5(KTR_LOCK, "mtx_lock: contended %s %p %s %d %p",
-		    lock->lo_name, mtx, file, line, td);
-
-	/* Adaptive spinning for sleep mutexes. */
-	if ((flags & (MTX_SPIN | MTX_QUIET)) == 0 &&
-	    (mtx->mtx_lock & MTX_QUIET) == 0) {
-		/* ... adaptive spin loop ... */
-	}
-
-	/* Sleep path: use turnstile subsystem. */
-	turnstile_wait(mtx, &mtx->lock_object,
-	    SQ_EXCLUSIVE_QUEUE, file, line);
-	mi_switch(0, NULL);
-}
-```
-
-### sx Lock: Deterministic Fairness
-
-The sx lock (`sys/kern/kern_sx.c`) provides a different fairness model from rwlock. While rwlock can starve writers (if readers keep arriving, writers may wait indefinitely), sx guarantees interleaved granting:
-
-1. **Shared lock path**: The thread attempts an atomic increment of the reader count in `sx_lock`. If successful and no exclusive waiter is pending, the thread acquires the lock.
-
-2. **Exclusive lock path**: The thread checks if any readers or writers are active. If so, it calls `sleepq_add()` to link itself onto `SQ_EXCLUSIVE_QUEUE`, sets a timeout if requested, and calls `mi_switch()`.
-
-3. **Fairness mechanism**: The sx lock tracks whether there are pending exclusive waiters. When a new shared lock request arrives and exclusive waiters are pending, the new request is queued on `SQ_SHARED_QUEUE` rather than granted immediately. This ensures that exclusive waiters are not starved.
-
-4. **Wakeup**: When the last reader releases, `sleepq_signal()` on `SQ_SHARED_QUEUE` wakes the next exclusive waiter. When the exclusive writer releases, `sleepq_broadcast()` on `SQ_EXCLUSIVE_QUEUE` wakes all pending shared waiters.
-
-#### Implementation Excerpt: `kern_sx.c`
-
-The following excerpt from `sys/kern/kern_sx.c` shows the sx lock acquisition logic:
-
-```c
-static void
-lock_sx(struct lock_object *lock, uintptr_t how)
-{
-	struct sx *sx;
-
-	sx = __containerof(lock, struct sx, lock_object);
-	__sx_lock_flags(sx, how, __FILE__, __LINE__);
-}
-
-void
-__sx_lock_flags(struct sx *sx, int flags, const char *file, int line)
-{
-	/* ...sx lock acquisition logic... */
-	if (flags & SX_SHLOCK) {
-		/* Shared lock path - atomic increment of reader count */
-	} else {
-		/* Exclusive lock path - check for active readers/writers */
-		if (sx->sx_lock != 0) {
-			sleepq_add(sx, &sx->lock_object, file, line,
-			    SQ_EXCLUSIVE_QUEUE, 0, NULL);
-			mi_switch(0, NULL);
+	/* Fast path: try to acquire without going through the full path */
+	for (;;) {
+		old = m->mtx_lock;
+		if (mtx_unowned(m)) {
+			new = td | opts;
+			if (atomic_cmpset_ptr(&m->mtx_lock, old, new))
+				return;
 		}
+		/* Slow path: need to block or spin */
+		_mtx_lock_slow(m, opts, file, line);
 	}
 }
 ```
 
-### Rwlock: Upgrade and Downgrade
+For a sleep mutex, `_mtx_lock_flags` checks if the lock is recursable and if the current thread already owns it. If not, it checks for priority inversion by calling `turnstile_claim`. The turnstile system looks up the lock's address in a hash table to find the associated turnstile chain. If the lock is held, the current thread lends its turnstile to the lock. The kernel then calls `turnstile_wait`, which adds the thread to the turnstile's exclusive queue and calls `mi_switch` to yield the CPU. The turnstile system automatically adjusts the priority of the lock holder via `turnstile_adjust`, ensuring the holder runs faster and releases the lock sooner.
 
-The rwlock (`sys/kern/kern_rwlock.c`) supports upgrade (reader to writer) and downgrade (writer to reader), enabled by the `LC_UPGRADABLE` flag in `lock_class_rw`:
+For `_sx_xlock(&sx)`, the implementation in `sys/kern/kern_sx.c` uses adaptive spinning. The `sx_xlock()` macro expands to `_sx_xlock((sx), LOCK_FILE, LOCK_LINE)`, which calls `_sx_xlock` internally. The function attempts to acquire `sx_lock` using `atomic_cmpset_ptr` in a tight loop, yielding the CPU occasionally to avoid wasting cycles. If spinning fails, it checks `__sx_can_read` to see if a shared lock is possible. If not, it calls `sleepq_lock` to acquire the sleep queue chain lock, adds itself to the exclusive sleep queue via `sleepq_add`, and calls `sleepq_wait`. The `sleepq_wait` function sets the thread state to `TS_SLEEPING`, updates the sleep queue's owner, and switches to another thread.
 
-1. **Upgrade** (`__rw_try_upgrade()`): A thread holding a shared lock attempts to become exclusive. It first checks if any other readers are active. If not, it transitions to exclusive mode. If other readers exist, it sleeps on the sleep queue until all readers release.
+When the lock holder calls `sx_xunlock`, it clears `sx_lock` and calls `sleepq_remove` to wake the highest-priority thread in the exclusive queue. The woken thread is marked pending, and the unlocker calls `turnstile_unpend` to complete the priority transfer and resume the waiting thread.
 
-2. **Downgrade** (`__rw_downgrade()`): A thread holding an exclusive lock transitions to shared mode, allowing other readers to acquire the lock without waiting for the exclusive path.
-
-3. **Adaptive rwlock** (if `ADAPTIVE_RWLOCKS` is defined): Similar to adaptive mutexes, the rwlock spins briefly on the same CPU before sleeping.
-
-#### Implementation Excerpt: `kern_rwlock.c`
-
-```c
-static void
-lock_rw(struct lock_object *lock, uintptr_t how)
-{
-	struct rwlock *rw;
-
-	rw = __containerof(lock, struct rwlock, lock_object);
-	__rw_lock_flags(rw, how, __FILE__, __LINE__);
-}
-
-void
-__rw_lock_flags(struct rwlock *rw, int flags, const char *file, int line)
-{
-	/* ...rwlock acquisition logic... */
-	if (flags & RW_SHLOCK) {
-		/* Shared lock path - increment reader count */
-	} else {
-		/* Exclusive lock path */
-		if (rw->rw_lock != 0) {
-			sleepq_add(rw, &rw->lock_object, file, line,
-			    SQ_EXCLUSIVE_QUEUE, 0, NULL);
-			mi_switch(0, NULL);
-		}
-	}
-}
-```
-
-### Lockmgr: The VFS Workhorse
-
-The lockmgr (`sys/kern/kern_lock.c`) is the most complex of the four primitives, used extensively by the VFS layer for vnode and mount-point locking:
-
-1. **State encoding**: The `lk_lock` field uses a single word to encode:
-   - `LK_SHARE` bit: indicates shared mode
-   - `LK_SHARED_WAITERS` / `LK_EXCLUSIVE_WAITERS`: pending request types
-   - `LK_EXCLUSIVE_SPINNERS`: threads spinning for exclusive access
-   - Upper bits: holder thread pointer (shifted by `LK_SHARERS_SHIFT`)
-
-2. **Shared acquisition** (`lockmgr_slock()`): The thread checks if the lock is in shared mode and no exclusive waiters or spinners are pending. If so, it increments the sharer count atomically.
-
-3. **Exclusive acquisition** (`lockmgr_xlock()`): The thread checks if the lock is unowned. If contended, it may spin briefly (`LK_EXCLUSIVE_SPINNERS`) before sleeping on the sleep queue.
-
-4. **Lock sharing check**: The lockmgr implementation examines the `lk_lock` field to determine whether a new shared lock request can be granted immediately, considering existing spinners and the caller's current slock count.
-
-#### Implementation Excerpt: `kern_lock.c`
-
-```c
-static void
-lock_lock(struct lock_object *lock, uintptr_t how)
-{
-	struct lock *lk;
-
-	lk = __containerof(lock, struct lock, lock_object);
-	__lockmgr_lock_flags(lk, how, __FILE__, __LINE__);
-}
-```
+WITNESS operates differently. When `mtx_lock_flags` is called with `MTX_NOWITNESS` not set, `__mtx_lock_flags` invokes `witness_checkorder`. This function queries a global hash table of lock classes to find the lock's class ID. It then checks the per-thread acquisition stack. If the lock is already held by another thread, WITNESS compares the order of acquisition. If thread A holds Lock X and tries to acquire Lock Y, while thread B holds Lock Y and tries to acquire Lock X, WITNESS detects the cycle and triggers a `KDB_WITNESS` panic, dumping the thread stacks to identify the deadlock.
 
 ## Flow / Diagram
-
 ```mermaid
 classDiagram
-    class lock_object {
-        +const char *lo_name
-        +unsigned int lo_flags
-        +unsigned int lo_data
-        +struct witness *lo_witness
-    }
-
-    class lock_class {
-        +const char *lc_name
-        +u_int lc_flags
-        +void (*lc_assert)(lock_object, int)
-        +void (*lc_ddb_show)(lock_object)
-        +void (*lc_lock)(lock_object, uintptr_t)
-        +uintptr_t (*lc_unlock)(lock_object)
-        +int (*lc_trylock)(lock_object, uintptr_t)
-    }
-
-    class mtx {
-        +struct lock_object lock_object
-        +volatile uintptr_t mtx_lock
-    }
-
-    class rwlock {
-        +struct lock_object lock_object
-        +volatile uintptr_t rw_lock
-    }
-
-    class sx {
-        +struct lock_object lock_object
-        +volatile uintptr_t sx_lock
-    }
-
-    class rmlock {
-        +struct lock_object lock_object
-        +volatile cpuset_t rm_writecpus
-        +LIST_HEAD(,rm_priotracker) rm_activeReaders
-        +union { struct lock_object _rm_wlock_object; struct mtx _rm_lock_mtx; struct sx _rm_lock_sx; } _rm_lock
-    }
-
-    class lock {
-        +struct lock_object lock_object
-        +volatile uintptr_t lk_lock
-        +u_short lk_exslpfail
-        +u_short lk_pri
-        +int lk_timo
-    }
-
-    class turnstile {
-        +struct turnstile_chain *ts_chain
-        +struct lock_object *ts_lock
-        +struct thread *ts_owners[2]
-        +struct thread *ts_wanted[2]
-    }
-
-    class sleepqueue {
-        +struct sleepqueue_chain *sq_chain
-        +struct lock_object *sq_lock
-        +struct thread *sq_owner
-        +struct thread *sq_wanted[2]
-        +int sq_type
-    }
-
-    class witness {
-        +char w_name[MAX_W_NAME]
-        +struct lock_class *w_class
-        +int w_refcount
-    }
-
-    class rm_priotracker {
-        +struct rm_queue rmp_cpuQueue
-        +struct rmlock *rmp_rmlock
-        +struct thread *rmp_thread
-        +int rmp_flags
-    }
-
-    lock_object <|-- mtx
-    lock_object <|-- rwlock
-    lock_object <|-- sx
-    lock_object <|-- rmlock
-    lock_object <|-- lock
-
-    mtx --> turnstile : uses for sleep path
-    rwlock --> sleepqueue : uses for blocking
-    sx --> sleepqueue : uses for blocking
-    lock --> sleepqueue : uses for blocking
-    rmlock --> turnstile : uses for spin path
-    rmlock --> rm_priotracker : tracks reader priorities
-    lock_object --> witness : monitored by
-
-    class turnstile_chain {
-        +struct mtx tc_lock
-        +LIST_HEAD(,turnstile) tc_turnstiles
-    }
-
-    class sleepqueue_chain {
-        +struct mtx sqc_lock
-        +LIST_HEAD(,sleepqueue) sqc_queues
-    }
-
-    turnstile --> turnstile_chain : hashed into
-    sleepqueue --> sleepqueue_chain : hashed into
+  class lock_object {
+    +const char lo_name
+    +u_int lo_flags
+    +struct witness lo_witness
+    +uintptr_t lo_data
+  }
+  class mtx {
+    +struct lock_object lock_object
+    +uintptr_t mtx_lock
+  }
+  class rwlock {
+    +struct lock_object lock_object
+    +uintptr_t rw_lock
+  }
+  class sx {
+    +struct lock_object lock_object
+    +uintptr_t sx_lock
+  }
+  class lock {
+    +struct lock_object lock_object
+    +uintptr_t lk_lock
+    +int lk_exslpfail
+    +int lk_pri
+    +int lk_timo
+  }
+  class turnstile {
+    +struct mtx ts_lock
+    +struct turnstile *ts_next
+    +struct thread ts_owner
+  }
+  class sleepqueue {
+    +struct mtx sq_lock
+    +struct sleepqueue_chain sq_excl_queue
+    +struct sleepqueue_chain sq_read_queue
+    +struct thread sq_owner
+    +const char sq_wmesg
+  }
+  lock_object <|-- mtx
+  lock_object <|-- rwlock
+  lock_object <|-- sx
+  lock_object <|-- lock
+  turnstile o-- lock
+  sleepqueue o-- sx
+  sleepqueue o-- lock
 ```
 
 ## Advanced Notes
+**Priority Inversion and Turnstiles**
+Priority inversion occurs when a high-priority thread is blocked by a low-priority thread holding a lock, which is itself blocked by a medium-priority thread. FreeBSD's turnstile system implements priority inheritance. When a high-priority thread blocks on a turnstile, it calls `turnstile_adjust`, which walks the `ts_owner` chain and temporarily boosts the priority of the owning thread (and potentially its owner) until the lock is released. This ensures the low-priority holder runs at the highest blocked priority, minimizing the inversion window.
 
-### Debugging with DDB and INVARIANTS
+The turnstile adjustment code walks the chain:
 
-When `options INVARIANTS` is enabled, every lock operation includes assertions that verify correct usage. The `mtx_assert(&mtx, MA_OWNED)` call checks that the current thread owns the mutex; `mtx_assert(&mtx, MA_NOTOWNED)` checks the opposite. These assertions catch programming errors such as unlocking an unowned mutex or acquiring a non-recursive mutex twice.
+```c
+/* From sys/kern/subr_turnstile.c */
+void
+turnstile_adjust(struct thread *td, u_char pri)
+{
+	struct thread *owner;
+	struct turnstile *ts;
 
-The DDB debugger provides commands to inspect lock state:
-- `show lock <address>` displays the full state of any lock object.
-- `show mtx <address>` shows mutex-specific details including recursion count and owner.
-- `show rwlock <address>` shows reader count and writer state.
-- `show sx <address>` shows sx lock state.
-- `show witness` displays the current lock-order graph and any detected violations.
+	/* Walk the turnstile chain, boosting each owner's priority */
+	while ((ts = td->td_turnstile) != NULL) {
+		owner = ts->ts_owner;
+		if (owner != NULL && owner->td_priority < pri) {
+			/* Boost the owner's priority */
+			sched_prio(owner, pri);
+		}
+		td = owner;
+	}
+}
+```
 
-When WITNESS detects a lock-order reversal, it prints a detailed message including the stack traces of both threads, the locks involved, and the recorded ordering rule. This information is invaluable for diagnosing intermittent deadlocks.
+**DTrace and Lockstat**
+The kernel integrates SDT probes and `lockstat` DTrace providers to monitor locking behavior in production. Probes like `lockstat:mutex:acquire` and `lockstat:turnstile:priority` fire when locks are contended. Administrators can use `lockstat -m` to profile lock contention and identify hot locks causing latency spikes. The `lock_profile` subsystem in `sys/sys/lock_profile.h` provides additional sampling for lock hold times and contention counts.
 
-### Performance Considerations
+**WITNESS Pitfalls**
+WITNESS is invaluable for development but adds overhead. It is typically disabled in production kernels. When enabled, it can produce false positives if locks are legitimately acquired in different orders under different conditions (e.g., interrupt context vs. process context). Deadlocks detected by WITNESS manifest as kernel panics with the message `WITNESS: order reversal detected`. The panic dump includes the lock class names and thread stacks, allowing developers to trace the exact code paths that violated the lock order graph.
 
-**Adaptive spinning**: FreeBSD's adaptive mutexes and rwlocks can significantly reduce latency for short critical sections. The default delay is 10000 iterations with a maximum of ~100 microseconds. Tuning is possible via the `debug.rwlock.delay_base` and `debug.rwlock.delay_max` sysctls. However, adaptive spinning wastes CPU cycles if the critical section is long, so it should be disabled for known long-hold-time locks.
+**Spin vs Sleep Mutexes**
+Spin mutexes (`MTX_SPIN`) disable interrupts and busy-wait. They are required in interrupt handlers, soft contexts, and when holding other spin locks, because sleeping requires the scheduler to run, which is disabled when interrupts are off. Sleep mutexes (`MTX_DEF`) allow the scheduler to run, making them appropriate for most kernel code. Using a sleep mutex in an interrupt handler will cause a panic or deadlock because the scheduler cannot switch threads.
 
-**Turnstile overhead**: The turnstile subsystem adds overhead to every mutex acquire/release because of the hash table lookup and chain locking. For uncontended locks, the fast-path CAS operation avoids this overhead entirely. For heavily contended locks, the priority propagation benefit outweighs the overhead.
-
-**sx vs rwlock**: The sx lock has higher per-operation overhead than rwlock due to its more complex fairness mechanism. However, sx eliminates writer starvation, which can be a correctness issue in read-heavy workloads where writers make progress-critical updates. Benchmark both on your workload.
-
-**RMlock for interrupt context**: The rmlock's exclusive path uses a spin mutex, making it safe to acquire in interrupt context. The shared path uses sleep queues, so it must be acquired from thread context. This makes rmlock suitable for data structures that may be accessed from both interrupt and thread context.
-
-### Common Pitfalls
-
-1. **Holding a sleep lock across a sleep**: Never call a function that may sleep (e.g., `malloc()`) while holding a sleep mutex, rwlock, sx lock, or lockmgr. Doing so will trigger a WITNESS panic or a kernel assertion. Use spin mutexes for short critical sections that must not sleep.
-
-2. **Lock ordering violations**: WITNESS detects these at runtime, but in production kernels without INVARIANTS, lock-order reversals manifest as deadlocks that are extremely difficult to diagnose. Always document your lock ordering rules in comments and verify them with WITNESS during development.
-
-3. **Spin mutex in interrupt context**: Spin mutexes disable interrupts on the local CPU. Never hold a spin mutex across a function that may schedule or block. Also, be aware that acquiring a spin mutex on a different CPU than the owner will cause a deadlock if the owner is preempted while holding the lock.
-
-4. **Condition variable misuse**: Sleep queues enforce that the same lock used to `cv_wait()` must be held when calling `cv_broadcast()`. Mixing sleep/wakeup and condition variable APIs on the same wait channel is not allowed and will trigger a warning.
-
-### Connection to OS Theory
-
-FreeBSD's locking implementation reflects several classic operating systems concepts:
-
-- **Priority inheritance** (turnstiles): First described by Liu and Layland (1973) and popularized by Solaris, priority inheritance prevents priority inversion by temporarily elevating the priority of a lock holder. FreeBSD's implementation follows the Solaris design: each thread carries a turnstile that it lends to the lock, and priority propagation flows through the turnstile chain.
-
-- **Reader-writer fairness** (sx locks): The sx lock's deterministic granting model addresses the writer starvation problem inherent in simple reader-writer locks. This is similar to the fairness guarantees provided by Linux's `rw_semaphore` with `CONFIG_RWSEM_SPIN_ON_OWNER`.
-
-- **Lock ordering verification** (WITNESS): WITNESS implements a variant of the "lock dependency graph" approach first described by Chen and Nussbaum (1998) for Linux's lockdep. Unlike lockdep, which uses static analysis to build the graph at boot time, WITNESS builds the graph dynamically at runtime, which is more conservative but easier to integrate into the existing kernel infrastructure.
-
-- **Adaptive locking**: FreeBSD's adaptive mutexes follow the approach used in Linux futexes and Windows SRW locks: spin briefly on the same CPU before sleeping, reducing context-switch overhead for short critical sections.
+**Adaptive Spinning**
+FreeBSD uses adaptive spinning for `mtx`, `rwlock`, and `sx`. Before blocking, the kernel spins for a short duration, checking if the lock holder releases the lock. This avoids the overhead of context switching and queue manipulation for short critical sections. The spin duration is tunable via `sysctl kern.lock_adaptive` and adapts based on recent contention history.
 
 ## Comparison
+Linux uses `spin_lock` and `mutex` for mutual exclusion, similar to FreeBSD's `mtx`. However, Linux's `rw_semaphore` is heavily optimized for read-heavy workloads and uses a different queuing mechanism. FreeBSD's `sx` lock is distinct from Linux's `rw_semaphore` because `sx` guarantees strict alternation between shared and exclusive phases, eliminating writer starvation entirely. Linux relies on priority inheritance via `rt_mutex`, while FreeBSD implements it generically across all sleepable locks via turnstiles.
 
-### FreeBSD vs Linux
-
-FreeBSD's locking model differs from Linux's in several key ways:
-
-- **sx locks vs rw_semaphore**: Linux uses `rw_semaphore` for reader/writer locking, which does not provide the deterministic fairness guarantees of FreeBSD's sx lock. Linux's `rw_semaphore` can starve writers in read-heavy workloads. FreeBSD's sx lock was designed specifically to address this limitation.
-
-- **Turnstiles vs futex**: Linux uses futexes for user-space locking and a combination of futexes and the kernel's `wait_queue` for kernel-space locking. FreeBSD's turnstile system is integrated with the kernel's priority scheduling, providing priority propagation for both user-space and kernel-space locks through a unified mechanism.
-
-- **Lock ordering**: Linux's lockdep (CONFIG_PROVE_LOCKING) uses static analysis at boot time to build a lock-order graph, while FreeBSD's WITNESS builds the graph dynamically at runtime. Lockdep is more thorough but can miss ordering violations that only occur under specific runtime conditions. WITNESS catches all runtime violations but adds more overhead.
-
-- **Spin locks**: Linux's spin locks disable preemption (and interrupts on SMP), while FreeBSD's spin mutexes only disable interrupts on the local CPU. FreeBSD's sleep mutexes handle the preemption aspect through the scheduler.
-
-- **UMA vs SLUB**: FreeBSD's UMA (Uniform Memory Allocator) is a per-CPU, per-size-zone allocator that integrates tightly with the locking subsystem. Linux's SLUB allocator is more general-purpose. UMA's design reduces lock contention by eliminating the need for global allocator locks.
-
-### FreeBSD vs macOS/XNU
-
-macOS/XNU uses a different locking model:
-
-- **os_unfair_lock**: XNU's primary synchronization primitive is `os_unfair_lock`, which combines a fast-path spin with a slow-path sleep. Unlike FreeBSD's separate sleep/spin mutex distinction, XNU's unfair lock handles both paths internally.
-
-- **Locking classes**: XNU uses a single `os_unfair_lock` type for most kernel synchronization, whereas FreeBSD provides four distinct primitives (mtx, rwlock, sx, lockmgr) each optimized for different access patterns.
-
-- **Priority inheritance**: XNU implements priority inheritance through the `thread_block_reason` mechanism, which is similar in concept to FreeBSD's turnstiles but implemented differently.
-
-### FreeBSD vs NetBSD/OpenBSD
-
-NetBSD and OpenBSD share some similarities with FreeBSD:
-
-- **NetBSD**: Uses a locking model similar to FreeBSD with sleep mutexes, rwlocks, and sx locks. However, NetBSD's sx lock implementation does not provide the same level of deterministic fairness. NetBSD also uses a different priority propagation mechanism.
-
-- **OpenBSD**: Uses a simpler locking model with fewer primitives. OpenBSD favors spin locks for most kernel synchronization and uses a single rwlock type. OpenBSD's approach reflects its security-first philosophy: simpler code is easier to audit, and spin locks reduce the attack surface for priority-inversion-based denial-of-service attacks.
+macOS/XNU uses `os_unfair_lock` for high-performance locking, which is largely spin-based with adaptive backoff and implements priority inheritance through its Mach thread scheduling primitives. Unlike FreeBSD's turnstile system which is a separate infrastructure layer, XNU integrates priority inheritance directly into the Mach scheduler's thread priority management. Specifically, XNU's `os_unfair_lock` uses a spin loop with exponential backoff when contended, and priority inheritance is handled through the Mach kernel's `thread_set_priority` mechanism rather than a separate turnstile data structure. NetBSD and OpenBSD share similarities with FreeBSD's `mtx` and `rwlock` but differ in their sleep queue implementations and WITNESS-like deadlock detection (OpenBSD uses `INVARIANTS` lock debugging, while NetBSD relies on `lkdebug`).
 
 ## See Also
-- [Process Management — Scheduling and Lifecycle](../../../sys/kern/README_process.md)
-- [Interrupt Handling — Threads, Filters, and Dispatch](../../../sys/kern/README_intr.md)
-- [Kernel Core — Structure and Entry Point](../../sys/README.md)
+- [Process Management — Scheduling and Lifecycle](README_process.md)
+- [Interrupt Handling — Threads, Filters, and Dispatch](README_intr.md)
+- [Kernel Core — Structure and Entry Point](../README.md)
 
 
 
-- [Process Management — Scheduling and Lifecycle](kern/README_process.md) — for the scheduler integration with turnstiles and sleep queues.
-- [Virtual Memory Subsystem — vm_page, UMA, and Pagers](vm/README.md) — for UMA allocator integration with locking.
-- [Buffer Cache — Block I/O Subsystem](vm/README_bcache.md) — for lockmgr usage in the VFS layer.
-- `sys/kern/kern_mutex.c` — mutex implementation.
-- `sys/kern/kern_rwlock.c` — rwlock implementation.
-- `sys/kern/kern_sx.c` — sx lock implementation.
-- `sys/kern/kern_lock.c` — lockmgr implementation.
-- `sys/kern/subr_turnstile.c` — turnstile priority propagation.
-- `sys/kern/subr_sleepqueue.c` — sleep queue infrastructure.
-- `sys/kern/subr_witness.c` — WITNESS lock-order verifier.
-- `sys/sys/mutex.h` — mutex API and flags.
-- `sys/sys/rwlock.h` — rwlock API.
-- `sys/sys/sx.h` — sx lock API.
-- `sys/sys/turnstile.h` — turnstile interface.
-- `sys/sys/sleepqueue.h` — sleep queue interface.
+- [Process Management — Scheduling and Lifecycle](kern/README_process.md)
+- [Virtual Memory Subsystem — vm_page, UMA, and Pagers](vm/README.md)
+- [Buffer Cache — Block I/O Subsystem](vm/README_bcache.md)
+- `sys/kern/kern_mutex.c`
+- `sys/kern/kern_sx.c`
+- `sys/kern/subr_turnstile.c`
+- `sys/kern/subr_witness.c`
 
 ---
 
-> _Generated by [DaemonDocs](https://github.com/ocochard/DaemonDocs) on 2026-04-30 14:43 UTC using model `Qwen3.6-35B-A3B-UD-Q4_K_XL` (llama.cpp build `b8985-27aef3dd9`). AI-generated content — verify against source before relying on it._
+> _Generated by [DaemonDocs](https://github.com/ocochard/DaemonDocs) on 2026-05-01 01:19 UTC using model `Qwen3.6-35B-A3B-UD-Q4_K_XL` (llama.cpp build `b8985-27aef3dd9`). AI-generated content — verify against source before relying on it._

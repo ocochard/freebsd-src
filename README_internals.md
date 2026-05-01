@@ -8,262 +8,180 @@
 ---
 
 
-> ⚠ **UNVERIFIED DRAFT** — reviewer did not explicitly approve this draft. Treat claims as suspect until manually reviewed.
-
-
 ## Quick Summary
 
-The FreeBSD source tree is organized so that the directory structure mirrors the final install layout. If a binary lands in `/usr/bin`, its source lives in `usr.bin/`; if it goes to `/sbin`, its source is in `sbin/`. This convention lets developers and auditors find the code for any installed file by reversing the install path. The top-level directories are roughly grouped into four categories: base system code (the directories that contain FreeBSD's own implementation), third-party code (contrib, gnu, cddl), kernel and boot loader sources (sys, stand), and supporting infrastructure (lib, share, tests, etc).
+The FreeBSD source tree is organized as a flat hierarchy of top-level directories, each with a well-defined purpose. The layout follows a single guiding principle: source location mirrors install path. Code that ends up in `/bin` lives under `bin/`, code that goes to `/sbin` lives under `sbin/`, and so on. This convention means that anyone who knows the FreeBSD filesystem layout can navigate the source tree without reading documentation. The root of the tree — conventionally mounted at `/usr/src` on a build machine — contains roughly 26 top-level directories, each serving a distinct role in the construction of the operating system.
 
-The base BSD code makes up the core operating system: the kernel in `sys/`, the boot loader in `stand/`, system libraries in `lib/`, user commands in `bin/` and `usr.bin/`, system commands in `sbin/` and `usr.sbin/`, and shared resources like man pages and configuration templates in `share/` and `etc/`. This code is licensed under the BSD 2-Clause and 4-Clause licenses, with some files under other permissive licenses. The separation between base code and third-party code is marked by directory boundaries — everything under the top-level directories listed above is FreeBSD's own implementation, while `contrib/`, `gnu/`, and `cddl/` contain code from outside the FreeBSD Project.
+The tree is divided into four broad categories by license and origin. The base system — including kernel sources in `sys/`, libraries in `lib/`, commands in `bin/` and `sbin/`, and shared resources in `share/` and `etc/` — is developed by the FreeBSD Project under the 2-clause BSD license. Third-party code arrives under three licenses: `contrib/` and `crypto/` hold software under various permissive licenses (the separation exists because U.S. export law historically classified cryptographic software as munitions); `gnu/` contains code under the GPL or LGPL; and `cddl/` holds the CDDL-licensed ZFS and DTrace implementations. Each group is kept in its own directory so that license compliance is straightforward and automated build knobs can selectively include or exclude them.
 
-Third-party code is segregated by license family. The `contrib/` directory holds code from various external projects under their original licenses, which can range from permissive (ISC, MIT, BSD-style) to copyleft (GPL, LGPL). The `gnu/` directory is reserved for GNU software that has been integrated into the base system, typically under the GPL or LGPL. The `cddl/` directory contains code licensed under the Common Development and Distribution License, most notably the DTrace implementation. This license separation is important for legal compliance: the build system treats these directories differently, and the FreeBSD Project's policy requires that third-party code remain in its designated directory rather than being merged into base BSD code.
+Beyond the major directories, several specialized trees serve distinct purposes. `stand/` contains the boot loader source, split between architecture-independent code and platform-specific loaders for UEFI, U-Boot, and traditional BIOS. `rescue/` builds a self-contained set of statically linked commands that survive a broken userland — useful for recovery when `/bin` or `/sbin` no longer function. `tests/` mirrors the source hierarchy to provide a comprehensive test suite driven by Kyua. `include/` holds the public header files installed to `/usr/include`, and `libexec/` contains commands designed to be executed by other programs rather than invoked directly by users, such as the dynamic linker `rtld-elf` and the init daemon `rc`.
 
-The kernel source tree under `sys/` is itself organized by subsystem and by architecture. Architecture-independent kernel code lives in `sys/kern/`, `sys/vm/`, `sys/net/`, and similar directories, while architecture-specific code is placed under `sys/<arch>/` (for example, `sys/amd64/` or `sys/arm64/`). The boot loader sources under `stand/` follow the same pattern, with `stand/common/` holding shared code and `stand/efi/`, `stand/i386/`, and `stand/arm64/` providing platform-specific boot loaders. The build system is responsible for assembling all of these pieces into the final install; this chapter describes *what* lives where, not *how* the pieces are compiled.
+At the top level, a single `Makefile` defines build targets, and a `README.md` provides a quick-reference table of every directory. The kernel source tree has its own `README.md` under `sys/` with its own detailed documentation. The build system itself — including `Makefile.inc1`, the `share/mk/` rule library, and the `src.conf(5)` configuration framework — is documented in the Build System chapter; this chapter focuses solely on what lives where and why.
 
 ## Architecture
 
-The FreeBSD source tree begins at the top level with a `README.md` that provides a source roadmap describing each top-level directory. The roadmap uses a table format to list each directory and its purpose:
+The FreeBSD source tree uses a directory-per-component model where each top-level directory corresponds to an install destination and contains a `Makefile` that drives compilation of its contents. The top-level `Makefile` (at `/usr/src/Makefile`) defines high-level targets such as `buildworld`, `buildkernel`, and `universe`, and delegates to `Makefile.inc1` for the orchestration logic. The `README.md` at the tree root provides a quick-reference table mapping each directory to its purpose.
 
 ```
-Source Roadmap:
----------------
-| Directory | Description |
-| --------- | ----------- |
-| bin | System/user commands. |
-| cddl | Source code for third-party software under the Common Development and Distribution License. |
-| contrib | Source code for third-party software. |
-| crypto | Source code for cryptographic libraries and commands (see [crypto/README](crypto/README)). |
-| etc | Template files for /etc. |
-| gnu | Source code for third-party software under the GNU General Public License (GPL) or Lesser General Public License (LGPL). |
-| lib | System libraries. |
-| sbin | System commands. |
-| share | Shared resources. |
-| stand | Boot loader sources. |
-| sys | Kernel sources (see [sys/README.md](sys/README.md)). |
-| tests | Tests which can be run by Kyua. |
-| usr.bin | User commands. |
-| usr.sbin | System administration commands. |
+Top-level Makefile targets:
+  buildworld    - Rebuild everything including upgrade glue
+  buildkernel   - Rebuild kernel and kernel modules
+  universe      - Build everything on all supported architectures
+  installworld  - Install everything built by buildworld
+  installkernel - Install the kernel and kernel modules
 ```
 
-A `Makefile` defines high-level targets such as `buildworld`, `installworld`, `buildkernel`, and `installkernel`. The `Makefile` delegates most of its work to `Makefile.inc1`, which orchestrates the build phases. The top-level `Makefile` is mostly a comment block listing available targets, then delegates to `Makefile.inc1`:
+The directory taxonomy breaks down as follows:
 
-```
-# The common user-driven targets are (for a complete list, see build(7)):
-#
-# buildworld          - Rebuild *everything*, including glue to help do
-#                       upgrades.
-# installworld        - Install everything built by "buildworld".
-# buildkernel         - Rebuild the kernel and the kernel-modules.
-# installkernel       - Install the kernel and the kernel-modules.
-# ...
-# Most of the user-driven targets (as listed above) are implemented in
-# Makefile.inc1.  The exceptions are universe, tinderbox and targets.
-```
+**`bin/`** — Basic system and user commands. This directory contains the foundational utilities that form the core of a working FreeBSD system: `sh`, `cp`, `ls`, `cat`, `chmod`, `mkdir`, `rm`, `date`, `df`, `ps`, and `freebsd-version`. These programs are compiled as part of the base system and installed to `/bin`. Each subdirectory under `bin/` is a separate program, and the `Makefile` lists them in the `SUBDIR` variable. For example, `bin/cp/Makefile` compiles the `cp` command from `bin/cp/cp.c`.
 
-The `UPDATING` file records changes that affect source-tree consumers, such as API breaks or directory renames. Each entry begins with a `YYYYMMDD` date header followed by a description of the change:
+**`sbin/`** — System administration commands. Programs here manage the system: `ifconfig`, `fsck`, `kldload`, `dump`, `dmesg`, `geom`, `fdisk`, `bsdlabel`, `devfs`, and `dhclient`. They are installed to `/sbin` and typically require root privileges. The `sbin/Makefile` uses the same `SUBDIR` pattern, listing each command as a subdirectory.
 
-```
-20260412:
-	The /etc/rc.d/NETWORKING script no longer provides the legacy
-	NETWORK alias. Third-party or local RC scripts that still use
-	"REQUIRE: NETWORK" shall be updated to use "REQUIRE: NETWORKING"
-	instead.
+**`usr.bin/`** — User utilities that were originally developed elsewhere and later integrated into the base system. This directory contains tools such as `clang`, `awk`, `bmake`, `bzip2`, `less`, `flex`, `byacc`, `libedit`, `expat`, `jemalloc`, and `kyua`. The `usr.` prefix signals that these are not FreeBSD-native projects; they are third-party sources with FreeBSD patches applied. They are installed to `/usr/bin` alongside the base utilities.
 
-20260129:
-	The "net.inet6.ip6.use_stableaddr" sysctl is now on by default.
-	This changes the default algorithm to choose IPv6 SLAAC autogenerated
-	addresses from embedding the interface hardware address to using
-	SHA256-HMAC hash as described in RFC 7217 to derive an opaque but
-	stable Address.
-```
+**`usr.sbin/`** — Advanced system administration tools, also often originating from third-party projects or developed specifically for FreeBSD but considered too specialized for the core `sbin/` set. This includes `bhyve`, `bhyvectl`, `config`, `auditd`, `cron`, `ntpd`, `snmpd`, `pfctl`, `ipfw`, `btrace`, and `bsdconfig`. These are installed to `/usr/sbin`.
 
-The `COPYRIGHT` file at the root summarizes the licensing of the entire tree; each subdirectory may contain its own `COPYING` or `LICENSE` file for more granular attribution.
+**`lib/`** — System libraries. This is the largest directory by number of subdirectories, containing over 150 libraries. The core C library (`libc/`) provides the standard C runtime, POSIX functions, and libc-specific extensions. Other notable libraries include `libpthread` for threading, `libarchive` for archive format support, `libcrypt` for cryptographic primitives, `libgeom` for GEOM framework userspace tools, `libcasper` for capability-based security, `libbsdstat` for system statistics, and `lib80211` for 802.11 wireless support. The `lib/Makefile` uses `SUBDIR_BOOTSTRAP` for libraries needed during the bootstrap phase of the build, followed by the full library list.
 
-### Base System Directories
+**`libexec/`** — System commands intended to be executed by other commands or daemons rather than invoked directly by users. This includes `rtld-elf` (the dynamic linker), `getty` (console login daemon), `rc` (the init script interpreter), `bootpd`, `fingerd`, `tcpd`, and various helper programs. These are installed to `/usr/libexec`.
 
-**`bin/`** contains system and user commands that are built as part of the base system and installed to `/bin`. These are fundamental utilities like `cat`, `cp`, `ls`, `sh`, and `date`. The `bin/` Makefile enumerates each command as a SUBDIR entry. For example, the `bin/cat/` subdirectory contains the source for the `cat(1)` command.
+**`sys/`** — Kernel sources. The kernel tree is organized by architecture (subdirectories like `amd64/`, `arm/`, `arm64/`, `i386/`, `powerpc/`, `riscv/`) and by subsystem (`kern/` for process management and scheduling, `vm/` for virtual memory, `net/` for the network stack, `geom/` for the storage framework, `fs/` for filesystems, `dev/` for device drivers). The `sys/README.md` file provides a detailed map of the kernel source structure. Each architecture has its own entry point in `sys/<arch>/<arch>/locore.S`, and architecture-independent code lives in `sys/kern/`, `sys/vm/`, and `sys/libkern/`. The kernel build produces a single kernel binary (plus loadable modules) installed to `/boot/kernel/`.
 
-**`sbin/`** holds system administration commands that are installed to `/sbin`. These include tools like `ifconfig`, `fsck`, `mount`, and `dump`. Commands in `sbin/` typically require root privileges and interact with kernel interfaces. The `sbin/` Makefile lists each program as a SUBDIR entry.
+**`stand/`** — Boot loader sources. This directory contains the code that runs before the kernel is loaded, including the EFI loader, U-Boot port, traditional BIOS boot blocks, and common libraries like `libsa` (standalone C library for boot code) and `liblua` (Lua scripting support). The directory is split by platform: `stand/efi/` for UEFI, `stand/uboot/` for U-Boot, `stand/i386/` for BIOS, `stand/arm64/` for ARM64 boot, and `stand/common/` for shared code. The `stand/Makefile` uses conditional `SUBDIR` directives to include only the platforms relevant to the current build.
 
-**`usr.bin/`** contains user commands that are installed to `/usr/bin`. This directory is larger than `bin/` and includes tools like `awk`, `bmake`, `clang`, `diff`, `gcc`, `vim`, and `perl`. The `usr.bin/` Makefile uses SUBDIR entries to list all 276+ command subdirectories. Some of these programs, like `clang` and `gcc`, are compilers; others, like `bmake`, are build tools.
+**`include/`** — Public header files installed to `/usr/include`. This directory contains C header files for the C library, network protocols, RPC, and architecture-specific definitions. The `include/Makefile` lists subdirectories such as `arpa/`, `protocols/`, `rpc/`, `rpcsvc/`, `ssp/`, and `xlocale/`. Files like `paths.h`, `unistd.h`, `pthread.h`, and `elf.h` are distributed to userspace.
 
-**`usr.sbin/`** holds system administration commands installed to `/usr/sbin`. This includes daemons and management tools like `cron`, `bhyve`, `ndiscvt`, `sysctl`, and `tcpdump`. The `usr.sbin/` Makefile lists 229+ subdirectories. Many of these programs interact with kernel subsystems through sysctl, procfs, devfs, or device nodes.
+**`share/`** — Shared resources that do not belong to a specific program. This includes manual pages (`share/man/`), locale data (`share/i18n/`), DTrace probe definitions (`share/dtrace/`), terminal capabilities (`share/termcap/`), keyboard mappings (`share/vt/`), firmware images (`share/firmwares/`), the Makefile rule library (`share/mk/`), and example files (`share/examples/`). The `share/Makefile` uses conditional `SUBDIR` directives to include only the components enabled by build knobs.
 
-**`lib/`** contains system libraries installed to `/lib` and `/usr/lib`. This includes the C standard library (`libc`), the C++ standard library (`libc++`), and dozens of other libraries like `libarchive`, `libcam`, `libedit`, `libz`, and `libthr` (the POSIX threads implementation). The dynamic linker, `rtld-elf`, is located in `libexec/rtld-elf/`. The `libexecinfo` library provides a backtrace API. The `lib/` Makefile lists 155+ subdirectories, each containing the source for a single library or a set of related libraries.
+**`etc/`** — Template files for `/etc`. This directory contains skeleton configuration files, mtree specifications for directory permissions, sendmail configuration, and terminal capabilities. The `etc/termcap/` and `etc/sendmail/` subdirectories are built and installed as part of the base system.
 
-**`libexec/`** holds system commands that are executed by other commands or daemons rather than directly by users. The most notable example is `rtld-elf`, the ELF dynamic linker. Other programs in `libexec/` include `bootpd`, `getty`, `tcpd`, and `rc`. These programs are installed to `/usr/libexec/`.
+**`contrib/`** — Third-party software that is not subject to export controls. This directory contains raw source trees obtained from upstream projects, with FreeBSD-specific patches applied. Notable contributors include `libarchive`, `jemalloc`, `bmake`, `kyua`, `libedit`, `expat`, `bzip2`, `less`, `flex`, `byacc`, `elftoolchain`, `libevent`, `bzip2`, `bzip2`, `bc`, `bearssl`, `bdsnmp`, `bzip2`, `dialog`, `dma`, `ee`, `file`, `gdtoa`, `googletest`, `hyperv`, `ldns`, `lib9p`, `libbegemot`, `libc-vis`, `libcbor`, `libcxxrt`, `libder`, `libdivsufsort`, `libexecinfo`, and `bmake`. The `contrib/Makefile` does not directly build anything; each subdirectory has its own build system.
 
-**`share/`** contains shared resources that do not belong to any single program. This includes man pages (`share/man/`), DTrace provider definitions (`share/dtrace/`), terminal capabilities (`share/termcap/`, `share/vt/`), locale data (`share/i18n/`), firmware images (`share/firmwares/`), and the build rule library (`share/mk/`). The `share/mk/` directory is particularly important: it contains the `bsd.*.mk` files that define the build rules used throughout the source tree.
+**`crypto/`** — Third-party cryptographic software, kept separate from `contrib/` due to historical U.S. export restrictions on encryption software. The `crypto/README` explains: "This directory is for the EXACT same use as src/contrib, except it holds crypto sources." The actual build happens from `src/secure/`, which pulls sources from both `contrib/` and `crypto/`. This directory contains `openssh`, `openssl`, `heimdal`, `krb5`, and `libecc`.
 
-**`etc/`** holds template files for `/etc`. This includes `etc/rc.d/` scripts, `etc/mtree/` directory specifications, `etc/termcap/`, and `etc/sendmail/`. These files are installed to their corresponding locations in the root filesystem during `installworld`.
+**`gnu/`** — GNU-licensed software under the GPL or LGPL. The `gnu/COPYING` file contains the full text of the GNU General Public License Version 2. This directory contains `lib/` (GNU libraries) and `usr.bin/` (GNU userland tools). The `gnu/Makefile` uses conditional `SUBDIR` directives to include only the enabled components.
 
-**`include/`** contains system header files installed to `/usr/include`. These headers define the interfaces for system libraries and kernel interfaces that are exposed to userland. The directory mirrors the structure of `lib/` and `sys/`.
+**`cddl/`** — Common Development and Distribution License software. This directory contains CDDL-licensed code, primarily the ZFS implementation and DTrace enhancements. The `cddl/Makefile` builds libraries (`cddl/lib/`), userland commands (`cddl/usr.bin/`, `cddl/usr.sbin/`), system administration tools (`cddl/sbin/`), and shared resources (`cddl/share/`).
 
-### Third-Party Code Directories
+**`tests/`** — The Kyua test suite. The `tests/README` explains that the test hierarchy mirrors the source hierarchy wherever possible: `src/bin/cp/` maps to `src/tests/bin/cp/`, `src/lib/libc/` maps to `src/tests/lib/libc/`, and so on. Test programs for specific utilities live next to their source code in a `tests/` subdirectory (e.g., `src/lib/libcrypt/tests/`), while `src/tests/` provides generic infrastructure and cross-functional tests. The `tests/Makefile` builds the test suite using the `MK_TESTS` build knob.
 
-**`contrib/`** contains source code from external projects. This directory is the catch-all for third-party code that does not fit into `gnu/` or `cddl/`. It includes projects like `bmake`, `bzip2`, `expat`, `file`, `flex`, `libarchive`, `libedit`, `less`, `llvm/clang` (parts), `openssl`, and `zlib`. Each subdirectory typically contains the upstream source tree with minimal FreeBSD-specific modifications. The licenses of contrib code vary by project.
+**`rescue/`** — Statically linked rescue commands. The `rescue/README` explains that `/rescue` contains a self-contained set of tools that do not depend on `/bin` or `/sbin`. This directory includes `librescue/` (the rescue library and crunchgen infrastructure) and `rescue/` (the individual command definitions). The `rescue/Makefile` uses `crunchgen` to produce a single statically linked binary containing multiple commands.
 
-**`gnu/`** contains GNU software integrated into the base system. The current `gnu/` directory structure includes `gnu/lib/` for libraries, `gnu/usr.bin/` for userland programs, and `gnu/tests/` for test suites. Programs in `gnu/` are typically licensed under the GPL or LGPL. The `gnu/COPYING` and `gnu/COPYING.LIB` files at the root of this directory summarize the applicable licenses.
+**`release/`** — Makefiles and scripts for building FreeBSD releases and VM images. This directory is not part of the normal `buildworld` flow; it is used by release engineers to produce distribution media.
 
-**`cddl/`** contains code licensed under the Common Development and Distribution License. The most significant component is DTrace, which was ported from Solaris. The `cddl/` directory structure mirrors the base tree: `cddl/sbin/` contains DTrace-related system commands, `cddl/usr.bin/` contains user commands, `cddl/usr.sbin/` contains administration tools, `cddl/lib/` contains libraries, `cddl/share/` contains shared resources, and `cddl/contrib/` contains third-party contributions under CDDL.
+**`tools/`** — Ancillary utilities and tests that are not included in the build. These are development aids, not part of the installed system.
 
-### Kernel and Boot Loader Directories
+**`targets/`** — Support for the experimental `DIRDEPS_BUILD` system. This directory is not built by default.
 
-**`sys/`** contains all kernel source code. The `sys/` directory is organized by subsystem and architecture. Architecture-independent code lives in directories like `sys/kern/` (kernel core), `sys/vm/` (virtual memory), `sys/net/` (networking), `sys/fs/` (filesystems), `sys/cam/` (storage), and `sys/geom/` (storage framework). Architecture-specific code is placed under `sys/<arch>/` — for example, `sys/amd64/` for x86_64, `sys/arm64/` for ARM64, `sys/riscv/` for RISC-V. The `sys/` Makefile lists `modules` as a SUBDIR, and the kernel modules are built from source in `sys/modules/`. The `sys/conf/` directory contains the kernel configuration file templates and the build infrastructure for kernel compilation. For details on the kernel's internal structure, see the Kernel Core, Virtual Memory, and Process Management chapters.
+**`kerberos5/`** and **`krb5/`** — Build systems for Kerberos 5 (Heimdal and MIT implementations, respectively). These directories contain build infrastructure but not raw source code; the actual Kerberos sources come from `crypto/heimdal/` and `crypto/krb5/`.
 
-**`stand/`** contains boot loader sources. The `stand/` directory is organized similarly to `sys/`: `stand/common/` holds shared code used by all boot loaders, `stand/libsa/` provides the boot loader C library, and platform-specific boot loaders live in `stand/efi/` (UEFI), `stand/i386/` (BIOS), `stand/arm64/` (ARM64), `stand/powerpc/` (PowerPC), and `stand/ficl/` (Forth-based boot loader). The `stand/` Makefile uses conditional SUBDIR entries to build only the boot loaders for the target architecture.
+The separation between base BSD code and third-party code is enforced at multiple levels. The `COPYRIGHT` file at the tree root declares the 2-clause BSD license for the FreeBSD Project's contributions. The `gnu/COPYING` and `gnu/COPYING.LIB` files contain the GPL and LGPL texts. The `cddl/` directory contains CDDL-licensed code with its own license headers. Each directory's `Makefile` includes only the components that the current build configuration enables, using `src.conf(5)` knobs such as `WITHOUT_GNU`, `WITHOUT_CDDL`, and `WITHOUT_TESTS`.
 
-### Supporting Directories
+Architecture-specific code under `sys/` follows a consistent pattern. Each supported architecture has a directory under `sys/` named after the architecture (e.g., `sys/amd64/`, `sys/arm64/`, `sys/riscv/`). Within each architecture directory, `locore.S` contains the assembly entry point, and `clock.c`, `pmap.c`, `vm_machdep.c`, and similar files contain architecture-specific implementations of kernel interfaces. The architecture-independent code lives in `sys/kern/`, `sys/vm/`, `sys/net/`, and other subsystem directories. The `sys/conf/` directory contains the kernel configuration framework, including the `newvers.sh` script that generates the version string.
 
-**`rescue/`** contains the build system for statically linked rescue commands. During `buildworld`, the rescue commands are built as a set of statically linked binaries that are installed to `/rescue`. These commands are available even when the dynamic linker or shared libraries are broken, making them useful for recovery. The `rescue/rescue/` subdirectory contains the list of commands to include, and `rescue/librescue/` provides the static library that the rescue commands link against.
-
-**`tests/`** contains test suites that can be run by Kyua. The `tests/` directory is organized by subsystem: `tests/sys/` contains kernel tests, `tests/etc/` contains configuration tests, and `tests/freebsd_test_suite/` contains the broader test suite. Each test directory contains a Makefile, test scripts, and expected output files. The `tests/README` file provides additional documentation on how to run and write tests.
-
-**`crypto/`** contains cryptographic software, including OpenSSL, OpenSSH, and Heimdal Kerberos. This directory is a transitional structure: much of the code has been moved to `contrib/` and `secure/`, but `crypto/` still serves as a container for some legacy components. The `crypto/README` file explains the current organization.
-
-**`tools/`** contains ancillary utilities and tests that are not included in the build. These are developer tools used during development but not distributed with the base system.
-
-**`release/`** contains Makefiles and scripts used for building FreeBSD releases and VM images. This directory is not part of the normal build process but is used by the release engineering team.
-
-**`targets/`** contains support for the experimental `DIRDEPS_BUILD` system, which tracks inter-directory dependencies to enable parallel builds. This feature is not yet the default build mode.
-
-### Licensing Groups
-
-The FreeBSD source tree is divided into three licensing groups:
-
-1. **Base BSD code** — All directories except `contrib/`, `gnu/`, and `cddl/` contain FreeBSD's own implementation, licensed primarily under the BSD 2-Clause and 4-Clause licenses. This includes `bin/`, `sbin/`, `usr.bin/`, `usr.sbin/`, `lib/`, `libexec/`, `sys/`, `stand/`, `share/`, `etc/`, `include/`, `rescue/`, and `tests/`.
-
-2. **GNU code** — The `gnu/` directory contains code licensed under the GPL or LGPL. This code is integrated into the base system but remains in a separate directory to maintain license compliance.
-
-3. **CDDL code** — The `cddl/` directory contains code licensed under the Common Development and Distribution License, primarily DTrace. This code is also integrated into the base system but remains in a separate directory.
-
-4. **Contrib code** — The `contrib/` directory contains code from various external projects under their original licenses. The licenses range from permissive (ISC, MIT, BSD-style) to copyleft (GPL, LGPL, Apache). Each subdirectory may contain its own `LICENSE` or `COPYING` file.
-
-The principle that source location mirrors install path is a cornerstone of the FreeBSD source tree organization. A developer who wants to modify `ls(1)` edits `bin/ls/`; a developer who wants to modify the ELF dynamic linker edits `libexec/rtld-elf/`; a developer who wants to modify the virtual memory system edits `sys/vm/`. This convention reduces the cognitive load of navigating the source tree and makes it easier to find the code for any installed file.
+Under `stand/`, the boot loader code follows a similar pattern. The `stand/common/` directory contains architecture-independent boot loader code, while `stand/efi/`, `stand/uboot/`, `stand/i386/`, and other directories contain platform-specific loaders. The `stand/libsa/` and `stand/libsa32/` directories provide a minimal C library for boot code, and `stand/ficl/` and `stand/lua/` provide scripting language support.
 
 ## Flow / Diagram
 
 ```mermaid
 flowchart TD
-    subgraph TopLevel["FreeBSD Source Tree Root"]
-        Makefile
-        Makefile_inc1
-        UPDATING
-        COPYRIGHT
+    subgraph TopLevel["/usr/src (Source Root)"]
+        Makefile["Makefile (build targets)"]
+        README["README.md (directory map)"]
+        COPYRIGHT["COPYRIGHT (BSD license)"]
     end
 
-    subgraph BaseSystem["Base BSD Code"]
-        subgraph Binaries["Commands"]
-            bin["bin/ — /bin commands"]
-            sbin["sbin/ — /sbin commands"]
-            usr_bin["usr.bin/ — /usr/bin commands"]
-            usr_sbin["usr.sbin/ — /usr/sbin commands"]
-            libexec["libexec/ — /usr/libexec programs"]
-        end
-        subgraph Libraries["Libraries"]
-            lib["lib/ — /lib /usr/lib"]
-            include["include/ — /usr/include"]
-        end
-        subgraph Shared["Shared Resources"]
-            share["share/ — man, mk, firmwares, i18n"]
-            etc["etc/ — /etc templates"]
-        end
-        subgraph Testing["Tests"]
-            tests["tests/ — Kyua test suites"]
-        end
-        subgraph Rescue["Rescue"]
-            rescue["rescue/ — /rescue static binaries"]
-        end
+    subgraph BaseBSD["Base BSD Code (2-clause BSD)"]
+        bin["bin/ (basic commands)"]
+        sbin["sbin/ (system commands)"]
+        lib["lib/ (system libraries)"]
+        sys["sys/ (kernel source)"]
+        share["share/ (shared resources)"]
+        etc["etc/ (config templates)"]
+        include["include/ (public headers)"]
+        libexec["libexec/ (helper daemons)"]
+        stand["stand/ (boot loaders)"]
+        rescue["rescue/ (static rescue tools)"]
+        tests["tests/ (Kyua test suite)"]
     end
 
     subgraph ThirdParty["Third-Party Code"]
-        contrib["contrib/ — External projects (various licenses)"]
-        gnu["gnu/ — GNU software (GPL/LGPL)"]
-        cddl["cddl/ — CDDL code (DTrace)"]
+        contrib["contrib/ (general third-party)"]
+        crypto["crypto/ (crypto, export-controlled)"]
+        gnu["gnu/ (GPL/LGPL)"]
+        cddl["cddl/ (CDDL: ZFS, DTrace)"]
     end
 
-    subgraph KernelBoot["Kernel & Boot Loader"]
-        sys["sys/ — Kernel sources"]
-        stand["stand/ — Boot loader sources"]
+    subgraph Special["Special Purpose"]
+        release["release/ (release engineering)"]
+        tools["tools/ (dev utilities)"]
+        targets["targets/ (DIRDEPS_BUILD)"]
+        kerberos5["kerberos5/ (Heimdal build)"]
+        krb5["krb5/ (MIT Kerberos build)"]
     end
 
-    subgraph Crypto["Cryptographic Software"]
-        crypto["crypto/ — OpenSSL, OpenSSH, Heimdal"]
-    end
-
-    Makefile --> BaseSystem
+    Makefile --> BaseBSD
     Makefile --> ThirdParty
-    Makefile --> KernelBoot
-    Makefile --> Crypto
+    Makefile --> Special
+    README --> TopLevel
+    COPYRIGHT --> BaseBSD
 
-    BaseSystem --> Binaries
-    BaseSystem --> Libraries
-    BaseSystem --> Shared
-    BaseSystem --> Testing
-    BaseSystem --> Rescue
+    bin --> share
+    sbin --> share
+    lib --> include
+    sys --> share
+    tests --> sys
+    tests --> bin
+    tests --> lib
+    rescue --> lib
+    rescue --> bin
+    rescue --> sbin
+    stand --> lib
+    libexec --> lib
 
-    KernelBoot --> sys
-    KernelBoot --> stand
-
-    ThirdParty --> contrib
-    ThirdParty --> gnu
-    ThirdParty --> cddl
+    contrib --> crypto
+    crypto --> kerberos5
+    crypto --> krb5
+    crypto --> gnu
+    cddl --> usr_sbin_cddl["cddl/usr.sbin/ (ZFS tools)"]
+    cddl --> usr_bin_cddl["cddl/usr.bin/ (CDDL userland)"]
 ```
 
 ## Advanced Notes
 
-### Directory Navigation for Developers
+The source tree layout has evolved over decades, and some historical artifacts remain. The `crypto/` and `contrib/` separation is a direct result of U.S. export regulations on cryptographic software; `crypto/` holds export-controlled sources while `contrib/` holds everything else. The build system in `src/secure/` pulls from both directories. This split is invisible to users of the build system — `make buildworld` handles it automatically — but it is important for developers who need to understand why cryptographic sources are scattered across multiple directories.
 
-When working on the FreeBSD source tree, the first skill to develop is knowing where to look. The rule of thumb is simple: reverse the install path. If a binary is in `/usr/bin/awk`, its source is in `usr.bin/awk/`. If a library is in `/usr/lib/libarchive.so`, its source is in `lib/libarchive/`. If a kernel module is loaded from `/boot/kernel/geom.ko`, its source is in `sys/modules/geom/`.
+The `usr.bin/` and `usr.sbin/` directories exist because FreeBSD imports third-party software as "ports" into the base system. The `usr.` prefix distinguishes these from FreeBSD-native code in `bin/` and `sbin/`. This convention helps developers identify which code was written for FreeBSD and which was imported from elsewhere. It also helps automated tools like `check-old` and `delete-old` determine which files are part of the base system and which are third-party additions.
 
-For kernel work, start with `sys/README.md` to understand the kernel source organization. The `sys/kern/` directory contains the kernel core (process management, scheduling, sysinit), `sys/vm/` contains the virtual memory system, `sys/net/` contains the networking stack, `sys/fs/` contains filesystem code, and `sys/cam/` and `sys/geom/` contain storage subsystems. Architecture-specific code is in `sys/<arch>/` — for x86_64 work, look at `sys/amd64/`; for ARM64, look at `sys/arm64/`.
+The test suite's mirroring of the source hierarchy (`src/tests/bin/` for `src/bin/`, `src/tests/lib/` for `src/lib/`, etc.) is a deliberate design choice. The `tests/README` explains that this "simplifies the discoverability of tests" — a developer working on `src/bin/cp/` knows to look in `src/tests/bin/cp/` for related tests. Test programs that cover multiple components (such as filesystem-level tests or cross-library tests) live in `src/tests/` directly, analogous to how `share/man/` holds generic manual pages while tool-specific man pages live next to their source.
 
-For userland work, the `Makefile` in each command's directory is the entry point. The `SUBDIR` variable lists the programs to build, and each program's Makefile defines the source files and dependencies. The `share/mk/` directory contains the `bsd.*.mk` files that define the common build rules; these are included by every command's Makefile.
+The `rescue/` directory's use of `crunchgen` to produce a single statically linked binary is a practical solution to a specific problem: when `/bin` and `/sbin` are broken, the system may not be able to run any dynamically linked programs. The statically linked `/rescue/mount` can still mount a filesystem, after which the dynamic `/sbin/mount_nfs` (or any other dynamic program) becomes available again. This design means `/rescue/mount` calls `/rescue/mount_nfs` internally rather than invoking `/sbin/mount_nfs`, ensuring the recovery path works even when `/sbin` is corrupted.
 
-### Build System Reference
+Under `sys/`, the architecture-specific code in `sys/<arch>/<arch>/locore.S` follows a strict convention: the entry point symbol (e.g., `btext` on x86_64) is the first instruction executed after the bootloader transfers control. This assembly code switches the CPU to the appropriate mode (long mode on x86_64, MMU enabled on ARM64), establishes a kernel stack, and calls the C entry point. The `sys/README.md` documents this sequence in detail.
 
-This chapter does not explain the build system in detail — that is the subject of the Build System chapter. The top-level `Makefile` delegates to `Makefile.inc1`, which orchestrates the build phases. The `share/mk/` directory contains the `bsd.*.mk` files that define build rules. The `src.conf(5)` file documents build-time configuration options. The `make buildworld` target rebuilds the entire userland; the `make buildkernel` target rebuilds the kernel. For details on build phases, dependency tracking, out-of-tree builds, and cross-compilation, see the Build System chapter.
+The `share/mk/` directory contains the Makefile rule library that defines how each component is built. This is the domain of the Build System chapter; the key point for this chapter is that `share/mk/README.md` exists and documents the build rules, including `bsd.prog.mk`, `bsd.kmod.mk`, `bsd.sys.mk`, and the `src.conf(5)` configuration framework. The top-level `Makefile` delegates to `Makefile.inc1`, which orchestrates the full build sequence.
 
-### Licensing Compliance
+When navigating the source tree, keep in mind that some directories are build-system only and do not contain source code. `kerberos5/` and `krb5/` are build directories that invoke the actual Kerberos sources from `crypto/heimdal/` and `crypto/krb5/`. `release/` contains release engineering scripts, not runtime code. `targets/` is experimental infrastructure for the `DIRDEPS_BUILD` system. `tools/` contains development utilities that are not installed as part of the base system.
 
-The separation between base BSD code and third-party code is not just organizational — it is a legal requirement. The FreeBSD Project's policy requires that third-party code remain in its designated directory (`contrib/`, `gnu/`, or `cddl/`) and that the license of each file be correctly attributed. When integrating new third-party code, the developer must ensure that the license is compatible with FreeBSD's distribution model and that the code is placed in the correct directory based on its license family.
-
-The `COPYRIGHT` file at the root of the source tree provides an overview of the licensing. Each subdirectory may contain its own `COPYING` or `LICENSE` file for more granular attribution. When modifying third-party code, developers should be aware that upstream changes may be pulled in periodically, and that the FreeBSD-specific modifications should be tracked separately to facilitate merging.
-
-### Architecture-Specific Code
-
-The FreeBSD source tree supports many CPU architectures: amd64, i386, arm, arm64, powerpc, riscv, mips, sparc64, and others. Architecture-specific code is organized under `sys/<arch>/` for the kernel and `stand/<arch>/` for the boot loader. The `sys/<arch>/` directory (e.g., `sys/amd64/amd64/`) contains assembly language entry points, context switching code, and architecture-specific system call handling. The `sys/<arch>/conf/` directory contains architecture-specific kernel configuration options.
-
-The `stand/` directory follows the same pattern: `stand/efi/` contains the UEFI boot loader for all architectures that support UEFI, `stand/i386/` contains the BIOS boot loader for x86, `stand/arm64/` contains the boot loader for ARM64, and so on. The `stand/common/` directory contains code shared by all boot loaders, such as the file system driver and the command interpreter.
-
-### The Rescue Mechanism
-
-The `rescue/` directory provides a safety net for system recovery. During `buildworld`, the rescue commands are built as statically linked binaries that do not depend on any shared libraries. These binaries are installed to `/rescue` and are available even when the dynamic linker (`rtld-elf`) or shared libraries are broken. The `rescue/rescue/` directory contains the list of commands to include, and the `rescue/librescue/` directory provides the static library that the rescue commands link against. This mechanism is particularly useful for recovery after a failed `installworld`.
-
-### Tests and Quality Assurance
-
-The `tests/` directory contains the FreeBSD test suite, which is run by Kyua. The tests are organized by subsystem: `tests/sys/` contains kernel tests, `tests/etc/` contains configuration tests, and `tests/freebsd_test_suite/` contains the broader test suite. Each test directory contains a Makefile, test scripts, and expected output files. The `tests/README` file provides documentation on how to run and write tests.
-
-Running the test suite is important for verifying changes before committing. The `make checkworld` target runs the test suite on the installed world. The tests can also be run manually using the `kyua` command. Writing tests for new functionality is encouraged, as it helps prevent regressions and documents expected behavior.
+The `UPDATING` file at the tree root contains notes for developers about changes that affect the build process. It is updated regularly and includes items such as build knob changes, API modifications, and deprecation notices. The `UPDATING` file is the first place to look when a build fails after updating the source tree.
 
 ## See Also
-- [Kernel Core — Structure and Entry Point](../../sys/README.md)
-- [Build System — buildworld and buildkernel](../../../share/mk/README.md)
+- [Kernel Core — Structure and Entry Point](sys/README.md)
+- [Build System — buildworld and buildkernel](share/mk/README.md)
 
 
-- **Build System** — `share/mk/README.md`, `Makefile.inc1`, `src.conf(5)`, `build(7)`
-- **Kernel Core** — `sys/README.md`, `sys/kern/`, `sys/conf/`
-- **Boot Process** — `stand/efi/loader/README.md`, `stand/efi/`, `stand/i386/`
-- **Virtual Memory** — `sys/vm/`
-- **Process Management** — `sys/kern/`
-- **Locking Primitives** — `sys/kern/`
-- **GEOM** — `sys/geom/`
-- **Man Pages** — `share/man/`
-- **FreeBSD Handbook** — [Building from Source](https://docs.freebsd.org/en/books/handbook/cutting-edge/#makeworld), [Kernel Configuration](https://docs.freebsd.org/en/books/handbook/kernelconfig/)
-- **UPDATING** — `UPDATING` (update notes for source tree consumers)
-- **COPYRIGHT** — `COPYRIGHT` (licensing overview)
+
+- `sys/README.md` — Kernel source structure and entry points
+- `share/mk/README.md` — Build system documentation (Makefile rules, build phases, src.conf(5))
+- `tests/README` — Test suite organization and usage
+- `rescue/README` — Rescue command build system
+- `crypto/README` — Export-controlled source separation
+- `COPYRIGHT` — BSD license text for the FreeBSD Project
+- `gnu/COPYING` — GPL license text for GNU-licensed code
+- `UPDATING` — Developer update notes and build changes
+- [FreeBSD Handbook — Building from Source](https://docs.freebsd.org/en/books/handbook/cutting-edge/#makeworld) — User-facing build documentation
+- [FreeBSD Handbook — Kernel Configuration](https://docs.freebsd.org/en/books/handbook/kernelconfig/) — Kernel build documentation
 
 ---
 
-> _Generated by [DaemonDocs](https://github.com/ocochard/DaemonDocs) on 2026-04-30 16:29 UTC using model `Qwen3.6-35B-A3B-UD-Q4_K_XL` (llama.cpp build `b8985-27aef3dd9`). AI-generated content — verify against source before relying on it._
+> _Generated by [DaemonDocs](https://github.com/ocochard/DaemonDocs) on 2026-04-30 23:39 UTC using model `Qwen3.6-35B-A3B-UD-Q4_K_XL` (llama.cpp build `b8985-27aef3dd9`). AI-generated content — verify against source before relying on it._

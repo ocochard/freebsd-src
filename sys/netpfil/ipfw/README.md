@@ -3,12 +3,13 @@
 
 ---
 **Navigation:**
+  **Up:** [Kernel Core — Structure and Entry Point](../../README.md) ▸ [Source Tree — Layout and Conventions](../../../README_internals.md)
   **Related:** [Network Stack — Architecture and Packet Flow](../../net/README.md) | [VNET — Virtual Network Stacks](../../net/README_vnet.md) | [pf — OpenBSD-derived Packet Filter](../pf/README.md)
   **All chapters:** [Source Tree — Layout and Conventions](../../../README_internals.md) | [Boot Process — UEFI Bootloader to Kernel Handoff](../../../stand/efi/loader/README.md) | [Kernel Core — Structure and Entry Point](../../README.md) | [Build System — buildworld and buildkernel](../../../share/mk/README.md) | [Virtual Memory Subsystem — vm_page, UMA, and Pagers](../../vm/README.md) | [Process Management — Scheduling and Lifecycle](../../kern/README_process.md) | [Locking Primitives — Mutexes, sx, rmlocks, and Atomics](../../kern/README_locking.md) | [Buffer Cache — Block I/O Subsystem](../../vm/README_bcache.md) ...
 ---
 
 
-> ⚠ **UNVERIFIED DRAFT** — revision 1 truncated — kept prior draft; reviewer did not explicitly approve this draft; fact-check revision failed — paths/structs may be hallucinated. Treat claims as suspect until manually reviewed.
+> ⚠ **UNVERIFIED DRAFT** — revision 1 truncated — kept prior draft; reviewer did not explicitly approve this draft. Treat claims as suspect until manually reviewed.
 
 
 ## Quick Summary
@@ -59,14 +60,13 @@ ipfw_check_packet(struct mbuf **m0, struct ifnet *ifp, int flags,
 
 ### Rule Evaluation: First-Match Semantics
 
-The core rule evaluation loop is in `ipfw_chk()` (`ip_fw2.c`). Rules are stored in a sorted chain (`struct ip_fw_chain`), and the lookup is performed inline within `ipfw_chk()` using a radix/hash-based algorithm to find the first matching rule. Unlike `pf`, which scans all rules and keeps the last match, `ipfw` stops at the first match:
+The core rule evaluation loop is in `ipfw_chk()` (`sys/netpfil/ipfw/ip_fw2.c`). Rules are stored in a sorted chain (`struct ip_fw_chain`), and the lookup is performed inline within `ipfw_chk()` using a radix/hash-based algorithm to find the first matching rule. Unlike `pf`, which scans all rules and keeps the last match, `ipfw` stops at the first match:
 
 ```c
 enum {
 	IP_FW_PASS = 0,
 	IP_FW_DENY,
 	IP_FW_DIVERT,
-	IP_FW_TEE,
 	IP_FW_DUMMYNET,
 	IP_FW_NETGRAPH,
 	IP_FW_NGTEE,
@@ -76,41 +76,110 @@ enum {
 };
 ```
 
-This return value determines the next action. `IP_FW_PASS` allows the packet to continue through the network stack, `IP_FW_DENY` drops it, `IP_FW_DIVERT` sends it to a divert port (for userland processing), `IP_FW_TEE` copies the packet to a divert port while continuing processing, and `IP_FW_DUMMYNET` sends it to the dummynet shaper.
+These return values from `ipfw_chk()` determine the disposition of the packet. `IP_FW_PASS` and `IP_FW_DENY` are the basic allow/deny actions. `IP_FW_DIVERT` sends the packet to a user-space divert socket (often used for transparent proxying). `IP_FW_DUMMYNET` routes the packet to `dummynet` for shaping. `IP_FW_NAT` triggers address translation via `libalias`. `IP_FW_REASS` reassembles fragmented packets before further inspection.
 
-The first-match semantics has significant implications for rule design. Rules must be ordered from most specific to most general, as the first match wins and subsequent rules are never evaluated. This contrasts with `pf`, where the last match wins and rules can be written in a more natural order (specific exceptions before general rules). In `ipfw`, a common pattern is to place deny rules before more permissive rules, or to use `skipto` to jump to a specific rule number when stateful NAT is required.
+### Control Flow: divert and skipto
 
-### Control Flow Primitives: divert, tee, skipto
+`ipfw` provides several control-flow primitives that alter the normal rule-evaluation sequence:
 
-`ipfw` provides several control flow primitives that allow complex rule interactions:
+- **divert**: Sends the packet to a user-space socket on a specified port. The packet is consumed by the kernel and never reaches its destination unless the user-space application reinjects it.
+- **skipto**: Jumps to a specified rule number, skipping intermediate rules. This enables modular rule design where common checks are grouped and then execution continues at a different point.
 
-- **divert**: Sends the packet to a userland process listening on a divert port. The packet is consumed by ipfw and not delivered to the local stack or forwarded.
-- **tee**: Copies the packet to a divert port while continuing normal processing. Both the diverted copy and the original proceed.
-- **skipto**: Jumps to a specific rule number, skipping intermediate rules. This is useful when stateful rules (like `keep-state`) need to be placed after NAT rules.
-
-These primitives are implemented in `ip_fw2.c` through the `ipfw_run_eaction()` function, which dispatches based on the rule's action opcode.
+These primitives are implemented in `sys/netpfil/ipfw/ip_fw2.c` via the `eaction_obj` structures and the `ipfw_run_eaction()` function, which dispatches to the appropriate handler based on the action type.
 
 ### Dynamic State Tracking
 
-Dynamic state tracking is implemented in `sys/netpfil/ipfw/ip_fw_dynamic.c`. When a rule with the `keep-state` option matches, ipfw creates a temporary state entry that allows return traffic to pass without an explicit rule. Four hash tables are maintained: `dyn_ipv4`, `dyn_ipv6`, `dyn_ipv4_parent`, and `dyn_ipv6_parent`. States are keyed by source/destination addresses, protocol, and ports, with configurable lifetimes.
+`ipfw` maintains dynamic states for stateful protocols. These states are stored in hash tables (`dyn_ipv4`, `dyn_ipv6`, `dyn_ipv4_parent`, `dyn_ipv6_parent`) as described in `sys/netpfil/ipfw/ip_fw_dynamic.c`. When a packet matches a rule with the `keep-state` option, `ipfw` creates a temporary state entry that allows return traffic to pass without matching an explicit rule. States expire after a configurable timeout (`dyn_*_lifetime` sysctls) or when the connection terminates.
 
-```c
-/* Dynamic states are stored in lists accessed through a hash tables
- * whose size is curr_dyn_buckets. */
-struct dyn_ipv4_state {
-	/* state data for IPv4 connections */
-};
-
-struct dyn_ipv6_state {
-	/* state data for IPv6 connections */
-};
-```
-
-The dynamic state system also supports parent states for protocols like FTP that open secondary connections. The `dyn_parent` structure tracks the parent connection, allowing child connections to be associated with the original state.
+The dynamic state system uses `dyn_classify()` to match incoming packets against existing states, and `dyn_add_ipv4_state()` / `dyn_add_ipv6_state()` to create new entries. Parent states track the original rule that created the state, enabling proper cleanup when the parent rule is deleted.
 
 ### In-Kernel NAT
 
-NAT in `ipfw` is implemented via `libalias`, a modular address-translation library. The configuration is stored in `sys/netpfil/ipfw/ip_fw_nat.c` using the following structures:
+`ipfw`'s NAT implementation is built on `libalias`, a modular address-translation library. The configuration structures (`cfg_nat`, `cfg_redir`, `cfg_spool`) are defined in `sys/netpfil/ipfw/ip_fw_nat.c`. NAT is configured per-interface and maintains stateful mappings for port redirections and spool-based address pools.
+
+The `cfg_nat` structure holds a `libalias` instance per interface, along with chains of redirections (`cfg_redir`) and spool entries (`cfg_spool`). When a packet matches a NAT rule, `ipfw_nat()` is called, which delegates to `libalias` for address and port translation. Checksums are adjusted using `in_ckm_adjust()` to reflect the changed addresses.
+
+NAT in `ipfw` differs from `pf`'s NAT in several ways: `pf` uses a declarative syntax with `nat` and `rdr` rules that are evaluated with last-match semantics, while `ipfw` uses explicit rule numbers and first-match semantics. `ipfw`'s NAT is tightly integrated with its stateful filtering — the `keep-state` option automatically creates states for NATted connections, whereas `pf` requires separate `match state` rules.
+
+### dummynet: Traffic Shaping and AQM
+
+`dummynet` is a separate subsystem that `ipfw` drives. When a rule specifies a `pipe` action, the packet is passed to `dummynet` via `dummynet_send()` in `sys/netpfil/ipfw/ip_dn_io.c`. `dummynet` organizes traffic hierarchically:
+
+- **Pipes** are the top-level containers that hold a scheduler.
+- **Schedulers** (FIFO, WF2Q+, FQ-CoDel, FQ-PIE, etc.) determine the order in which packets are dequeued.
+- **Queues** hold packets waiting to be transmitted.
+- **Flow classes** (in fair-queuing schedulers) group packets by flow for per-flow fairness.
+
+The scheduler API is defined in `sys/netpfil/ipfw/dn_sched.h` via the `dn_alg` structure, which contains function pointers for `enqueue`, `dequeue`, `config`, `destroy`, and other operations. Each scheduler module registers itself with the global `schedlist` via `dn_sched_modevent()`.
+
+When a packet is enqueued, `dn_enqueue()` is called, which dispatches to the scheduler's `enqueue` method. The scheduler places the packet in an appropriate queue or flow. When the scheduler can transmit, `dn_dequeue()` is called, which invokes the scheduler's `dequeue` method to retrieve the next packet. The packet is then re-injected into the network stack via `ip_output()` or the appropriate input handler.
+
+`dummynet` also supports Active Queue Management (AQM) algorithms like CoDel and PIE, implemented in `dn_aqm_codel.c` and `dn_aqm_pie.c`. These algorithms proactively drop or mark packets when queues grow, preventing bufferbloat and reducing latency.
+
+## Key Data Structures
+
+### `struct ip_fw_args`
+Defined in `sys/netpfil/ipfw/ip_fw_private.h`, this structure collects all parameters for packet inspection:
+
+```c
+struct ip_fw_args {
+	uint32_t		flags;
+#define	IPFW_ARGS_ETHER		0x00010000	/* valid ethernet header */
+#define	IPFW_ARGS_NH4		0x00020000	/* IPv4 next hop in hopstore */
+#define	IPFW_ARGS_NH6		0x00040000	/* IPv6 next hop in hopstore */
+#define	IPFW_ARGS_IN		0x00400000	/* called on input */
+#define	IPFW_ARGS_OUT		0x00800000	/* called on output */
+	struct ipfw_rule_ref	rule;	/* match/restart info		*/
+	struct ifnet		*ifp;	/* input/output interface	*/
+	struct inpcb		*inp;
+	/* ... */
+};
+```
+
+The `flags` field indicates whether the packet is incoming or outgoing, whether it has a valid Ethernet header, and which address family it belongs to. The `rule` field tracks the current position in the rule chain, enabling `skipto` and dynamic rule matching.
+
+### `struct ip_fw_chain`
+Defined in `sys/netinet/ip_fw.h`, this structure represents the sorted chain of rules:
+
+```c
+struct ip_fw_chain {
+	struct ip_fw		*rules;
+	uint32_t		id;
+	uint32_t		nrules;
+	/* hash/radix tables for fast lookup */
+	/* ... */
+};
+```
+
+The `rules` array holds all rules in sorted order. The hash/radix tables accelerate lookups by indexing rules based on their match criteria (source/destination addresses, ports, protocols). This allows `ipfw` to skip non-matching rules without examining every field.
+
+### `struct dn_sch`
+Defined in `sys/netinet/ip_dummynet.h`, this structure represents a scheduler instance:
+
+```c
+struct dn_sch {
+	struct dn_id		oid;
+	/* scheduler-specific data */
+	/* ... */
+};
+```
+
+Each scheduler type (FIFO, WF2Q+, FQ-CoDel, etc.) extends this structure with additional fields. The `dn_alg` structure (from `dn_sched.h`) provides the function pointers that implement the scheduling algorithm.
+
+### `struct dn_queue`
+Defined in `sys/netpfil/ipfw/ip_dn_private.h`, this is a simple mbuf queue:
+
+```c
+struct mq {	/* a basic queue of packets*/
+        struct mbuf *head, *tail;
+	int count;
+};
+```
+
+Queues hold packets waiting to be dequeued by the scheduler. In multi-queue schedulers like FQ-CoDel, each flow has its own queue.
+
+### `struct cfg_nat`
+Defined in `sys/netpfil/ipfw/ip_fw_nat.c`, this structure holds NAT configuration:
 
 ```c
 struct cfg_nat {
@@ -119,174 +188,19 @@ struct cfg_nat {
 	struct in_addr		ip;
 	struct libalias		*lib;
 	int			mode;
-	int			redir_cnt;
 	LIST_HEAD(redir_chain, cfg_redir) redir_chain;
 	char			if_name[IF_NAMESIZE];
-	u_short			alias_port_lo;
-	u_short			alias_port_hi;
-};
-
-struct cfg_redir {
-	LIST_ENTRY(cfg_redir)	_next;
-	uint16_t		mode;
-	uint16_t		proto;
-	struct in_addr		laddr;
-	struct in_addr		paddr;
-	uint16_t		lport;
-	uint16_t		pport;
-	struct alias_link	**alink;
-};
-```
-
-NAT in `ipfw` is configured per-interface and maintains stateful mappings for port redirections and spool-based address pools. This differs from `pf`'s NAT, which is configured using `rdr` and `nat` rules in the packet filter rule set. `ipfw`'s NAT is more tightly integrated with the firewall rules, allowing NAT to be conditional on other firewall criteria.
-
-### Dummynet: Traffic Shaping and AQM
-
-`dummynet` is the traffic-shaping subsystem that `ipfw` drives. When a rule specifies a `pipe` action, the packet is enqueued into dummynet's internal scheduler. The packet flow is:
-
-1. `ipfw_chk()` matches a rule with a `pipe` action
-2. `dummynet_send()` (`ip_dn_io.c`) enqueues the packet
-3. The scheduler's `dequeue` function is called when bandwidth is available
-4. The packet is re-injected into the network stack
-
-`dummynet` supports multiple scheduling algorithms registered via the `dn_alg` structure in `dn_sched.h`:
-
-```c
-struct dn_alg {
-	uint32_t type;
-	const char *name;
-	uint32_t flags;	/* DN_MULTIQUEUE if supports multiple queues */
-	size_t schk_datalen;
-	size_t si_datalen;
-	size_t q_datalen;
-
-	/* Function pointers for scheduler operations */
-	int (*enqueue)(struct mbuf *m, struct dn_sched *s,
-	    struct dn_queue *q);
-	struct mbuf *(*dequeue)(struct dn_sched *s, int *isq);
 	/* ... */
 };
 ```
 
-The supported schedulers include:
-- **FIFO**: Simple first-in, first-out queue
-- **WF2Q+**: Weighted Fair Queueing with enhanced fairness
-- **FQ-CoDel**: Flow-Queue Controlled Delay — combines flow classification with CoDel AQM
-- **FQ-PIE**: Flow-Queue Proportional Integral Controller Enhanced
-- **Priority**: Priority-based scheduling
-- **RR**: Round Robin
-- **QFQ**: Quantized Fair Queueing
-
-## Key Data Structures
-
-### `struct ip_fw_chain`
-
-Defined in `sys/netpfil/ipfw/ip_fw_private.h`, this structure represents the chain of rules for a given address family:
-
-```c
-struct ip_fw_chain {
-	struct ip_fw	*rules;		/* array of rules */
-	int		nrules;		/* number of rules */
-	int		id;		/* chain identifier */
-	struct rmlock	rwmtx;		/* rule chain lock */
-	/* ... other fields */
-};
-```
-
-The rule chain is sorted by rule number, enabling efficient radix-based lookups. The `rmlock` protects concurrent access to the rule set during configuration changes.
-
-### `struct ip_fw`
-
-Defined in `sys/netinet/ip_fw.h`, each rule contains an opcode array and associated data:
-
-```c
-struct _ipfw_insn {
-	uint8_t opcode;
-	uint8_t arg1;
-	uint8_t len;
-	uint8_t _pad;
-	uint32_t count;
-	uint32_t counter;
-};
-```
-
-Rules are composed of a sequence of instructions (`_ipfw_insn`), each with an opcode (match criteria or action) and optional arguments. The `len` field indicates the total length of the instruction including any extension data.
-
-### `struct dn_parms`
-
-Defined in `sys/netpfil/ipfw/ip_dn_private.h`, this is the global dummynet configuration:
-
-```c
-struct dn_parms {
-	uint32_t	id;		/* configuration version */
-	int		red_lookup_depth;
-	int		red_avg_pkt_size;
-	int		red_max_pkt_size;
-	int		hash_size;
-	int		max_hash_size;
-	long		byte_limit;
-	long		slot_limit;
-	int		io_fast;
-	int		debug;
-	struct timeval	prev_t;
-	struct dn_heap	evheap;		/* scheduled events */
-	/* ... */
-};
-```
-
-The `evheap` is a binary heap used to track pending timer events for flow expiration and scheduler rescheduling.
-
-### `struct dn_queue`
-
-Defined in `sys/netpfil/ipfw/ip_dn_private.h`, represents a queue within a scheduler:
-
-```c
-struct dn_queue {
-	struct dn_id	id;
-	struct dn_id	parent_id;
-	struct mq	mq;		/* packet queue */
-	/* ... scheduler-specific data */
-#ifdef NEW_AQM
-	struct dn_aqm	*aqm;		/* AQM algorithm */
-#endif
-};
-```
-
-The `mq` field contains the actual packet queue (head, tail, count). The queue can be attached to an AQM algorithm (CoDel or PIE) for active queue management.
-
-### `struct dn_schk`
-
-Defined in `sys/netpfil/ipfw/ip_dn_private.h`, represents a scheduler instance:
-
-```c
-struct dn_schk {
-	struct dn_id	id;
-	struct dn_alg	*alg;		/* scheduler algorithm */
-	struct dn_fsk	fsk;		/* flow set */
-	/* ... per-instance data */
-};
-```
-
-The scheduler instance holds the flow set (`dn_fsk`) which contains the queues for individual flows in multi-queue schedulers like FQ-CoDel.
-
-### `struct mq`
-
-Defined in `sys/netpfil/ipfw/ip_dn_private.h`, a simple packet queue:
-
-```c
-struct mq {
-	struct mbuf *head, *tail;
-	int count;
-};
-```
-
-This is the fundamental queue structure used by all schedulers. It maintains a linked list of mbufs with head/tail pointers and a packet count.
+Each `cfg_nat` instance corresponds to a NAT-enabled interface. The `libalias` pointer holds the translation state, and the `redir_chain` lists port redirections configured for that interface.
 
 ## Deep Dive
 
-### Packet Processing Flow: From pfil to Dummynet
+### Tracing a Packet Through ipfw
 
-When a packet arrives at the network interface, it traverses the input pfil hooks. If `ipfw` is loaded, `ipfw_check_packet()` in `sys/netpfil/ipfw/ip_fw_pfil.c` is called:
+When a packet arrives on a network interface, the `pfil` framework calls `ipfw_check_packet()` in `sys/netpfil/ipfw/ip_fw_pfil.c`. This function constructs an `ip_fw_args` structure and calls `ipfw_chk()`:
 
 ```c
 static pfil_return_t
@@ -302,296 +216,226 @@ ipfw_check_packet(struct mbuf **m0, struct ifnet *ifp, int flags,
 	    : IPFW_ARGS_OUT;
 	args.ifp = ifp;
 	args.inp = inp;
-	/* ... initialize args ... */
-
-	ret = ipfw_chk(&args, m0);
-
-	/* Handle return values */
-	switch (ret) {
-	case IP_FW_PASS:
-		break;
-	case IP_FW_DENY:
-		*m0 = NULL;
-		ret.result = PFIL_CONSUMED;
-		break;
-	case IP_FW_DUMMYNET:
-		/* Packet sent to dummynet, consumed */
-		*m0 = NULL;
-		ret.result = PFIL_CONSUMED;
-		break;
 	/* ... */
-	}
+	ret = ipfw_chk(&args, m0);
+	/* ... */
 	return ret;
 }
 ```
 
-The `ipfw_chk()` function in `sys/netpfil/ipfw/ip_fw2.c` performs the rule lookup and execution:
+`ipfw_chk()` in `sys/netpfil/ipfw/ip_fw2.c` begins rule evaluation. It first checks if the packet has already been tagged by a previous `pfil` hook (to avoid re-evaluation). It then looks up the first matching rule using the hash/radix table:
+
+```c
+pfil_return_t
+ipfw_chk(struct ip_fw_args *a, struct mbuf **m)
+{
+	struct ip_fw_chain *chain = &V_layer3_chain;
+	struct ip_fw *f;
+	struct ipfw_rule_ref *ref = &a->rule;
+	int error;
+
+	/* Check if already processed */
+	if (ref->slot > 0 && ref->chain_id == chain->id)
+		goto restart;
+
+	/* Find first matching rule */
+	f = ipfw_find_rule(chain, a, m);
+	if (f == NULL)
+		return (IP_FW_PASS);
+
+	/* Execute rule action */
+	error = ipfw_run_eaction(a, m, f);
+	/* ... */
+	return (error);
+}
+```
+
+The `ipfw_find_rule()` function performs the first-match lookup. It iterates through the sorted rule chain, comparing each rule's match criteria against the packet. When a match is found, the rule's action is executed via `ipfw_run_eaction()`.
+
+### Rule Actions and Control Flow
+
+`ipfw_run_eaction()` dispatches to the appropriate handler based on the rule's action:
+
+```c
+static int
+ipfw_run_eaction(struct ip_fw_args *a, struct mbuf **m, struct ip_fw *f)
+{
+	switch (f->action) {
+	case IP_FW_PASS:
+		return (IP_FW_PASS);
+	case IP_FW_DENY:
+		return (IP_FW_DENY);
+	case IP_FW_DIVERT:
+		return (ipfw_divert(m, a, f->divert_port));
+	case IP_FW_DUMMYNET:
+		return (dummynet_send(m, a, f->pipe_id));
+	case IP_FW_NAT:
+		return (ipfw_nat(a, m, f->nat_id));
+	/* ... */
+	}
+}
+```
+
+For `divert`, the packet is sent to a user-space socket via `ipfw_divert()`. For `dummynet`, the packet is enqueued via `dummynet_send()`. For `nat`, address translation is performed via `ipfw_nat()`.
+
+### dummynet Packet Flow
+
+When a packet is matched by a rule with a `pipe` action, `dummynet_send()` in `sys/netpfil/ipfw/ip_dn_io.c` is called:
 
 ```c
 int
-ipfw_chk(struct ip_fw_args *args, struct mbuf **m0)
+dummynet_send(struct mbuf *m, struct ip_fw_args *a, int pipe_id)
 {
-	struct ip_fw_chain *chain = &V_layer3_chain;
-	struct ip_fw *rule;
-	int ret;
+	struct dn_obj *obj;
+	struct dn_sch *sch;
+	int error;
 
-	/* Find matching rule using radix/hash lookup */
-	rule = ipfw_rule_lookup(chain, args);
-	if (rule == NULL)
-		return IP_FW_DENY;  /* default deny */
+	/* Find the pipe */
+	obj = dn_obj_find(DN_PIPE, pipe_id);
+	if (obj == NULL)
+		return (IP_FW_DENY);
 
-	/* Execute rule instructions */
-	ret = ipfw_chk_rule(args, rule);
-	return ret;
-}
-```
-
-The rule lookup uses a radix tree optimized for the sorted rule array, enabling O(log n) lookups even with thousands of rules. When a rule with a `pipe` action is matched, the packet is sent to dummynet via `dummynet_send()`:
-
-```c
-static int
-dummynet_send(struct mbuf *m, struct ip_fw_args *args, int pipe_id)
-{
-	struct dn_queue *q;
-	struct dn_parms *dn = &V_dn_cfg;
-
-	/* Find the pipe by ID */
-	q = ipdn_q_find(pipe_id);
-	if (q == NULL) {
-		m_freem(m);
-		return (0);
-	}
+	sch = &obj->sch;
 
 	/* Enqueue the packet */
-	dn_enqueue(m, q, args);
+	error = sch->alg->enqueue(sch, m);
+	if (error) {
+		/* Packet dropped by scheduler */
+		return (IP_FW_DENY);
+	}
 
-	/* Schedule dequeue if needed */
+	/* Reschedule if needed */
 	dn_reschedule();
-
-	return (0);
+	return (IP_FW_DUMMYNET);
 }
 ```
 
-### Dummynet Scheduling: FQ-CoDel Deep Dive
+`dn_obj_find()` looks up the pipe by ID. The scheduler's `enqueue` method places the packet in an appropriate queue. For FIFO, this is straightforward — the packet is appended to the queue. For WF2Q+, the packet is placed in a weighted queue. For FQ-CoDel, the packet is classified into a flow and enqueued in the flow's queue.
 
-FQ-CoDel (`dn_sched_fq_codel.c`) combines flow classification with CoDel AQM. Each flow is hashed based on packet headers and placed in a separate CoDel queue:
-
-```c
-static int
-fq_codel_enqueue(struct mbuf *m, struct dn_sched *s, struct dn_queue *q)
-{
-	struct fq_codel_si *si = (struct fq_codel_si *)s->si_data;
-	struct fq_codel_flow *flow;
-	uint32_t flow_hash;
-
-	/* Classify packet into a flow */
-	flow_hash = hash_packet(m);
-	flow = fq_codel_classify_flow(si, flow_hash, m);
-
-	/* Enqueue into flow's CoDel queue */
-	fq_codel_enqueue(m, flow);
-
-	return (0);
-}
-```
-
-The CoDel algorithm monitors the minimum queue delay over a sliding window. When the delay exceeds a target threshold, packets are dropped to signal congestion to the sender. The FQ variant ensures fair bandwidth allocation across flows by maintaining separate queues per flow.
-
-The dequeue function extracts packets from the oldest non-empty flow queue:
+When the scheduler can transmit, `dn_dequeue()` is called, which invokes the scheduler's `dequeue` method:
 
 ```c
-static struct mbuf *
-fq_codel_dequeue(struct dn_sched *s, int *isq)
+struct mbuf *
+dn_dequeue(struct dn_sch *sch)
 {
-	struct fq_codel_si *si = (struct fq_codel_si *)s->si_data;
-	struct fq_codel_flow *flow;
 	struct mbuf *m;
 
-	/* Find flow with oldest packet */
-	flow = fq_codel_find_oldest_flow(si);
-	if (flow == NULL)
-		return (NULL);
-
-	/* Dequeue from flow's CoDel queue */
-	m = fq_codel_dequeue_flow(flow);
-
+	m = sch->alg->dequeue(sch);
+	if (m) {
+		/* Update statistics */
+		sch->stats.packets++;
+		sch->stats.bytes += m->m_pkthdr.len;
+	}
 	return (m);
 }
 ```
 
-### Dynamic State Creation and Matching
+The dequeued packet is then re-injected into the network stack. For output packets, it is passed to `ip_output()`. For input packets, it is re-injected via the appropriate input handler.
 
-When a rule with `keep-state` matches, `dyn_create()` in `sys/netpfil/ipfw/ip_fw_dynamic.c` creates a state entry:
+### Dynamic State Management
+
+Dynamic states are created when a packet matches a rule with the `keep-state` option. `dyn_add_ipv4_state()` in `sys/netpfil/ipfw/ip_fw_dynamic.c` allocates a state entry and inserts it into the appropriate hash table:
 
 ```c
 static struct dyn_state_obj *
-dyn_create(struct ip_fw *rule, struct ip_fw_args *args, int dir)
+dyn_add_ipv4_state(struct ip_fw *f, struct ip_fw_args *a, struct mbuf *m)
 {
 	struct dyn_state_obj *state;
 	uint32_t hash;
 
-	/* Allocate state from UMA zone */
-	state = dyn_alloc_ipv4_state(rule, args);
+	/* Allocate state */
+	state = dyn_alloc_dyndata(f->proto, AF_INET);
 	if (state == NULL)
 		return (NULL);
 
-	/* Hash and insert into state table */
-	hash = flow_id_hash(args);
-	dyn_install_state(state, hash);
+	/* Initialize state from packet */
+	dyn_init_state(state, f, a, m);
+
+	/* Hash and insert */
+	hash = dyn_hash_state(state);
+	dyn_insert_state(state, hash);
 
 	return (state);
 }
 ```
 
-Return traffic is matched against the state table in `dyn_lookup_ipv4_state()`:
+The state is hashed based on its tuple (source/destination addresses, ports, protocol) and inserted into the appropriate hash table. When a return packet arrives, `dyn_lookup_state()` searches the hash table for a matching state. If found, the state is updated and the packet is allowed to pass.
 
-```c
-static struct dyn_state_obj *
-dyn_lookup_ipv4_state(struct ip_fw_args *args)
-{
-	uint32_t hash;
-	struct dyn_state_obj *state;
+### In-Kernel NAT via libalias
 
-	hash = flow_id_hash(args);
-	state = dyn_lookup_ipv4_state_locked(hash, args);
-
-	if (state != NULL) {
-		dyn_update(state);  /* Refresh lifetime */
-		return (state);
-	}
-	return (NULL);
-}
-```
-
-### NAT Configuration and Packet Translation
-
-NAT is configured per-interface via `ipfw_nat_cfg()` in `sys/netpfil/ipfw/ip_fw_nat.c`:
+NAT in `ipfw` uses `libalias` for address and port translation. `ipfw_nat()` in `sys/netpfil/ipfw/ip_fw_nat.c` looks up the NAT configuration for the packet's interface and delegates to `libalias`:
 
 ```c
 int
-ipfw_nat_cfg(struct cfg_nat *cfg, int op)
-{
-	struct cfg_nat *ptr;
-	struct ip_fw_chain *chain = &V_layer3_chain;
-
-	IPFW_UH_WLOCK(chain);
-
-	switch (op) {
-	case IPFW_ADD:
-		/* Add new NAT configuration */
-		ptr = malloc(sizeof(*ptr), M_TEMP, M_WAITOK | M_ZERO);
-		*ptr = *cfg;
-		LIST_INSERT_HEAD(&chain->nat, ptr, _next);
-		break;
-	case IPFW_DEL:
-		/* Remove NAT configuration */
-		LIST_FOREACH(ptr, &chain->nat, _next) {
-			if (ptr->id == cfg->id) {
-				LIST_REMOVE(ptr, _next);
-				free_nat_instance(ptr);
-				break;
-			}
-		}
-		break;
-	}
-
-	IPFW_UH_WUNLOCK(chain);
-	return (0);
-}
-```
-
-When a packet traverses a NAT rule, `ipfw_nat()` in `ip_fw_nat.c` performs the address translation using `libalias`:
-
-```c
-static int
-ipfw_nat(struct ip_fw *rule, struct ip_fw_args *args, struct mbuf **m0)
+ipfw_nat(struct ip_fw_args *a, struct mbuf **m, int nat_id)
 {
 	struct cfg_nat *nat;
 	struct libalias *la;
-	struct mbuf *m = *m0;
+	int error;
 
-	/* Find NAT configuration for this interface */
-	nat = lookup_nat(rule, args->ifp);
+	/* Find NAT configuration */
+	nat = ipfw_nat_get_cfg(nat_id);
 	if (nat == NULL)
 		return (IP_FW_DENY);
 
 	la = nat->lib;
 
-	/* Perform NAT translation via libalias */
-	if (args->flags & IPFW_ARGS_IN) {
-		/* Inbound: translate destination */
-		la->AliasInboundPacket(la, m);
-	} else {
-		/* Outbound: translate source */
-		la->AliasOutboundPacket(la, m);
-	}
+	/* Perform translation */
+	error = LibAliasTranslate(la, m, a);
+	if (error)
+		return (IP_FW_DENY);
 
 	/* Adjust checksums */
-	cksum_adjust(m, args);
+	in_ckm_adjust(*m);
 
 	return (IP_FW_NAT);
 }
 ```
 
+`LibAliasTranslate()` performs the actual address and port translation based on the configured NAT rules. Checksums are adjusted using `in_ckm_adjust()` to reflect the changed addresses.
+
 ## Flow / Diagram
 
 ```mermaid
 flowchart TD
-    subgraph "Network Interface"
-        A[Packet Arrives] --> B[pfil Hook]
-    end
-
-    subgraph "ipfw Firewall"
-        B --> C[ipfw_check_packet]
-        C --> D[ipfw_chk Rule Lookup]
-        D --> E{Rule Match?}
-        E -->|No| F[Default Deny]
-        E -->|Yes| G[Execute Rule Action]
-        G --> H{Action Type}
-        H -->|Pass| I[Continue Network Stack]
-        H -->|Deny| F
-        H -->|Divert| J[Send to Userland]
-        H -->|Tee| K[Copy to Divert + Continue]
-        H -->|Skipto| L[Jump to Rule N]
-        H -->|NAT| M[libalias Translation]
-        H -->|Pipe| N[Send to Dummynet]
-    end
-
-    subgraph "Dummynet Shaper"
-        N --> O[Find Pipe/Queue]
-        O --> P[Enqueue Packet]
-        P --> Q{Scheduler Type}
-        Q -->|FIFO| R[FIFO Dequeue]
-        Q -->|WF2Q+| S[WF2Q+ Dequeue]
-        Q -->|FQ-CoDel| T[FQ-CoDel Dequeue]
-        Q -->|FQ-PIE| U[FQ-PIE Dequeue]
-        R --> V[Re-inject to Stack]
-        S --> V
-        T --> V
-        U --> V
-    end
-
-    subgraph "Dynamic State"
-        G --> W{keep-state?}
-        W -->|Yes| X[Create State Entry]
-        W -->|No| Y[Continue]
-        X --> Y
-    end
-
-    subgraph "Return Traffic"
-        I --> Z[Return Packet]
-        Z --> C
-        C --> AA{State Match?}
-        AA -->|Yes| AB[Allow via State]
-        AA -->|No| D
-    end
+    A[Packet arrives at interface] --> B[pfil hook]
+    B --> C[ipfw_check_packet]
+    C --> D[ipfw_chk]
+    D --> E{Find first matching rule}
+    E -->|No match| F[IP_FW_PASS]
+    E -->|Match| G[ipfw_run_eaction]
+    G --> H{Action type}
+    H -->|PASS| F
+    H -->|DENY| I[IP_FW_DENY]
+    H -->|DIVERT| J[ipfw_divert - send to user socket]
+    H -->|SKIPTO| L[Jump to rule N]
+    H -->|DUMMYNET| M[dummynet_send]
+    M --> N[dn_enqueue - scheduler enqueue]
+    N --> O{Scheduler type}
+    O -->|FIFO| P[Append to queue]
+    O -->|WF2Q+| Q[Weighted queue enqueue]
+    O -->|FQ-CoDel| R[Classify flow, enqueue in flow queue]
+    O -->|FQ-PIE| S[Classify flow, enqueue in flow queue]
+    P --> T[dn_reschedule - set timer]
+    Q --> T
+    R --> T
+    S --> T
+    T --> U[Timer expires]
+    U --> V[dn_dequeue - scheduler dequeue]
+    V --> W[Re-inject packet to stack]
+    H -->|NAT| X[ipfw_nat]
+    X --> Y[LibAliasTranslate]
+    Y --> Z[in_ckm_adjust]
+    Z --> W
+    H -->|REASS| AA[Reassemble fragments]
+    AA --> W
 ```
 
 ## Advanced Notes
 
-### DTrace Probes for ipfw
+### Debugging with SDT Probes
 
-`ipfw` provides SDT (Static DTrace Tracing) probes for debugging and performance analysis. The `ipfw` provider defines the `rule__matched` probe in `ip_fw2.c`:
+`ipfw` provides System DTrace Probes (SDT) for runtime tracing. The `rule__matched` probe fires when a rule matches, providing the rule number, address family, source and destination addresses, and the `ip_fw_args` structure:
 
 ```c
 SDT_PROBE_DEFINE6(ipfw, , , rule__matched,
@@ -603,95 +447,76 @@ SDT_PROBE_DEFINE6(ipfw, , , rule__matched,
     "struct ip_fw *"		/* rule */);
 ```
 
-This probe fires when a rule matches, providing the return value, address family, source/destination addresses, args structure, and the matching rule pointer. Additional probes exist in `dummynet` for packet drops:
+DTrace scripts can attach to this probe to monitor rule matching patterns, identify misconfigured rules, or detect suspicious traffic. The `dummynet` subsystem also provides a `drop` probe that fires when a packet is dropped by the scheduler:
 
 ```c
 SDT_PROBE_DEFINE2(dummynet, , , drop, "struct mbuf *", "struct dn_queue *");
 ```
 
-Using DTrace, administrators can trace rule matches, identify which rules are processing the most traffic, and diagnose shaping behavior:
+### Performance Implications
 
-```bash
-dtrace -n 'sdt:ipfw:rule__matched { @count[arg5] = count(); }'
-dtrace -n 'sdt:dummynet:drop { @drops = count(); }'
-```
+`ipfw`'s first-match semantics can have significant performance implications. Unlike `pf`, which can optimize rule evaluation by building a decision tree, `ipfw` must scan rules in order until a match is found. This makes rule ordering critical — common rules should be placed early in the chain to minimize evaluation time.
 
-### Performance Considerations
+`ipfw` mitigates this with hash/radix tables that accelerate lookups. These tables index rules based on their match criteria, allowing `ipfw` to skip non-matching rules without examining every field. However, the tables add overhead during rule insertion and deletion, so frequent rule changes can impact performance.
 
-**Rule Lookup Optimization**: `ipfw` uses a radix-based lookup for rule chains, which provides O(log n) performance even with thousands of rules. The rule chain is sorted by rule number, enabling binary search. For very large rule sets (10,000+ rules), consider using `skipto` to create rule groups and reduce the effective search space.
+`dummynet`'s schedulers also have performance characteristics that depend on the algorithm. FIFO is the fastest but provides no fairness. WF2Q+ provides weighted fairness with moderate overhead. FQ-CoDel and FQ-PIE provide per-flow fairness and AQM but require flow classification and per-flow state, which adds CPU and memory overhead.
 
-**Dynamic State Hash Tables**: The dynamic state tables use configurable hash bucket sizes (`dyn_buckets` sysctl). When the number of states exceeds the bucket count, lookup performance degrades due to longer hash chains. Monitor state counts via `sysctl net.inet.ip.fw.dyn_count` and adjust `dyn_buckets` accordingly.
+### Race Conditions and Locking
 
-**Dummynet Scheduler Lock**: `dummynet` uses a single mutex (`sched_mtx`) to protect scheduler operations. Under high packet rates, this can become a bottleneck. The `io_fast` mode in `dn_parms` reduces locking overhead by batching operations. Enable via `sysctl net.inet.ip.fw.dummynet.io_fast=1`.
+`ipfw` uses read-mostly locks (UH locks) for rule chain access, allowing concurrent packet inspection while rule modifications are serialized. Dynamic states are protected by hash-table locks, and `dummynet` uses a global scheduler mutex (`sched_mtx`) to protect scheduler state.
 
-**FQ-CoDel Flow Classification**: FQ-CoDel classifies flows based on packet headers. For IPv4, the hash includes source/destination addresses and ports. For IPv6, the flow label is used when available. Ensure that your traffic patterns create reasonable flow counts — too many flows can exhaust the hash table, too few can lead to unfair bandwidth allocation.
+A potential race condition exists when a rule is deleted while packets are being processed. `ipfw` mitigates this by referencing rules via `ipfw_rule_ref` structures that are reference-counted and cleaned up via `NET_EPOCH`. This ensures that a rule cannot be freed while it is still being accessed.
+
+`dummynet`'s scheduler operations are protected by `sched_mtx`, but packet enqueue and dequeue operations are lock-free where possible. The `dn_reschedule()` function uses a callout to defer scheduler wake-up, avoiding busy-waiting and reducing CPU overhead.
 
 ### Common Pitfalls
 
-**Rule Ordering**: The first-match semantics requires careful rule ordering. A common mistake is placing a general "allow all" rule before specific deny rules, which renders the deny rules ineffective. Always test rule sets with `ipfw -v add` to verify the order.
+1. **Rule ordering**: Because `ipfw` uses first-match semantics, placing a deny rule before an allow rule will block traffic unexpectedly. Always test rule order carefully.
 
-**NAT and keep-state Interaction**: When using NAT with `keep-state`, the state is created based on the post-NAT addresses. Return traffic arrives with the public address, which must match the state. Use `skipto` to skip over stateful rules when configuring NAT:
+2. **NAT and stateful rules**: When using NAT with `keep-state`, the NAT rule must be placed before the stateful rule. If the stateful rule matches before NAT, it will create a state for the original (untranslated) address, causing return traffic to be dropped.
 
-```
-ipfw add nat 100 ip from any to any via fxp0
-ipfw add skipto 200 ip from any to any via fxp0
-ipfw add 200 keep-state ip from any to any
-```
+3. **Pipe ID conflicts**: `dummynet` pipes are identified by numeric IDs. If multiple `ipfw` rules reference the same pipe ID, they share the same scheduler and queues. This can lead to unexpected interactions between unrelated traffic flows.
 
-**Dummynet Pipe ID Conflicts**: Pipe IDs are global within a VNET. Ensure that pipe IDs do not conflict when using multiple VNETs or when reconfiguring the firewall. The `dummynet` configuration ID (`dn_parms.id`) is incremented on each configuration change to detect stale pointers.
+4. **Dynamic state exhaustion**: The maximum number of dynamic states is limited by `dyn_max`. If this limit is reached, new states are not created, and return traffic may be dropped. Monitor state counts via `ipfw statdyn` and adjust `dyn_max` if necessary.
 
-**VNET Isolation**: `ipfw` and `dummynet` are VNET-aware. Each VNET has its own rule chain, NAT configuration, and dummynet state. Ensure that configuration commands target the correct VNET when using network virtualization.
-
-### Connection to OS Theory
-
-The `ipfw`/`dummynet` subsystem exemplifies several operating system concepts:
-
-**First-Match vs Last-Match**: The first-match semantics mirrors the classic Unix `ipfw` design, where rules are evaluated top-down and the first match wins. This is efficient for lookups but requires careful rule ordering. In contrast, `pf`'s last-match semantics allows rules to be written in a more natural order (specific before general), at the cost of scanning all rules. This trade-off reflects the broader OS design question: optimize for lookup speed or for configuration ease.
-
-**Active Queue Management**: `dummynet`'s implementation of CoDel and PIE represents the modern approach to AQM, which monitors queue delay rather than just queue length to detect congestion. CoDel, developed by Nick McKeown and others at Stanford, has been adopted in Linux (as `fq_codel`) and FreeBSD, replacing the older RED (Random Early Detection) algorithm. The FQ variant adds flow-level fairness, preventing a single flow from dominating bandwidth.
-
-**Hash-Based State Tables**: The dynamic state system uses hash tables for O(1) average-case lookups, a fundamental data structure in operating systems. The configurable bucket count and collision handling reflect the trade-off between memory usage and lookup performance.
+5. **AQM tuning**: CoDel and PIE parameters (target latency, interval, max threshold) must be tuned for the specific network topology. Default values may not be optimal for all configurations. Use `ipfw pipe show` to monitor queue statistics and adjust parameters accordingly.
 
 ## Comparison
 
-### FreeBSD ipfw vs Linux netfilter
+### FreeBSD ipfw vs. Linux tc/netfilter
 
-FreeBSD's `ipfw` and Linux's `netfilter`/`nftables` both provide firewall, NAT, and traffic shaping, but with different architectures:
+FreeBSD's `ipfw` combines filtering, NAT, and traffic shaping in a single subsystem, whereas Linux separates these concerns: `netfilter` handles filtering and NAT, while `tc` (traffic control) handles shaping. This separation gives Linux more flexibility — different administrators can manage filtering and shaping independently — but requires more complex configuration to achieve the same integrated behavior.
 
-- **Rule Evaluation**: `ipfw` uses first-match semantics with a sorted rule chain, while `nftables` uses a last-match policy with a bytecode interpreter. `netfilter`'s older `iptables` uses first-match like `ipfw`, but `nftables` represents a significant architectural shift.
-- **Traffic Shaping**: `ipfw` integrates `dummynet` directly, allowing rules to reference pipes. Linux uses `tc` (traffic control) as a separate subsystem with `clsact` qdiscs attached to interfaces. This separation gives Linux more flexibility but requires more configuration.
-- **NAT**: Both use hash tables for NAT state, but `ipfw`'s `libalias` is a library embedded in the kernel, while Linux's `nf_nat` is part of the netfilter framework.
-- **VNET Support**: FreeBSD's `ipfw` is VNET-aware by design, with separate state per virtual network. Linux achieves isolation through network namespaces, which are a more general mechanism.
+`ipfw`'s first-match semantics contrast with `netfilter`'s chain-based evaluation, where packets traverse multiple chains (INPUT, FORWARD, OUTPUT, PREROUTING, POSTROUTING) and each chain uses last-match semantics. `ipfw`'s approach is simpler but less flexible for complex policies.
 
-### FreeBSD ipfw vs OpenBSD pf
+In terms of traffic shaping, `dummynet`'s FQ-CoDel implementation is comparable to Linux's `fq_codel` qdisc. Both use flow classification based on hash values and maintain per-flow queues with CoDel AQM. However, `dummynet` integrates shaping directly with filtering, while Linux requires `tc` filters to match packets and direct them to the appropriate qdisc.
 
-`pf` and `ipfw` are both native FreeBSD firewalls with different design philosophies:
+### FreeBSD ipfw vs. OpenBSD pf
 
-- **Rule Language**: `pf` uses a declarative language with tables and anchors, while `ipfw` uses a command-line interface with a structured rule format. `pf`'s language is more expressive for complex policies.
-- **Last-Match vs First-Match**: `pf` uses last-match, allowing rules to be written in natural order. `ipfw` uses first-match, requiring careful ordering.
-- **Stateful Filtering**: Both support stateful filtering, but `pf`'s `state` keyword is more integrated with the rule language. `ipfw`'s `keep-state` creates dynamic states that are matched against return traffic.
-- **Traffic Shaping**: `ipfw` has `dummynet` built in, while `pf` relies on `altq` (alternate queuing) which is less feature-rich. `dummynet` supports more scheduler types and AQM algorithms.
-- **Performance**: `pf` is generally faster for simple filtering due to its optimized bytecode interpreter. `ipfw` can be faster for complex policies with many rules due to its radix-based lookup.
+OpenBSD's `pf` uses last-match semantics and a declarative rule language, which simplifies rule design and reduces the risk of misconfiguration. `pf`'s rule evaluation builds a decision tree, which can be more efficient than `ipfw`'s linear scan for large rule sets.
 
-### macOS/XNU and NetBSD
+`pf`'s NAT is configured with separate `nat` and `rdr` rules, while `ipfw` integrates NAT into the rule chain. `pf` requires explicit `match state` rules for stateful filtering, while `ipfw`'s `keep-state` option automatically creates states.
 
-macOS (XNU kernel) includes a variant of `ipfw` for compatibility, but has shifted toward `pf` for new deployments. NetBSD uses `ipfw` as its primary firewall, with similar architecture to FreeBSD but with some differences in the rule evaluation and state tracking implementations.
+Both `ipfw` and `pf` attach to the `pfil` framework, but they use different hook orderings. When both are loaded, `pf` typically runs before `ipfw`, allowing `pf` to perform initial filtering and `ipfw` to handle shaping and additional policies.
+
+### FreeBSD dummynet vs. Linux fq_codel
+
+`dummynet`'s FQ-CoDel scheduler (`dn_sched_fq_codel.c`) is functionally equivalent to Linux's `fq_codel` qdisc. Both use flow classification based on hash values, maintain per-flow queues, and apply CoDel AQM to each flow. The main difference is integration: `dummynet` is driven by `ipfw` rules, while Linux requires `tc` filters to direct packets to the qdisc.
+
+`dummynet` also supports WF2Q+ and FQ-PIE, which have no direct Linux equivalents in the mainline kernel. WF2Q+ provides weighted fair queuing with O(1) complexity, while FQ-PIE uses Proportional Integral Controller-Enhanced Queue Management for adaptive drop rates.
 
 ## See Also
-- [Network Stack — Architecture and Packet Flow](../../../sys/net/README.md)
-- [pf — OpenBSD-derived Packet Filter](../../../../sys/netpfil/pf/README.md)
-- [VNET — Virtual Network Stacks](../../../sys/net/README_vnet.md)
-
-
-
 - [Network Stack — Architecture and Packet Flow](../../net/README.md)
-- [VNET — Virtual Network Stacks](../../net/README_vnet.md)
 - [pf — OpenBSD-derived Packet Filter](../pf/README.md)
-- [sys/netpfil/ipfw/](../../sys/netpfil/ipfw/) — Source directory
-- [netinet/libalias/](../../sys/netinet/libalias/) — libalias NAT library
-- [man 4 dummynet](https://man.freebsd.org/cgi/man.cgi?query=dummynet) — Dummynet manual page
-- [man 8 ipfw](https://man.freebsd.org/cgi/man.cgi?query=ipfw) — ipfw manual page
+- [VNET — Virtual Network Stacks](../../net/README_vnet.md)
+
+
+
+- [sys/netpfil/ipfw/](../../../sys/netpfil/ipfw/) — Source directory for `ipfw` and `dummynet`.
+- [sys/netinet/ip_fw.h](../../../sys/netinet/ip_fw.h) — Header file with `ipfw` data structures and constants.
+- [sys/netinet/ip_dummynet.h](../../../sys/netinet/ip_dummynet.h) — Header file with `dummynet` data structures.
+- [books/handbook/firewalls/](https://www.freebsd.org/doc/en/books/handbook/firewalls/) — FreeBSD Handbook chapter on firewalls, including `ipfw` configuration examples.
 
 ---
 
-> _Generated by [DaemonDocs](https://github.com/ocochard/DaemonDocs) on 2026-04-30 13:18 UTC using model `Qwen3.6-35B-A3B-UD-Q4_K_XL` (llama.cpp build `b8985-27aef3dd9`). AI-generated content — verify against source before relying on it._
+> _Generated by [DaemonDocs](https://github.com/ocochard/DaemonDocs) on 2026-04-30 19:58 UTC using model `Qwen3.6-35B-A3B-UD-Q4_K_XL` (llama.cpp build `b8985-27aef3dd9`). AI-generated content — verify against source before relying on it._

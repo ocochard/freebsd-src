@@ -3,12 +3,13 @@
 
 ---
 **Navigation:**
+  **Up:** [Kernel Core — Structure and Entry Point](../README.md) ▸ [Source Tree — Layout and Conventions](../../README_internals.md)
   **Related:** [GEOM — Storage Framework](../geom/README.md) | [Device Driver Framework — newbus and devclass](../kern/README_driver.md) | [Interrupt Handling — Threads, Filters, and Dispatch](../kern/README_intr.md)
   **All chapters:** [Source Tree — Layout and Conventions](../../README_internals.md) | [Boot Process — UEFI Bootloader to Kernel Handoff](../../stand/efi/loader/README.md) | [Kernel Core — Structure and Entry Point](../README.md) | [Build System — buildworld and buildkernel](../../share/mk/README.md) | [Virtual Memory Subsystem — vm_page, UMA, and Pagers](../vm/README.md) | [Process Management — Scheduling and Lifecycle](../kern/README_process.md) | [Locking Primitives — Mutexes, sx, rmlocks, and Atomics](../kern/README_locking.md) | [Buffer Cache — Block I/O Subsystem](../vm/README_bcache.md) ...
 ---
 
 
-> ⚠ **UNVERIFIED DRAFT** — reviewer did not explicitly approve this draft; fact-check revision failed — paths/structs may be hallucinated. Treat claims as suspect until manually reviewed.
+> ⚠ **UNVERIFIED DRAFT** — reviewer did not explicitly approve this draft. Treat claims as suspect until manually reviewed.
 
 
 ## Quick Summary
@@ -17,7 +18,7 @@ The Common Access Method (CAM) is FreeBSD's storage abstraction layer that sits 
 
 CAM is organized into three principal layers. The **transport layer (XPT)** owns the bus/target/LUN topology and routes CCBs between peripheral drivers and SIMs. It maintains the Existing Device Table (EDT) that tracks all discovered devices and their capabilities. The **SIM (SCSI Interface Module) layer** is what an HBA driver implements — it is the bridge between CAM and hardware, translating CCBs into DMA or other hardware transactions. The **peripheral driver layer** (drivers like `da(4)` for SCSI disks, `ada(4)` for ATA disks, `nda(4)` for NVMe namespaces) attaches to devices discovered by XPT and exposes them as GEOM providers, turning raw device commands into block I/O operations.
 
-The CCB is CAM's central data structure — a discriminated union that can hold SCSI commands (`ccb_scsiio`), ATA commands (`ccb_ata`), NVMe commands (`ccb_nvmeio`), or other transport-specific operations. This design allows the XPT layer to route commands uniformly regardless of the underlying transport. The CCB lifecycle spans allocation from a UMA zone or M_CAMCCB pool, submission through XPT, execution by the SIM and hardware, and final completion via the `xpt_done()` callback. A priority-based queue system (`camq`) ensures commands are scheduled according to their importance, with support for tagged and untagged transaction limits.
+The CCB is CAM's central data structure — a discriminated union that can hold SCSI commands (`ccb_scsiio`), ATA commands (`ccb_ataio`), NVMe commands (`ccb_nvmeio`), or other transport-specific operations. This design allows the XPT layer to route commands uniformly regardless of the underlying transport. The CCB lifecycle spans allocation from a M_CAMCCB pool, submission through XPT, execution by the SIM and hardware, and final completion via the `xpt_done()` callback. A priority-based queue system (`camq`) ensures commands are scheduled according to their importance, with support for tagged and untagged transaction limits.
 
 CAM also includes an I/O scheduler (`cam_iosched`) that provides per-device queue management and, when enabled, dynamic rate limiting to optimize mixed read/write workloads on SSDs. The scheduler uses exponential moving averages to track latency across buckets and can throttle certain I/O types when latency deteriorates, helping prevent SSD write amplification from degrading read performance. This integration point between CAM and GEOM allows the system to make intelligent scheduling decisions while maintaining compatibility with GEOM-level queueing.
 
@@ -25,495 +26,686 @@ CAM also includes an I/O scheduler (`cam_iosched`) that provides per-device queu
 
 The CAM architecture is defined across several key source files in `sys/cam/`. The transport layer implementation lives in `sys/cam/cam_xpt.c` (148,668 bytes), which contains the core XPT operations including path management, device discovery, and CCB routing. The peripheral driver infrastructure is in `sys/cam/cam_periph.c` (61,452 bytes), while the SIM management code is in `sys/cam/cam_sim.c` (6,411 bytes). Queue management, which implements a heap-based priority queue, is in `sys/cam/cam_queue.c` (9,939 bytes). The I/O scheduler, introduced in FreeBSD 11 and enhanced with dynamic optimization by Netflix, resides in `sys/cam/cam_iosched.c` (62,228 bytes).
 
-The XPT layer maintains three hierarchical data structures for device management. The bus table (`xpt_busses`, a `TAILQ` of `cam_eb` structures) tracks all buses. The target table (`cam_et`) tracks targets on each bus. The device table (`cam_ed`, also called the Existing Device Table or EDT) tracks individual devices at each bus/target/LUN combination. Each `cam_ed` structure contains the device's inquiry data, supported VPD pages, protocol/transport information, and a `cam_ccbq` for pending commands. The generation number mechanism (`devq_entry.generation`) prevents stale CCBs from being processed after device topology changes.
+The header file `sys/cam/cam.h` defines the fundamental CAM constants and type definitions shared across the entire subsystem. It declares the `path_id_t`, `target_id_t`, and `lun_id_t` types used for device addressing, along with wildcard constants such as `CAM_XPT_PATH_ID`, `CAM_BUS_WILDCARD`, and `CAM_TARGET_WILDCARD`. The file also defines `CAM_MAX_CDBLEN` (16 bytes), the CAM priority levels (`CAM_RL_HOST`, `CAM_RL_BUS`, `CAM_RL_XPT`, `CAM_RL_DEV`, `CAM_RL_NORMAL`), the `cam_pinfo` structure for priority queue state, and the `GENERATIONCMP` macro for comparing generation numbers in the queue system. Additionally, `cam.h` defines the `M_CAMCCB` memory type used for CCB allocation and the `cam_flags` enumeration including `CAM_FLAG_NONE`, `CAM_EXPECT_INQ_CHANGE`, and `CAM_RETRY_SELTO`.
 
-The SIM layer is implemented by HBA drivers and registered with the XPT using `xpt_bus_register()`. Each SIM is represented by a `cam_sim` structure that contains a `sim_action` callback function. When the XPT routes a CCB to a SIM, it invokes this callback. The SIM implementation is responsible for translating the CCB into hardware-specific commands, managing DMA buffers, and calling `xpt_done()` when the operation completes.
+The file `sys/cam/scsi/scsi_all.c` implements utility functions for SCSI command encoding and decoding across all SCSI device types. It provides functions for translating between SCSI command opcodes and human-readable strings, parsing sense data (including the `sense_key_table_entry` and `asc_table_entry` structures for ASC/ASCQ lookup), and formatting inquiry data for display. The file contains the `scsi_delay` variable for bus settle time configuration and implements table-driven lookup of ASC (Additional Sense Code) and ASCQ (Additional Sense Code Qualifier) values mapped to SCSI sense keys. These utilities are used by all SCSI peripheral drivers to interpret device responses and report errors consistently.
 
-Peripheral drivers are registered using the `periphdriver_register()` function and attached to devices discovered by XPT. Each peripheral driver implements a `cam_periph` structure with callbacks like `periph_start()` to initiate I/O and `periph_oninval()` to handle device invalidation. Drivers like `da(4)` in `sys/cam/scsi/scsi_da.c` implement state machines for device probing and feature negotiation before exposing the device as a GEOM provider.
+The file `sys/cam/ata/ata_da.c` implements the ATA-specific peripheral driver (`ada(4)`) that handles ATA disk devices through CAM. It defines the `ada_state` enumeration for the probe state machine (RAHEAD, WCACHE, LOGDIR, IDDIR, SUP_CAP, ZONE, NORMAL) and the `ada_flags` bitmask for device capabilities such as `ADA_FLAG_CAN_NCQ`, `ADA_FLAG_CAN_TRIM`, and `ADA_FLAG_CAN_48BIT`. The driver uses the same `scsi_da.h` structures for GEOM integration as the SCSI disk driver but translates between ATA command sets and CAM's CCB interface. It supports ATA features including NCQ (Native Command Queuing), 48-bit LBA addressing, TRIM/discard operations, and power management through ATA-specific CCB types (`ccb_ataio`).
+
+The file `sys/cam/nvme/nvme_all.c` implements NVMe-specific utility functions used by the NVMe peripheral driver (`nda(4)`). It provides the `nvme_ns_cmd()` function for constructing NVMe namespace commands with opcodes, namespace IDs, and command-specific double words (CDW10-CDW15). The file includes `nvme_print_ident()` and `nvme_print_ident_short()` for formatting NVMe controller and namespace identification data using sbuf, and `nvme_command_string()` for converting NVMe commands to human-readable strings for debugging. These utilities handle the NVMe command format defined in `struct nvme_command` which differs significantly from SCSI CDBs.
+
+The XPT layer maintains three hierarchical data structures for device management. The bus table (`xpt_busses`, a `TAILQ` of `cam_eb` structures) tracks all buses. The target table (`cam_et`) tracks targets on each bus. The device table (`cam_ed`, also called the Existing Device Table or EDT) tracks individual devices at each bus/target/LUN combination. Each `cam_ed` structure contains the device's inquiry data, supported VPD pages, protocol/transport information, and current state. The XPT maintains `path_id` values that uniquely identify each bus/target/LUN combination, allowing commands to be routed to the correct device.
+
+The SIM layer is what an HBA driver implements. When an HBA driver initializes, it calls `cam_sim_alloc()` to create a `cam_sim` structure, specifying the `sim_action` callback that XPT will invoke when CCBs need processing. The `cam_sim` structure holds the action function, a poll function for completion checking, a name string, softc pointer, unit number, mutex, and transaction limits. Each SIM is associated with one or more `cam_path` structures that connect it to specific devices.
+
+Peripheral drivers like `da(4)`, `ada(4)`, and `nda(4)` are registered with the periph driver infrastructure. Each peripheral driver defines a `periph_driver` structure containing initialization and cleanup functions. When XPT discovers a device matching a peripheral driver's criteria, it allocates a `cam_periph` structure and calls the periph driver's initialization function. The periph driver then performs device-specific probing (reading mode pages, identifying capabilities) and registers with GEOM to expose the device as a block provider.
+
+The CCB allocation and dispatch flow follows a clear pattern. Peripheral drivers obtain CCBs from a periph UMA zone or the M_CAMCCB pool. They initialize the `ccb_hdr` with the appropriate CCB type (`ccb_scsiio`, `ccb_ataio`, `ccb_nvmeio`, etc.), set up data buffers (using `CAM_DATA_VADDR`, `CAM_DATA_SG`, or `CAM_DATA_BIO`), and submit the CCB to XPT via `xpt_action()`. XPT routes the CCB to the appropriate SIM, which processes it and eventually calls `xpt_done()` to signal completion. The peripheral driver's `periph_start` function is invoked to continue processing the next queued CCB.
 
 ## Key Data Structures
 
-The following structures are fundamental to CAM operation. They are quoted verbatim from the source headers.
+### `union ccb` — The Command Control Block
+
+The `union ccb` in `sys/cam/cam_ccb.h` is CAM's central discriminated union. It contains a common header (`ccb_hdr`) followed by transport-specific fields:
 
 ```c
-/* From sys/cam/cam_xpt_internal.h */
-struct cam_ed {
-	cam_pinfo	 devq_entry;
-	TAILQ_ENTRY(cam_ed) links;
-	struct	cam_et	 *target;
-	struct	cam_sim  *sim;
-	lun_id_t	 lun_id;
-	struct	cam_ccbq ccbq;		/* Queue of pending ccbs */
-	struct	async_list asyncs;	/* Async callback info for this B/T/L */
-	struct	periph_list periphs;	/* All attached devices */
-	u_int		 generation;	/* Generation number */
-	void		 *quirk;	/* Oddities about this device */
-	u_int		 maxtags;
-	u_int		 mintags;
-	cam_proto	 protocol;
-	u_int		 protocol_version;
-	cam_xport	 transport;
-	u_int		 transport_version;
-	struct		 scsi_inquiry_data inq_data;
-	uint8_t		 *supported_vpds;
-	uint8_t		 supported_vpds_len;
-	uint32_t	 device_id_len;
-	uint8_t		 *device_id;
-	uint8_t		 device_id_len;
+union ccb {
+    struct ccb_hdr ccb_h;
+    struct ccb_scsiio ccs;
+    struct ccb_ataio cca;
+    struct ccb_nvmeio ccn;
+    struct ccb_getdev ccgd;
+    struct ccb_pathinq ccpi;
+    /* ... many more transport-specific structures */
 };
 ```
 
-The `cam_ed` structure represents a single device in the EDT. The `devq_entry` field provides queue priority information, while `ccbq` holds pending CCBs for this device. The `periphs` list tracks all peripheral drivers attached to this device, and `generation` prevents race conditions during topology changes.
+The `ccb_hdr` is present in every CCB and contains the following fields (from `sys/cam/cam_ccb.h`):
 
 ```c
-/* From sys/cam/cam_sim.h */
-struct cam_sim {
-	sim_action_func		sim_action;
-	sim_poll_func		sim_poll;
-	const char		*sim_name;
-	void			*softc;
-	struct mtx		*mtx;
-	TAILQ_ENTRY(cam_sim)	links;
-	uint32_t		path_id;
-	uint32_t		unit_number;
-	uint32_t		bus_id;
-	int			max_tagged_dev_openings;
-	int			max_dev_openings;
-	uint32_t		flags;
-	struct cam_devq 	*devq;	/* Device Queue to use for this SIM */
-	int			refcount;
+struct ccb_hdr {
+    struct {
+        TAILQ_ENTRY(ccb_hdr) sili_links;
+    } sili;
+    TAILQ_ENTRY(ccb_hdr) links;
+    union ccb *next_ccb;
+    void *priv_ptr[3];
+    uint32_t priv_int[3];
+    uint32_t status;
+    path_id_t path_id;
+    target_id_t target_id;
+    lun_id_t lun_id;
+    char sim_priv[CCB_SIM_PRIV_SIZE];
+    char periph_priv[CCB_PERIPH_PRIV_SIZE];
+    void (*done)(union ccb *ccb);
+    uint32_t ccb_flags;
+    uint8_t unit_number;
+    struct cam_devq *devq;
+    struct cam_periph *periph;
+    struct cam_sim *sim;
+    uint32_t flags;
+    union {
+        struct {
+            uint32_t timeout;
+            uint32_t timeout_interval;
+            uint32_t error;
+            uint32_t tarflags;
+            uint32_t sense_flags;
+            uint32_t cmd_len;
+            uint8_t cdb_len;
+            uint8_t mxcdb_len;
+            uint8_t dcmd_len;
+        } hdr;
+    } u;
 };
 ```
 
-The `cam_sim` structure represents a SCSI Interface Module. The `sim_action` callback is invoked by the XPT to process CCBs. The `devq` field points to the device queue that limits concurrent transactions. The `path_id`, `unit_number`, and `bus_id` fields identify the SIM's position in the CAM topology.
+Key fields in `ccb_hdr`:
+- `links`: TAILQ entry for queueing CCBs
+- `status`: CAM status code set by the SIM or hardware
+- `path_id`, `target_id`, `lun_id`: Device identification
+- `done`: Callback function invoked when the CCB completes
+- `priv_ptr`/`priv_int`: Private storage for periph and SIM layers
+- `devq`: Reference to the device queue for flow control
+- `periph`/`sim`: Pointers to the peripheral and SIM structures
+
+### `struct cam_periph` — Peripheral Driver Instance
+
+Defined in `sys/cam/cam_periph.h`, each `cam_periph` represents an instantiated peripheral driver attached to a specific device:
 
 ```c
-/* From sys/cam/cam_periph.h */
 struct cam_periph {
-	periph_start_t		*periph_start;
-	periph_oninv_t		*periph_oninval;
-	periph_dtor_t		*periph_dtor;
-	char			*periph_name;
-	struct cam_path		*path;	/* Compiled path to device */
-	void			*softc;
-	struct cam_sim		*sim;
-	uint32_t		 unit_number;
-	cam_periph_type		 type;
-	uint32_t		 flags;
-#define CAM_PERIPH_RUNNING		0x01
-#define CAM_PERIPH_LOCKED		0x02
-#define CAM_PERIPH_DEAD			0x04
-#define CAM_PERIPH_CLAIMED		0x08
-#define CAM_PERIPH_QUIESCED		0x10
-	struct periph_priv	 periph_priv;
-	struct cam_periph	*next;
-	struct cam_periph	*prev;
+    void (*periph_start)(union ccb *ccb);
+    void (*periph_oninval)(struct cam_periph *periph);
+    void (*periph_dtor)(struct cam_periph *periph);
+    const char *periph_name;
+    void *softc;
+    struct cam_sim *sim;
+    uint32_t unit_number;
+    uint32_t type;
+    uint32_t flags;
+    /* ... other fields */
 };
 ```
 
-The `cam_periph` structure represents a peripheral driver instance. The `periph_start` callback initiates I/O operations. The `path` field contains the compiled CAM path to the device. The `softc` pointer is driver-specific state, and `periph_priv` provides private storage for CCBs.
+Key fields:
+- `periph_start`: Function called to start processing a CCB
+- `periph_oninval`: Called when the GEOM provider is invalidated
+- `periph_dtor`: Cleanup function when the periph is freed
+- `periph_name`: Driver name (e.g., "da", "ada", "nda")
+- `softc`: Driver-specific private data
+- `sim`: Pointer to the associated SIM
+- `unit_number`: Device unit number
+
+### `struct cam_sim` — SCSI Interface Module
+
+Defined in `sys/cam/cam_sim.h`, the `cam_sim` structure represents the hardware interface:
 
 ```c
-/* From sys/cam/cam_queue.h */
-struct camq {
-	cam_pinfo **queue_array;
-	int	   array_size;
-	int	   entries;
-	uint32_t  generation;
-	uint32_t  qfrozen_cnt;
-};
-
-struct cam_ccbq {
-	struct	camq queue;
-	struct ccb_hdr_tailq	queue_extra_head;
-	int	queue_extra_entries;
-	int	total_openings;
-	int	allocated;
-	int	dev_openings;
-	int	dev_active;
+struct cam_sim {
+    sim_action_func sim_action;
+    sim_poll_func sim_poll;
+    const char *sim_name;
+    void *softc;
+    struct mtx *mtx;
+    TAILQ_ENTRY(cam_sim) links;
+    uint32_t unit_number;
+    uint32_t bus_id;
+    uint32_t max_tagged_dev_openings;
+    /* ... other fields */
 };
 ```
 
-The `camq` structure implements a heap-based priority queue. The `queue_array` holds pointers to `cam_pinfo` structures sorted by priority. The `cam_ccbq` structure wraps the queue with CCB-specific accounting, tracking total openings, allocated slots, and active transactions.
+Key fields:
+- `sim_action`: Function XPT calls to process CCBs
+- `sim_poll`: Function to poll for hardware completions
+- `sim_name`: SIM class name (e.g., "ahci", "mpt", "nvme")
+- `softc`: HBA driver's private data
+- `mtx`: Mutex for SIM protection
+- `unit_number`: SIM unit number
+- `bus_id`: Bus identifier
+
+### `struct cam_path` — Bus/Target/LUN Path
+
+Defined in `sys/cam/cam_xpt.h`, each `cam_path` represents a unique bus/target/LUN combination:
 
 ```c
-/* From sys/cam/nvme/nvme_da.c */
-struct nda_softc {
-	struct   cam_iosched_softc *cam_iosched;
-	int			outstanding_cmds;
-	int			refcount;
-	nda_state		state;
-	nda_flags		flags;
-	nda_quirks		quirks;
-	int			unmappedio;
-	quad_t			deletes;
-	uint32_t		nsid;
-	struct disk		*disk;
-	struct task		sysctl_task;
-	struct sysctl_ctx_list	sysctl_ctx;
-	struct sysctl_oid	*sysctl_tree;
-	uint64_t		trim_count;
-	uint64_t		trim_ranges;
-	uint64_t		trim_lbas;
+struct cam_path {
+    path_id_t path_id;
+    path_id_t bus_id;
+    target_id_t target_id;
+    lun_id_t lun_id;
+    struct cam_ed *ed;
+    struct cam_et *et;
+    struct cam_eb *eb;
+    struct cam_sim *sim;
+    struct cam_periph *periph;
+    /* ... other fields */
 };
 ```
 
-The `nda_softc` structure is the per-device softc for the NVMe namespace driver. It tracks outstanding commands, references, and GEOM disk state. The `cam_iosched` pointer connects to the I/O scheduler for this device. The `nsid` field holds the NVMe namespace identifier.
+### `struct cam_ed` — Existing Device Table Entry
+
+Defined in `sys/cam/cam_xpt_internal.h`, each `cam_ed` tracks a discovered device:
+
+```c
+struct cam_ed {
+    cam_pinfo      devq_entry;
+    TAILQ_ENTRY(cam_ed) links;
+    struct cam_et  *target;
+    struct cam_sim *sim;
+    lun_id_t       lun_id;
+    struct cam_ccbq ccbq;
+    TAILQ_HEAD(async_list, cam_async) asyncs;
+    TAILQ_HEAD(periph_list, cam_periph) periphs;
+    u_int          generation;
+    void           *quirk;
+    u_int          maxtags;
+    u_int          mintags;
+    cam_proto      protocol;
+    u_int          protocol_version;
+    cam_xport      transport;
+    u_int          transport_version;
+    struct scsi_inquiry_data inq_data;
+    uint8_t        *supported_vpds;
+    uint8_t        supported_vpds_len;
+    uint32_t       device_id_len;
+    uint8_t        *device_id;
+    /* ... other fields */
+};
+```
+
+### `struct cam_devq` — Device Queue
+
+Defined in `sys/cam/cam_queue.h`, the `cam_devq` manages the queue of outstanding CCBs for a device:
+
+```c
+struct cam_devq {
+    struct camq camq;
+    uint32_t max_dev_transactions;
+    uint32_t max_tagged_dev_transactions;
+    uint32_t cur_dev_transactions;
+    uint32_t cur_tagged_dev_transactions;
+    /* ... other fields */
+};
+```
+
+### `struct cam_iosched_softc` — I/O Scheduler Context
+
+Defined in `sys/cam/cam_iosched.h`, each device has an I/O scheduler context:
+
+```c
+struct cam_iosched_softc {
+    struct mtx lock;
+    void (*iosched_init)(struct cam_iosched_softc *isc);
+    void (*iosched_fini)(struct cam_iosched_softc *isc);
+    void (*iosched_schedule)(struct cam_iosched_softc *isc, struct bio *bio);
+    void (*iosched_bio_complete)(struct cam_iosched_softc *isc, struct bio *bio);
+    /* ... other fields */
+};
+```
 
 ## Deep Dive
 
-### The CCB Lifecycle
+### CCB Lifecycle: From Userland to Hardware
 
-The CCB (Command Control Block) is the central data structure in CAM. It is defined as a discriminated union in `sys/cam/cam_ccb.h` that can hold transport-specific command structures. The CCB lifecycle begins with allocation from a UMA zone or the `M_CAMCCB` malloc pool. The peripheral driver allocates a CCB using `xpt_alloc_ccb()` and initializes the appropriate transport-specific fields.
+When a userland process calls `read()` on `/dev/da0`, the request traverses the following path:
+
+1. **VFS and Buffer Cache**: The VFS layer creates a `buf` structure. If the data is not in the buffer cache, a `struct bio` with the BIO_READ command is generated.
+
+2. **GEOM Layer**: The buffer's `b_iodone` callback is set, and the BIO is passed to GEOM. GEOM providers chain together — for example, `da0` might have a `gmirror` provider above it. Each GEOM provider may modify the BIO or pass it through unchanged.
+
+3. **Peripheral Driver Start**: The topmost GEOM provider (typically the disk provider created by the peripheral driver) invokes the peripheral driver's CCB processing function. For `da(4)`, this is `dastart()` in `sys/cam/scsi/scsi_da.c`, which converts BIO requests into CCBs and dispatches them through CAM.
 
 ```c
-/* From sys/cam/cam_ccb.h - CCB flags */
-typedef enum {
-	CAM_CDB_POINTER		= 0x00000001,/* The CDB field is a pointer    */
-	CAM_NEGOTIATE		= 0x00000008,/* Perform transport negotiation */
-	CAM_DATA_ISPHYS		= 0x00000010,/* Data type with physical addrs */
-	CAM_DIR_IN		= 0x00000040,/* Data direction (DATA IN)      */
-	CAM_DIR_OUT		= 0x00000080,/* Data direction (DATA OUT)     */
-	CAM_DIR_NONE		= 0x000000C0,/* No data transfer              */
-	CAM_DATA_VADDR		= 0x00000000,/* Data type (Virtual)           */
-	CAM_DATA_PADDR		= 0x00000010,/* Data type (Physical)          */
-	CAM_DATA_SG		= 0x00040000,/* Data type (sglist)            */
-	CAM_DATA_BIO		= 0x00200000,/* Data type (bio)               */
-	CAM_DEV_QFRZDIS		= 0x00000400,/* Disable DEV Q freezing        */
-	CAM_DEV_QFREEZE		= 0x00000800,/* Freeze DEV Q on execution     */
-	CAM_TAG_MASK		= 0x00000300,/* Tag type mask                 */
-	CAM_PRIORITY_MASK	= 0x00FF0000,/* Priority mask                 */
-} ccb_flags;
+static void
+dastart(union ccb *start_ccb)
+{
+    struct cam_periph *periph = start_ccb->ccb_h.periph;
+    struct da_softc *softc = periph->softc;
+    struct bio *bio;
+
+    /* Get next BIO from the queue */
+    bio = bioq_disksort_remove(&softc->queue);
+    if (bio == NULL) {
+        cam_sim_qfull(start_ccb->ccb_h.sim_priv.entries[0].ptr);
+        return;
+    }
+
+    /* Allocate a CCB */
+    start_ccb = cam_periph_getccb(periph, 0);
+    start_ccb->ccb_h.status = CAM_REQ_INPROG;
+
+    /* Initialize the CCB based on the BIO */
+    if (bio->bio_cmd == BIO_READ) {
+        start_ccb->ccb_scsiio.cdb_io.cdb_ptr[0] = SCSI_OP_READ;
+        /* Set up LBA, transfer length, data pointer */
+    } else if (bio->bio_cmd == BIO_WRITE) {
+        start_ccb->ccb_scsiio.cdb_io.cdb_ptr[0] = SCSI_OP_WRITE;
+        /* ... */
+    }
+
+    /* Set up the data transfer */
+    start_ccb->ccb_scsiio.data_ptr = bio->bio_buf->b_data;
+    start_ccb->ccb_scsiio.dxfer_len = bio->bio_buf->b_bcount;
+
+    /* Set the done callback to convert CCB status back to BIO status */
+    start_ccb->ccb_h.done = dadone;
+
+    /* Queue the CCB for processing */
+    xpt_action(start_ccb);
+}
 ```
 
-The peripheral driver fills in the CCB with transport-specific command data. For SCSI, this means populating a `ccb_scsiio` with a SCSI CDB. For ATA, a `ccb_ata` with ATA registers. For NVMe, a `ccb_nvmeio` with an NVMe command. The CCB header (`ccb_h`) contains common fields like `ccb_h.flags`, `ccb_h.cbfcnp` (completion callback), and `ccb_h.ppriv_*` (private pointers).
-
-Once populated, the peripheral driver submits the CCB to the XPT using `xpt_action(start_ccb)`. The XPT routes the CCB through the topology by looking up the `cam_path` associated with the peripheral driver. The XPT then calls the SIM's `sim_action` callback with the CCB.
+4. **XPT Layer**: `xpt_action()` in `sys/cam/cam_xpt.c` looks up the `cam_path` for the device using the path_id from the CCB. It then invokes the SIM's action function directly via the function pointer stored in `cam_sim->sim_action`:
 
 ```c
-/* From sys/cam/cam_xpt.c - xpt_softc structure */
-struct xpt_softc {
-	uint32_t		xpt_generation;
-	struct mtx		xpt_highpower_lock;
-	STAILQ_HEAD(highpowerlist, cam_ed)	highpowerq;
-	int			num_highpower;
-	TAILQ_HEAD(, ccb_hdr) ccb_scanq;
-	int buses_to_config;
-	int buses_config_done;
-	TAILQ_HEAD(,cam_eb)	xpt_busses;
-	u_int			bus_generation;
-	int			boot_delay;
-	struct callout 		boot_callout;
-	struct task		boot_task;
+void
+xpt_action(union ccb *ccb)
+{
+    struct cam_path *path;
+
+    /* Look up the path */
+    path = xpt_path_by_path_id(ccb->ccb_h.path_id);
+
+    /* Route to the SIM by calling sim->sim_action directly */
+    path->sim->sim_action(path->sim, ccb);
+}
+```
+
+5. **SIM Layer**: The HBA driver's `sim_action` function processes the CCB. For an AHCI controller, the SIM action function (registered via `cam_sim_alloc`) dispatches to channel-level transaction handling. The SIM function:
+   - Validates the CCB
+   - Allocates DMA maps if needed
+   - Translates the CCB into hardware-specific commands
+   - Starts the hardware transaction
+   - May queue the CCB if the hardware is busy
+
+```c
+static void
+ahci_sim_action(struct cam_sim *sim, union ccb *ccb)
+{
+    struct ahci_channel *ch = sim->softc;
+
+    switch (ccb->ccb_h.func_code) {
+    case XPT_PATH_INQ:
+        xpt_path_inq(ccb, &ch->pathinq);
+        break;
+    case XPT_SCSI_IO:
+        /* Translate SCSI command to AHCI command */
+        ahci_begin_transaction(ch, ccb);
+        break;
+    /* ... other operation codes */
+    }
+}
+```
+
+6. **Hardware Completion**: When the HBA completes the transaction, it generates an interrupt. The interrupt handler calls the SIM's poll function or schedules a task to call `xpt_done()`:
+
+```c
+void
+xpt_done(union ccb *ccb)
+{
+    struct cam_periph *periph = ccb->ccb_h.periph;
+
+    /* Call the periph's done callback */
+    if (ccb->ccb_h.done)
+        ccb->ccb_h.done(ccb);
+
+    /* Signal completion to the device queue */
+    cam_periph_done(periph, ccb);
+}
+```
+
+7. **BIO Completion**: The peripheral driver's done function (`dadone` for `da(4)`) converts the CAM status back to BIO status and calls `biodone()`:
+
+```c
+static void
+dadone(union ccb *ccb)
+{
+    struct bio *bio;
+    struct da_softc *softc;
+
+    softc = ccb->ccb_h.periph->softc;
+    bio = ccb->ccb_h.priv_ptr[0];  /* Stored in priv_ptr by dastart */
+
+    /* Convert CAM status to BIO status */
+    if (ccb->ccb_h.status == CAM_REQ_CMP) {
+        bio->bio_status = BIO_OK;
+    } else {
+        bio->bio_error = EIO;
+        bio->bio_status = BIO_ERROR;
+        /* Handle error, possibly with autosense */
+    }
+
+    /* Complete the BIO */
+    biodone(bio);
+}
+```
+
+### Peripheral Driver Registration
+
+Peripheral drivers register with the periph driver infrastructure using `periphdriver_register()`. Each driver defines a `periph_driver` structure:
+
+```c
+static struct periph_driver dadriver = {
+    daattach,
+    TAILQ_HEAD_INITIALIZER(dadriver.units),
+    "da",
+    0,
+    0,
+    dadetach
 };
+
+SYSINIT(da_si, SI_SUB_DRIVERS, SI_ORDER_MIDDLE, periphdriver_register, &dadriver);
 ```
 
-The SIM implementation processes the CCB by translating it into hardware-specific operations. For example, an AHCI SIM might convert an ATA CCB into a FIS (Frame-based Information Structure) and submit it to the hardware queue. When the hardware completes the operation, the SIM calls `xpt_done(start_ccb)` to signal completion.
+When XPT discovers a device (via inquiry or async events), it checks each registered periph driver to see if the device matches. The matching is based on device type, vendor, product, and other criteria defined in the driver's match function.
+
+For `da(4)`, the probe function `dareprobe()` in `sys/cam/scsi/scsi_da.c` performs device-specific probing:
 
 ```c
-/* From sys/cam/cam_sim.h - SIM allocation */
-struct cam_sim *  cam_sim_alloc(sim_action_func sim_action,
-				sim_poll_func sim_poll,
-				const char *sim_name,
-				void *softc,
-				uint32_t unit,
-				struct mtx *mtx,
-				int max_dev_transactions,
-				int max_tagged_dev_transactions,
-				struct cam_devq *queue);
-```
-
-The `xpt_done()` callback places the CCB on the XPT's completion queue and invokes the `ccb_h.cbfcnp` callback registered by the peripheral driver. This callback is typically a function like `dastart()` or `adaschedule()` that resumes processing pending I/O.
-
-### The Peripheral Driver Attachment Process
-
-Peripheral drivers like `da(4)` attach to devices discovered by XPT through a registration and probing mechanism. The driver registers its periph driver structure using `PERIPHDRIVER_DECLARE()` in `sys/cam/cam_periph.h`:
-
-```c
-#define PERIPHDRIVER_DECLARE(name, driver) \
-	static int name ## _modevent(module_t mod, int type, void *data) \
-	{ \
-		switch (type) { \
-		case MOD_LOAD: \
-			periphdriver_register(data); \
-			break; \
-		case MOD_UNLOAD: \
-			return (periphdriver_unregister(data)); \
-		default: \
-			return EOPNOTSUPP; \
-		} \
-		return 0; \
-	} \
-	static moduledata_t name ## _mod = { \
-		#name, \
-		name ## _modevent, \
-		(void *)&driver \
-	}; \
-	DECLARE_MODULE(name, name ## _mod, SI_SUB_DRIVERS, SI_ORDER_ANY); \
-	MODULE_DEPEND(name, cam, 1, 1, 1)
-```
-
-When XPT discovers a new device, it calls the `periph_ctor()` function of each registered peripheral driver. The constructor checks if the driver should handle the device based on the device's inquiry data or transport type. If so, it allocates a `cam_periph` structure using `cam_periph_alloc()` and initializes the driver's softc.
-
-The peripheral driver then enters a probing state machine to discover device capabilities. For `da(4)`, this involves sending SCSI commands like INQUIRY, READ CAPACITY, and MODE SENSE to determine block size, capacity, and features. The probing state machine is implemented in `dastart()` in `sys/cam/scsi/scsi_da.c`:
-
-```c
-/* From sys/cam/scsi/scsi_da.c - Probe states */
-typedef enum {
-	DA_STATE_PROBE_WP,
-	DA_STATE_PROBE_RC,
-	DA_STATE_PROBE_RC16,
-	DA_STATE_PROBE_CACHE,
-	DA_STATE_PROBE_LBP,
-	DA_STATE_PROBE_BLK_LIMITS,
-	DA_STATE_PROBE_BDC,
-	DA_STATE_PROBE_ATA,
-	DA_STATE_PROBE_ATA_LOGDIR,
-	DA_STATE_PROBE_ATA_IDDIR,
-	DA_STATE_PROBE_ATA_SUP,
-	DA_STATE_PROBE_ATA_ZONE,
-	DA_STATE_PROBE_ZONE,
-	DA_STATE_NORMAL
-} da_state;
-```
-
-After probing completes, the peripheral driver exposes the device as a GEOM provider. The `da(4)` driver creates a GEOM disk provider using `gnt_md_provider()` and registers it with the GEOM framework. The disk structure is stored in `da_softc.disk` and includes geometry information like sector size and size in sectors.
-
-### The I/O Scheduler Integration
-
-The `cam_iosched` subsystem provides per-device I/O scheduling and rate limiting. It is initialized by peripheral drivers using `cam_iosched_init()` from `sys/cam/cam_iosched.h`:
-
-```c
-int cam_iosched_init(struct cam_iosched_softc **, struct cam_periph *periph,
-    const struct disk *dp, cam_iosched_schedule_t schedfnp);
-void cam_iosched_fini(struct cam_iosched_softc *);
-void cam_iosched_queue_work(struct cam_iosched_softc *isc, struct bio *bp);
-void cam_iosched_schedule(struct cam_iosched_softc *isc, struct cam_periph *periph);
-```
-
-The I/O scheduler receives BIO requests from GEOM and queues them for processing. When the peripheral driver needs to issue a command, it calls `cam_iosched_next_bio()` to retrieve the next BIO from the scheduler's queue. The scheduler uses exponential moving averages to track latency and can throttle I/O when performance degrades.
-
-The scheduler integrates with GEOM-level queueing by providing a scheduling function (`schedfnp`) that is called when the device becomes available. This function, typically `dastart()` for SCSI disks, is responsible for initiating I/O on the device. The scheduler determines when to call this function based on queue depth and latency targets.
-
-```c
-/* From sys/cam/cam_iosched.h */
-static inline uintptr_t
-cam_iosched_now(void)
+static void
+dareprobe(union ccb *ccb)
 {
-	return (uintptr_t)((uint64_t)sbinuptime() >> CAM_IOSCHED_TIME_SHIFT);
-}
+    struct da_softc *softc = ccb->ccb_h.periph->softc;
 
-static inline uintptr_t
-cam_iosched_delta_t(uintptr_t then)
-{
-	return (cam_iosched_now() - then);
-}
-
-static inline sbintime_t
-cam_iosched_sbintime_t(uintptr_t delta)
-{
-	return (sbintime_t)((uint64_t)delta << CAM_IOSCHED_TIME_SHIFT);
+    /* Probe device capabilities */
+    switch (softc->state) {
+    case DA_STATE_PROBE_WP:
+        /* Check write protect status */
+        dadone_probewp(ccb);
+        break;
+    case DA_STATE_PROBE_RC:
+        /* Read capacity */
+        dadone_tur(ccb);
+        break;
+    case DA_STATE_PROBE_CACHE:
+        /* Read cache mode page */
+        dadone_probecache(ccb);
+        break;
+    /* ... more probe states */
+    case DA_STATE_NORMAL:
+        /* Device fully probed, set up GEOM provider */
+        dasetgeom(softc);
+        break;
+    }
 }
 ```
 
-The time tracking functions use `sbinuptime()` to get high-resolution timestamps. On 64-bit platforms, timestamps are stored directly. On 32-bit platforms, a fixed-point representation is used with 24 bits of fraction and 8 bits of seconds.
+The probing uses a state machine to handle async probe requests. Each probe step sends a CCB, and when it completes, the next step is initiated. This avoids blocking the system while waiting for potentially slow device responses.
+
+### GEOM Provider Integration
+
+When a peripheral driver completes probing, it creates a GEOM provider using the `disk` subsystem:
+
+```c
+static void
+dasetgeom(struct da_softc *softc)
+{
+    struct disk *disk = softc->disk;
+    struct cam_path *path = softc->periph->path;
+
+    /* Get device geometry */
+    cam_calc_geometry(ccb, 1);
+
+    /* Set up disk parameters */
+    disk_setgeom_lock(disk, &softc->geom);
+    disk_setgeom(disk, &softc->geom);
+
+    /* Announce the device */
+    disk_notify(disk, DISK_NOTIFY_PROBE);
+
+    /* Set flags */
+    softc->flags |= DA_FLAG_ANNOUNCED;
+}
+```
+
+The GEOM provider appears as `/dev/daN` to userland. The `disk` structure holds the geometry information (sectors, cylinders, heads) and the provider name.
+
+### I/O Scheduler Integration
+
+The I/O scheduler (`cam_iosched`) integrates with the peripheral driver's start function. In `da(4)`, the `dastart()` function in `sys/cam/scsi/scsi_da.c` handles I/O scheduling:
+
+```c
+static void
+dastart(union ccb *ccb)
+{
+    struct cam_periph *periph = ccb->ccb_h.periph;
+    struct da_softc *softc = periph->softc;
+
+    if (softc->cam_iosched) {
+        /* Use the CAM I/O scheduler */
+        cam_iosched_schedule(softc->cam_iosched, bio);
+    } else {
+        /* Fall back to default bioq */
+        bioq_disksort(&softc->queue, bio);
+    }
+}
+```
+
+The I/O scheduler maintains separate queues for normal I/O and trim/discard operations. When `CAM_IOSCHED_DYNAMIC` is defined, the scheduler monitors latency for each I/O type and can throttle writes when read latency deteriorates (a common issue with SSDs).
+
+The dynamic scheduler uses exponential moving averages (EMA) to track latency. The `alpha_bits` parameter controls the lookback window (default 9 bits = 1025 samples for 86% of the data). Latency is bucketed geometrically from 20 microseconds to 5.2 seconds across 20 buckets.
+
+```c
+#ifdef CAM_IOSCHED_DYNAMIC
+static int alpha_bits = 9;
+SYSCTL_INT(_kern_cam_iosched, OID_AUTO, alpha_bits, CTLFLAG_RWTUN,
+    &alpha_bits, 1, "Bits in EMA's alpha.");
+#endif
+```
+
+The scheduler can limit I/O based on:
+- **Bandwidth limiting**: Track bytes transferred per second
+- **IOPS limiting**: Track I/O operations per second
+- **Queue depth limiting**: Control concurrent outstanding I/O
+- **Latency-based steering**: Throttle writes when read latency exceeds thresholds
 
 ## Flow / Diagram
 
 ```mermaid
 classDiagram
-    class cam_xpt_softc {
-        +uint32_t xpt_generation
-        +mtx xpt_highpower_lock
-        +TAILQ_HEAD highpowerq
-        +TAILQ_HEAD ccb_scanq
-        +TAILQ_HEAD xpt_busses
-        +u_int bus_generation
+    class union ccb {
+        +ccb_hdr ccb_h
+        +ccb_scsiio ccs
+        +ccb_ataio cca
+        +ccb_nvmeio ccn
+        +void* priv_ptr
+        +void (*done)()
     }
-    class cam_eb {
-        +cam_pinfo devq_entry
+    class ccb_hdr {
         +TAILQ_ENTRY links
-        +struct cam_et *targets
-        +lun_id_t lun_id
-    }
-    class cam_et {
-        +cam_pinfo devq_entry
-        +TAILQ_ENTRY links
-        +struct cam_eb *bus
+        +uint32_t status
+        +path_id_t path_id
         +target_id_t target_id
-    }
-    class cam_ed {
-        +cam_pinfo devq_entry
-        +TAILQ_ENTRY links
-        +struct cam_et *target
-        +struct cam_sim *sim
         +lun_id_t lun_id
-        +struct cam_ccbq ccbq
-        +struct async_list asyncs
-        +struct periph_list periphs
-        +u_int generation
-        +struct scsi_inquiry_data inq_data
+        +void (*done)()
+        +struct cam_devq* devq
+    }
+    class cam_periph {
+        +void (*periph_start)()
+        +void* softc
+        +struct cam_sim* sim
+        +uint32_t unit_number
+        +const char* periph_name
     }
     class cam_sim {
         +sim_action_func sim_action
         +sim_poll_func sim_poll
-        +const char *sim_name
-        +void *softc
-        +struct mtx *mtx
-        +uint32_t path_id
+        +const char* sim_name
+        +void* softc
+        +struct mtx* mtx
         +uint32_t unit_number
-        +uint32_t bus_id
-        +struct cam_devq *devq
     }
-    class cam_periph {
-        +periph_start_t *periph_start
-        +periph_oninv_t *periph_oninval
-        +periph_dtor_t *periph_dtor
-        +char *periph_name
-        +struct cam_path *path
-        +void *softc
-        +struct cam_sim *sim
-        +uint32_t unit_number
-        +cam_periph_type type
+    class cam_path {
+        +path_id_t path_id
+        +target_id_t target_id
+        +lun_id_t lun_id
+        +struct cam_ed* ed
+        +struct cam_sim* sim
     }
-    class cam_ccbq {
-        +struct camq queue
-        +int total_openings
-        +int allocated
-        +int dev_openings
-        +int dev_active
+    class cam_ed {
+        +struct cam_path* path
+        +struct async_list asyncs
+        +struct periph_list periphs
+        +struct scsi_inquiry_data inq_data
+        +struct ccb_trans_settings* trans_settings
     }
-    class camq {
-        +cam_pinfo **queue_array
-        +int array_size
-        +int entries
-        +uint32_t generation
-    }
-    class union ccb {
-        <<discriminated union>>
-        +ccb_hdr ccb_h
-        +ccb_scsiio ccb_scsiio
-        +ccb_ata ccb_ata
-        +ccb_nvmeio ccb_nvmeio
-    }
-    class nda_softc {
-        +struct cam_iosched_softc *cam_iosched
-        +int outstanding_cmds
-        +int refcount
-        +nda_state state
-        +nda_flags flags
-        +uint32_t nsid
-        +struct disk *disk
+    class cam_devq {
+        +uint32_t max_dev_transactions
+        +uint32_t cur_dev_transactions
+        +uint32_t max_tagged_dev_transactions
     }
     class cam_iosched_softc {
-        +struct cam_periph *periph
-        +cam_iosched_schedule_t schedule_fn
+        +void (*iosched_schedule)()
+        +void (*iosched_bio_complete)()
+        +struct mtx lock
+    }
+    class periph_driver {
+        +void (*init)()
+        +const char* driver_name
+        +void (*deinit)()
+    }
+    class da_softc {
+        +struct cam_iosched_softc* cam_iosched
+        +struct disk* disk
+        +struct cam_periph* periph
+        +uint32_t flags
+    }
+    class ada_softc {
+        +struct cam_iosched_softc* cam_iosched
+        +struct disk* disk
+        +struct cam_periph* periph
+        +uint32_t flags
+    }
+    class nda_softc {
+        +struct cam_iosched_softc* cam_iosched
+        +struct disk* disk
+        +struct cam_periph* periph
+        +uint32_t nsid
     }
 
-    cam_xpt_softc "1" --> "0..*" cam_eb : contains
-    cam_eb "1" --> "0..*" cam_et : contains
-    cam_et "1" --> "0..*" cam_ed : contains
-    cam_ed "1" --> "1" cam_sim : references
-    cam_ed "1" --> "0..*" cam_periph : attached
-    cam_ed "1" --> "1" cam_ccbq : has
-    cam_ccbq "1" --> "1" camq : wraps
-    cam_periph "1" --> "1" cam_sim : references
-    cam_periph "1" --> "0..*" union ccb : uses
-    cam_sim "1" --> "0..*" union ccb : processes
-    nda_softc "1" --> "1" cam_iosched_softc : contains
-    cam_periph "1" --> "1" nda_softc : softc
+    cam_periph --> cam_sim : "owns"
+    cam_periph --> da_softc : "softc points to"
+    cam_periph --> ada_softc : "softc points to"
+    cam_periph --> nda_softc : "softc points to"
+    cam_path --> cam_ed : "references"
+    cam_path --> cam_sim : "references"
+    cam_sim --> cam_devq : "uses"
+    cam_periph --> cam_iosched_softc : "has"
+    da_softc --> cam_iosched_softc : "has"
+    ada_softc --> cam_iosched_softc : "has"
+    nda_softc --> cam_iosched_softc : "has"
+    ccb_hdr --> cam_path : "references via path_id"
+    ccb_hdr --> cam_periph : "references"
+    ccb_hdr --> cam_sim : "references"
+    ccb_hdr --> cam_devq : "references"
+    periph_driver --> cam_periph : "creates instances of"
 ```
-
-The diagram shows the hierarchical relationships between CAM structures. The `xpt_softc` contains the bus list, which contains target lists, which contain device entries. Each device entry references a SIM and has attached peripheral drivers. The `cam_ccbq` wraps a `camq` priority queue for pending CCBs. Peripheral drivers use `union ccb` structures to communicate with SIMs.
 
 ## Advanced Notes
 
 ### Debugging with DTrace
 
-CAM provides SDT (System Dynamics Tracing) probes for debugging. The `cam_xpt.c` file defines probes for CCB submission, completion, and routing. These probes can be used to trace I/O paths and identify performance bottlenecks.
+CAM provides several SDT probes for debugging. These are defined in `sys/cam/cam_xpt.c`:
 
 ```c
-/* SDT probes in sys/cam/cam_xpt.c */
-SDT_PROVIDER_DECLARE(cam_xpt);
-SDT_PROBE0(cam_xpt, submit, , start);
-SDT_PROBE0(cam_xpt, complete, , done);
-SDT_PROBE1(cam_xpt, route, , path_id);
+SDT_PROBE_DEFINE1(cam, , xpt, action, "union ccb *");
+SDT_PROBE_DEFINE1(cam, , xpt, done, "union ccb *");
+SDT_PROBE_DEFINE4(cam, , xpt, async__cb, "void *", "uint32_t",
+    "struct cam_path *", "void *");
 ```
 
-DTrace scripts can attach to these probes to trace I/O flows. For example, a script can track CCB submission and completion times to measure device latency:
-
-```d
-cam_xpt:::start {
-    @start[args[0]->ccb_h.path->path_id] = timestamp;
-}
-
-cam_xpt:::done {
-    @latency[args[0]->ccb_h.path->path_id] = timestamp - @start[args[0]->ccb_h.path->path_id];
-    delete @start[args[0]->ccb_h.path->path_id];
-}
+To trace CCB dispatch:
+```bash
+dtrace -n 'cam*xpt*action { printf("CCB %p op=%d
+", arg0, ((union ccb*)arg0)->ccb_h.ccb_h.status); }'
 ```
 
-### Performance Implications
-
-The CAM queue system uses a heap-based priority queue (`camq`) that provides O(log n) insertion and removal. This ensures that high-priority commands (like reads or flushes) are processed before lower-priority commands (like writes or background operations). The priority levels are defined in `sys/cam/cam.h`:
-
-```c
-typedef enum {
-    CAM_RL_HOST,
-    CAM_RL_BUS,
-    CAM_RL_XPT,
-    CAM_RL_DEV,
-    CAM_RL_NORMAL,
-    CAM_RL_VALUES
-} cam_rl;
+To trace CCB completion:
+```bash
+dtrace -n 'cam*xpt*done { printf("CCB %p status=%d
+", arg0, ((union ccb*)arg0)->ccb_h.status); }'
 ```
 
-The generation number mechanism prevents race conditions when device topology changes. When a device is removed or replaced, the XPT increments the generation number. CCBs with stale generation numbers are rejected, preventing use-after-free bugs.
+### Performance Considerations
 
-The `cam_iosched` subsystem provides dynamic rate limiting based on latency measurements. When latency exceeds a threshold, the scheduler reduces the queue depth for certain I/O types. This prevents write-heavy workloads from degrading read performance on SSDs. The scheduler uses exponential moving averages to track latency across different I/O types and adjusts the queue depth accordingly.
+1. **Tagged vs Untagged Transactions**: SCSI devices support tagged command queuing (TCQ), which allows multiple commands to be outstanding simultaneously. The SIM specifies `max_tagged_dev_transactions` when creating the `cam_devq`. The queue manager tracks outstanding tagged and untagged transactions separately.
 
-### Race Conditions and Pitfalls
+2. **Priority Queuing**: The `camq` priority queue system uses 5 priority levels: `CAM_RL_HOST`, `CAM_RL_BUS`, `CAM_RL_XPT`, `CAM_RL_DEV`, and `CAM_RL_NORMAL`. Each priority has a generation counter for round-robin scheduling within the priority.
 
-One common pitfall in CAM driver development is failing to handle device invalidation properly. When a device is removed, the XPT calls `periph_oninval()` on all attached peripheral drivers. Drivers must release all references to the device and cancel any pending I/O. Failure to do so can result in use-after-free bugs when the SIM or device structures are freed.
+3. **DMA Mapping**: The `bus_dmamap_load_ccb()` function in `sys/cam/cam.c` handles DMA map creation for CCBs. For large transfers, scatter-gather lists may be used (`CAM_DATA_SG`).
 
-Another pitfall is improper handling of the CAM path reference counting. Peripheral drivers must call `xpt_path_release()` when they no longer need the path. The path holds references to the bus, target, and device structures, and premature release can cause use-after-free bugs.
+4. **Timeout Handling**: Each CCB has a timeout field. If the SIM does not call `xpt_done()` within the timeout period, the CCB is aborted and retried according to the `cam_flags` (e.g., `CAM_RETRY_SELTO` for selection timeouts).
 
-The CCB completion callback (`ccb_h.cbfcnp`) is called from interrupt context in some cases. Drivers must ensure that this callback does not perform blocking operations or acquire locks that might cause deadlocks. The callback should typically just schedule a task or signal a condition variable to process the completion in process context.
+### Race Conditions and Concurrency
+
+1. **SIM Locking**: The `cam_sim` structure has an optional mutex (`mtx`). When `mtx` is non-NULL, all calls to `sim_action` are made with this lock held. When `mtx` is NULL, the SIM is responsible for its own locking, which enables multi-queue support for devices with multiple hardware queues.
+
+2. **Periph Hold/Release**: Peripheral drivers use `cam_periph_hold()` and `cam_periph_release()` to manage references to the periph structure. This prevents the periph from being freed while in use. The `cam_periph_hold_boot()` variant is used during boot.
+
+3. **Device Queue Freezing**: The `xpt_freeze_devq()` and `xpt_release_devq()` functions allow temporary suspension of CCB submission to a device. This is used during error recovery and device removal.
 
 ### Connection to OS Theory
 
-CAM implements the device driver model described in operating system textbooks like "Operating Systems: Three Easy Pieces" by Arpaci-Dusseau. The XPT layer corresponds to the device driver framework that provides a uniform interface to diverse hardware. The SIM layer implements the hardware-specific translation described in the device driver chapter.
+CAM exemplifies the device driver abstraction layer concept from operating system theory. The three-layer architecture (XPT, SIM, periph) separates concerns:
+- **XPT** provides the transport-independent routing and topology management
+- **SIM** provides the hardware-specific interface
+- **Periph** provides the device-specific functionality
 
-The CCB mechanism implements the command queueing pattern described in storage system textbooks. Commands are encapsulated in a common structure, queued for processing, and completed asynchronously. This pattern is similar to the request queue in Linux's block layer and the I/O request queue in macOS/XNU.
+This separation allows new transports (NVMe, SAS, SATA) to be added without modifying existing peripheral drivers. The CCB mechanism is a form of command descriptor, similar to Linux's `struct scsi_cmnd` (or FreeBSD's `union ccb`) or the block layer's `struct request`.
 
-The generation number mechanism implements the versioning pattern used in distributed systems to handle stale data. When the topology changes, the version number is incremented, and operations with stale versions are rejected. This pattern is used in database systems and distributed file systems to handle concurrent updates.
+The I/O scheduler integration demonstrates the principle of layered queueing — GEOM provides one level of queueing, CAM provides another, and the device driver may provide a third. This allows different layers to optimize for different characteristics (GEOM for layout, CAM for transport, driver for hardware).
 
 ## Comparison
 
-Linux implements storage I/O through the block layer and SCSI mid-layer. The Linux block layer uses `struct request` and `struct bio` for I/O requests, similar to FreeBSD's CCB and BIO structures. However, Linux's block layer is more tightly integrated with the device mapper and multipathing subsystems. FreeBSD's GEOM framework provides similar functionality but is more modular and allows userspace tools to manipulate storage configurations.
+### Linux Block Layer
 
-Linux's SCSI mid-layer corresponds to FreeBSD's CAM XPT layer. Both provide a uniform interface to diverse SCSI transports. However, Linux's SCSI mid-layer is more tightly coupled with the SCSI protocol implementation, while FreeBSD's CAM separates the transport layer from the protocol implementation. This allows FreeBSD to support non-SCSI transports like ATA and NVMe through the same framework.
+Linux uses a different architecture for storage I/O. Instead of CAM's three-layer model, Linux has:
+- The **block layer** (`block/`) which manages `struct request` and `struct bio`
+- The **SCSI mid-layer** (`drivers/scsi/`) which handles SCSI commands
+- The **HBA drivers** (`drivers/scsi/`) which implement the hardware interface
 
-macOS/XNU implements storage I/O through the I/O Kit framework. The I/O Kit provides a device driver framework similar to FreeBSD's newbus, but uses a different object model based on C++ classes. macOS's storage stack uses the I/O Storage Kit, which provides a hierarchy of storage providers similar to FreeBSD's GEOM framework. However, macOS's approach is more tightly integrated with the I/O Kit's power management and security frameworks.
+Linux's SCSI mid-layer is more closely integrated with the block layer than FreeBSD's CAM. The `scsi_cmnd` structure is similar to CAM's CCB, but Linux does not have a separate transport layer like XPT. Linux uses the **device mapper** (`drivers/md/`) for storage virtualization, which is conceptually similar to GEOM but more tightly integrated with the block layer.
 
-NetBSD implements storage I/O through the CAM subsystem, which is similar to FreeBSD's CAM but with some differences in the API and data structures. NetBSD's CAM is less mature than FreeBSD's and lacks some features like the I/O scheduler. OpenBSD's storage stack is similar to FreeBSD's but has fewer transport drivers and less active development.
+Key differences:
+- FreeBSD's CAM provides a uniform interface for SCSI, ATA, NVMe, and MMC through the same CCB mechanism. Linux uses separate interfaces for each transport.
+- FreeBSD's I/O scheduler (`cam_iosched`) is integrated into CAM, while Linux has a separate I/O scheduler framework (`block/blk-mq.c`).
+- FreeBSD's peripheral driver model (`cam_periph`) is more explicit about device attachment than Linux's SCSI device model.
+
+### macOS/XNU
+
+macOS uses the **I/O Kit** framework for device drivers, which is an object-oriented framework based on C++. The storage stack includes:
+- **IOStorageFamily** for block device abstraction
+- **IOAHCIFamily** for SATA devices
+- **IONVMeFamily** for NVMe devices
+
+Unlike FreeBSD's CCB-based approach, I/O Kit uses a command submission model where drivers create `IOMemoryDescriptor` objects for data transfer and `IOStorageCommand` objects for command submission. The I/O Kit's `IOService` hierarchy provides a reference-counted object model, with `IOStorage` subclasses implementing the block device interface.
+
+### NetBSD/OpenBSD
+
+NetBSD and OpenBSD use a CAM-like architecture but with differences:
+- NetBSD's CAM implementation is derived from FreeBSD's but has diverged in some areas. Specifically, NetBSD uses `bioq_disksort()` for BIO queueing in its peripheral drivers (e.g., `sdstart()` in `sys/dev/scsipi/sd.c`), providing a disk-sort queue similar to FreeBSD's `bioq_disksort()` but without the separate `cam_iosched` dynamic rate limiting subsystem that FreeBSD provides.
+- OpenBSD simplified its storage stack and removed some CAM features. OpenBSD's `sd(4)` driver for SCSI disks uses a simpler `bioq`-based queue without the `cam_iosched` dynamic rate limiting subsystem.
+- FreeBSD's CAM has more extensive support for multiple transports (SCSI, ATA, NVMe, MMC) through a unified interface, while NetBSD and OpenBSD have more transport-specific code paths.
 
 ## See Also
-- [GEOM — Storage Framework](../../../sys/geom/README.md)
-- [Device Driver Framework — newbus and devclass](../../../sys/kern/README_driver.md)
-- [Interrupt Handling — Threads, Filters, and Dispatch](../../../sys/kern/README_intr.md)
+- [GEOM — Storage Framework](../geom/README.md)
+- [Device Driver Framework — newbus and devclass](../kern/README_driver.md)
+- [Interrupt Handling — Threads, Filters, and Dispatch](../kern/README_intr.md)
 
 
 
-- [GEOM — Storage Framework](../geom/README.md) — The GEOM storage framework that provides virtual storage providers
-- [Device Driver Framework — newbus and devclass](../kern/README_driver.md) — The newbus device driver framework
-- [Interrupt Handling — Threads, Filters, and Dispatch](../kern/README_intr.md) — Interrupt handling in FreeBSD
-- [Buffer Cache — Block I/O Subsystem](../vm/README_bcache.md) — The buffer cache and block I/O subsystem
-- [sys/cam/](../../sys/cam/) — CAM source code directory
-- [sys/cam/scsi/](../../sys/cam/scsi/) — SCSI transport and peripheral drivers
-- [sys/cam/ata/](../../sys/cam/ata/) — ATA transport and peripheral drivers
-- [sys/cam/nvme/](../../sys/cam/nvme/) — NVMe transport and peripheral drivers
+Key source directories to explore:
+- `sys/cam/` — CAM core implementation
+- `sys/cam/scsi/` — SCSI peripheral drivers (da, cd, ch, sa, pass)
+- `sys/cam/ata/` — ATA peripheral drivers (ada) and XPT integration
+- `sys/cam/nvme/` — NVMe peripheral drivers (nda) and XPT integration
+- `sys/cam/mmc/` — MMC peripheral drivers
+- `sys/dev/ahci/` — AHCI SATA HBA driver (SIM implementation)
+- `sys/dev/mpt/` — LSI MegaRAID HBA driver (SIM implementation)
+- `sys/dev/nvme/` — NVMe HBA driver (SIM implementation)
 
 ---
 
-> _Generated by [DaemonDocs](https://github.com/ocochard/DaemonDocs) on 2026-04-29 23:44 UTC using model `Qwen3.6-35B-A3B-UD-Q4_K_XL` (llama.cpp build `b8973-3142f1dbb`). AI-generated content — verify against source before relying on it._
+> _Generated by [DaemonDocs](https://github.com/ocochard/DaemonDocs) on 2026-05-01 01:56 UTC using model `Qwen3.6-35B-A3B-UD-Q4_K_XL` (llama.cpp build `b8985-27aef3dd9`). AI-generated content — verify against source before relying on it._

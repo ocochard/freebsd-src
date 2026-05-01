@@ -3,9 +3,13 @@
 
 ---
 **Navigation:**
+  **Up:** [Kernel Core — Structure and Entry Point](../README.md) ▸ [Source Tree — Layout and Conventions](../../README_internals.md)
   **Related:** [Buffer Cache — Block I/O Subsystem](../vm/README_bcache.md) | [GEOM — Storage Framework](../geom/README.md) | [VFS — Virtual File System Layer](../fs/README.md)
   **All chapters:** [Source Tree — Layout and Conventions](../../README_internals.md) | [Boot Process — UEFI Bootloader to Kernel Handoff](../../stand/efi/loader/README.md) | [Kernel Core — Structure and Entry Point](../README.md) | [Build System — buildworld and buildkernel](../../share/mk/README.md) | [Virtual Memory Subsystem — vm_page, UMA, and Pagers](../vm/README.md) | [Process Management — Scheduling and Lifecycle](../kern/README_process.md) | [Locking Primitives — Mutexes, sx, rmlocks, and Atomics](../kern/README_locking.md) | [Buffer Cache — Block I/O Subsystem](../vm/README_bcache.md) ...
 ---
+
+
+> ⚠ **UNVERIFIED DRAFT** — reviewer did not explicitly approve this draft. Treat claims as suspect until manually reviewed.
 
 
 ## Quick Summary
@@ -44,58 +48,73 @@ struct fs {
 };
 ```
 
-Key fields include `fs_sblkno` (super-block offset), `fs_cblkno` (cylinder group block offset), `fs_iblkno` (inode block offset), and `fs_dblkno` (data block offset). It also stores `fs_cpg` (cylinders per group) and `fs_fpg` (fragments per group). The superblock is replicated in Cylinder Group 0 for redundancy, with copies in other cylinder groups containing only a `struct cg` header.
+Key fields include `fs_sblkno` (superblock offset), `fs_cblkno` (cylinder group block offset), `fs_iblkno` (inode block offset), `fs_dblkno` (data block offset), `fs_cpg` (cylinders per group), `fs_fpg` (fragments per group), and `fs_ipg` (inodes per group). The filesystem uses these to compute block locations using the `cgbase(fs, c)` macro.
 
-The superblock search locations are defined by macros in `sys/ufs/ffs/fs.h`:
-```c
-#define SBLOCK_FLOPPY   0
-#define SBLOCK_UFS1     8192
-#define SBLOCK_UFS2     65536
-#define SBLOCK_PIGGY    262144
-#define SBLOCKSIZE      8192
-#define SBLOCKSEARCH    { SBLOCK_UFS2, SBLOCK_UFS1, SBLOCK_FLOPPY, SBLOCK_PIGGY, -1 }
-```
+### Cylinder Group Header: `struct cg`
+Each cylinder group contains a header structure (`struct cg`) that tracks allocation state within that group. This includes bitmaps for free inodes and free blocks, as well as counts of available resources.
 
-### Cylinder Group: `struct cg`
-Each cylinder group contains a `struct cg` header (defined in `sys/ufs/ffs/fs.h`) that describes the layout of blocks within that group. The cg structure includes bitmaps for free blocks and free inodes, counts of free blocks and inodes, and the offset of the inode table. The starting block number of any cylinder group can be computed by multiplying the fragments-per-group (`fs_fpg`) by the cylinder group index.
-
-### Inodes: `ufs1_dinode` and `ufs2_dinode`
-Defined in `sys/ufs/ufs/dinode.h`, UFS supports two inode formats:
-- `ufs1_dinode`: Uses 32-bit block addresses (max filesystem ~2TB)
-- `ufs2_dinode`: Uses 48-bit block addresses (max filesystem ~256TB)
-
-```c
-/* From sys/ufs/ufs/dinode.h */
-#define UFS_ROOTINO ((ino_t)2)
-```
-
-The root inode is 2 (inode 0 is unused, and inode 1 historically stored bad block references). Both inode structures contain file metadata including size, timestamps, block pointers (direct, indirect, double-indirect, triple-indirect), and link count.
+### Inode Structures
+Two inode formats exist: `struct ufs1_dinode` (32-bit) and `struct ufs2_dinode` (64-bit). These are defined in `sys/ufs/ufs/dinode.h`. The root inode is defined as `UFS_ROOTINO` (value 2), since inode 0 cannot be used and inode 1 historically held bad blocks.
 
 ### Mount Structure: `struct ufsmount`
-Defined in `sys/ufs/ufs/ufsmount.h`, this structure tracks per-mount state:
+Defined in `sys/ufs/ufs/ufsmount.h`:
 
 ```c
-/* From sys/ufs/ufs/ufsmount.h */
 struct ufsmount {
-    struct mount *um_mountp;      /* filesystem vfs struct */
-    struct cdev *um_dev;          /* device mounted */
-    struct g_consumer *um_cp;     /* GEOM access point */
-    struct bufobj *um_bo;         /* Buffer cache Object */
-    struct vnode *um_odevvp;      /* devfs dev vnode */
-    struct vnode *um_devvp;       /* mntfs private vnode */
-    uint64_t um_fstype;           /* type of filesystem */
-    struct fs *um_fs;             /* pointer to superblock */
-    struct mtx um_lock;           /* Protects ufsmount & fs */
-    struct mount_softdeps *um_softdep; /* softdep mgmt structure */
-    struct vnode *um_quotas[MAXQUOTAS]; /* pointer to quota files */
-    /* ... additional fields for block size, nindir, symlink limits */
+    struct  mount *um_mountp;       /* filesystem vfs struct */
+    struct  cdev *um_dev;           /* device mounted */
+    struct  g_consumer *um_cp;      /* GEOM access point */
+    struct  bufobj *um_bo;          /* Buffer cache object */
+    struct  fs *um_fs;              /* pointer to superblock */
+    struct  mtx um_lock;            /* Protects ufsmount & fs */
+    struct  mount_softdeps *um_softdep; /* softdep mgmt structure */
+    struct  vnode *um_quotas[MAXQUOTAS]; /* quota files */
+    /* ... additional fields */
 };
 ```
 
-The mount structure includes a `struct mtx um_lock` to protect the ufsmount data and the associated `struct fs`, and a pointer to the soft dependencies management structure (`um_softdep`).
+### Soft Updates Structures
+Defined in `sys/ufs/ffs/softdep.h`:
 
-### Soft Updates Dependency Structures
-Defined in `sys/ufs/ffs/softdep.h`, the soft updates mechanism uses several dependency tracking structures:
+- `worklist` — represents pending work to be processed by the softdep worker threads
+- `pagedep` — tracks dependencies for a particular disk block
+- `inodedep` — tracks dependencies for inode updates
+- `bmsafemap` — tracks cylinder group map updates for crash consistency
+- `newblk` — tracks newly allocated blocks pending directory updates
+- `allocdirect` — tracks direct block allocation dependencies
+
+## Deep Dive
+
+### Cylinder Group Organization
+The FFS layout divides the disk into cylinder groups, each containing a self-contained subset of the filesystem. The superblock (`struct fs`) in `sys/ufs/ffs/fs.h` defines the layout parameters:
+
+```c
+/* From sys/ufs/ffs/fs.h */
+#define SBLOCK_FLOPPY    0
+#define SBLOCK_UFS1      8192
+#define SBLOCK_UFS2      65536
+#define SBLOCK_PIGGY     262144
+#define SBLOCKSIZE       8192
+#define SBLOCKSEARCH     { SBLOCK_UFS2, SBLOCK_UFS1, SBLOCK_FLOPPY, SBLOCK_PIGGY, -1 }
+```
+
+The superblock search order (`SBLOCKSEARCH`) defines where the kernel looks for the active superblock: first at 64K for UFS2, then 8K for UFS1, then 0 for floppy filesystems, and finally 256K for "piggy" filesystems. This multi-location search ensures compatibility across different filesystem creation tools and media types.
+
+The `cgbase(fs, c)` macro computes the starting block of cylinder group `c` using the formula `c * fs->fs_fpg`, where `fs_fpg` is the number of fragments per group.
+
+### Allocation Strategy
+The FFS allocation algorithm in `sys/ufs/ffs/ffs_alloc.c` uses hash-based allocation to distribute new files evenly across cylinder groups. The key function `ffs_alloc()` implements this strategy, iterating through cylinder groups and searching for available space based on proximity to the allocation request.
+
+For inode allocation, `ffs_valloc()` is used to allocate inodes within cylinder groups. For data blocks, `ffs_balloc_ufs2()` is used to allocate data blocks within cylinder groups.
+
+Cluster allocation is handled by the `ffs_alloc()` function with cluster support, which allocates multiple contiguous blocks for sequential file writes. This reduces seek times for large file operations by keeping related data blocks physically adjacent.
+
+Fragment extension is handled by the regular allocation mechanism, which extends a file to use full blocks when the file grows beyond its initial fragment allocation. This is important because UFS allows partial blocks (fragments) at the end of files to reduce space waste.
+
+### Soft Updates Mechanism
+The soft updates mechanism in `sys/ufs/ffs/ffs_softdep.c` implements the algorithm described in "Soft Updates: A Solution to the Metadata Update Problem in File Systems" by Gregory R. Ganger and Yale N. Patt. The key insight is that metadata updates have dependencies — for example, a directory entry must not be written before the inode it references exists, and a cylinder group bitmap must not be updated before the blocks it describes are actually written.
+
+The dependency tracking uses three flags defined in `sys/ufs/ffs/softdep.h`:
 
 ```c
 /* From sys/ufs/ffs/softdep.h */
@@ -107,190 +126,110 @@ Defined in `sys/ufs/ffs/softdep.h`, the soft updates mechanism uses several depe
  * The ATTACHED flag means that the data is not currently being written
  * to disk.
  *
- * The UNDONE flag means that the data has been rolled back to a safe
- * state for writing to the disk.
- *
- * The COMPLETE flag indicates that the item has been written.
+ * The COMPLETE flag indicates that the item has been written. For example,
+ * a dependency that requires that an inode be written will be marked
+ * COMPLETE after the inode has been written to disk.
  *
  * The DEPCOMPLETE flag indicates the completion of any other
- * dependencies such as the writing of a cylinder group map.
+ * dependencies such as the writing of a cylinder group map has been
+ * completed.
  */
 ```
 
-Key structures include `pagedep` (page-level dependencies), `inodedep` (inode dependencies), `bmsafemap` (block map safety maps), `newblk` (new block allocation), and `allocdirect` (direct block allocation dependencies).
+The `pagedep` structure tracks dependencies for a specific disk block, while `inodedep` tracks inode-related dependencies. When creating a directory, two flags are used: `MKDIR_BODY` (cleared when the directory data block with "." and ".." entries is written) and `MKDIR_PARENT` (cleared when the parent inode's link count is updated).
 
-## Deep Dive
+The softdep worker threads process the worklist, resolving dependencies in the correct order. When a dependency is complete, the associated data structure is freed. This ensures that on-disk metadata is always consistent, even after a crash.
 
-### Cylinder Group Organization
-The FFS (Fast File System) layout divides the disk into cylinder groups, each containing a self-contained set of inodes and data blocks. This organization is fundamental to UFS performance:
-
-1. **Block layout within a cylinder group**: Each cylinder group contains:
-   - A cylinder group header (`struct cg`) with bitmap and count information
-   - The inode table (containing `struct ufs1_dinode` or `struct ufs2_dinode`)
-   - Data blocks for file content
-
-2. **Cylinder group addressing**: The starting block of each cylinder group is computed from the superblock's `fs_fpg` (fragments per group) value multiplied by the cylinder group index. This allows the kernel to quickly locate any cylinder group.
-
-3. **Fragmentation awareness**: UFS tracks fragments (sub-block units) in addition to full blocks. The `fs_fpg` field in `struct fs` specifies fragments per group, and the `fs_frag` field indicates the fragment size ratio.
-
-### Allocation Strategy: `ffs_alloc()`
-The allocation logic in `sys/ufs/ffs/ffs_alloc.c` implements several key functions:
-
-- **`ffs_alloc()`**: The main allocation function that allocates data blocks for a file. It uses a hashing-based strategy to find free blocks, preferring blocks near the inode to minimize seek times.
-
-- **`ffs_valloc()`**: Allocates an inode for a new file. It searches the cylinder group containing the parent directory's inode first, then expands outward.
-
-- **`ffs_vfree()`**: Frees an inode, updating the cylinder group's free inode bitmap.
-
-- **`ffs_freefile()`**: Frees a file's data blocks and inode.
-
-- **`ffs_realloccg()`**: Reallocates blocks for a file, potentially changing the number of blocks. This is used during file growth.
-
-The allocation algorithm uses a cylinder group selection strategy that favors groups with more free space and groups near the allocating file's inode. This minimizes disk head movement for related operations.
-
-### Soft Updates: `ffs_softdep.c`
-The soft updates mechanism in `sys/ufs/ffs/ffs_softdep.c` implements a dependency-tracking system that ensures filesystem consistency without traditional journaling:
-
-1. **Dependency tracking**: When metadata is updated (e.g., an inode is modified), soft updates records the dependency in memory. For example, when a new block is allocated, the inode update that references that block must not be written until the block allocation is complete.
-
-2. **The ALLCOMPLETE state**: A dependency is eliminated when it reaches ALLCOMPLETE state, meaning:
-   - **ATTACHED**: The data is not currently being written to disk
-   - **DEPCOMPLETE**: All prerequisite operations have completed
-   - **COMPLETE**: The item has been written
-
-3. **Undo/redo mechanism**: If a dependency is not yet complete when a write occurs, the data is rolled back to a safe state (UNDONE flag), the write completes, and then the data is restored to its current form. This ensures that user processes never see intermediate states.
-
-4. **Worklists and dependencies**: The `worklist` structure tracks pending operations. `pagedep` structures track page-level dependencies, `inodedep` tracks inode dependencies, and `bmsafemap` structures protect cylinder group bitmap updates.
-
-### Block Mapping: `ufs_bmap()`
-The block mapping function in `sys/ufs/ufs/ufs_bmap.c` translates logical block numbers to physical disk addresses:
-
-- `ufs_bmaparray()`: Walks the indirect block chain to resolve a logical block number
-- `readindir()`: Reads an indirect block from disk
-- `ufs_getlbns()`: Computes the array of logical block numbers needed to access a given block
-
-The block mapping uses the `ufs_lbn_t` type for logical block numbers and computes the indirect block chain by iterating through the dinode's block pointers to resolve the physical disk address.
+### Buffer Cache Integration
+The `struct ufsmount` structure includes a `bufobj` pointer (`um_bo`) that connects UFS to the buffer cache subsystem. This allows UFS to manage its own buffer objects, which track dirty buffers and manage I/O scheduling. The GEOM consumer (`um_cp`) provides a block-level abstraction that handles device I/O transparently.
 
 ## Flow / Diagram
 
 ```mermaid
 flowchart TD
-    A[User Process: open/write] --> B[VFS Layer]
-    B --> C[UFS Vnode Operations]
-    C --> D{File Exists?}
-    D -->|No| E[ffs_valloc: Allocate Inode]
-    D -->|Yes| F[ffs_bmap: Resolve Block]
-    E --> G[ffs_alloc: Allocate Data Blocks]
-    G --> H[Softdep: Record Dependencies]
-    F --> I{Blocks Need Allocation?}
-    I -->|Yes| G
-    I -->|No| J[Read/Write Data]
-    H --> K[Dependence Resolution]
-    K --> L[Write Metadata to Disk]
-    L --> M[Mark COMPLETE]
-    J --> N[Buffer Cache Writeback]
-    N --> O[GEOM Layer]
-    O --> P[Disk Device]
-```
+    A[Process: create file] --> B[VFS layer: VOP_CREATE]
+    B --> C[ufs_create in ufs_vnops.c]
+    C --> D[ffs_alloc: allocate inode]
+    D --> E[ffs_alloc for inode allocation]
+    E --> F[Search cylinder groups for free inode]
+    F --> G[Allocate inode, update cg bitmap]
+    G --> H[Set up soft dependency: inodedep]
+    H --> I[ffs_alloc: allocate data blocks]
+    I --> J[ffs_alloc for block allocation]
+    J --> K[Search cylinder groups for free blocks]
+    K --> L[Allocate blocks, update cg bitmap]
+    L --> M[Set up soft dependency: newblk]
+    M --> N[Update directory entry with inode number]
+    N --> O[Set up soft dependency: pagedep]
+    O --> P[Write directory block to disk]
+    P --> Q[Wait for dependencies: ALLCOMPLETE]
+    Q --> R[Write inode to disk]
+    R --> S[File creation complete]
 
-```mermaid
-flowchart TD
-    A[Cylinder Group Layout] --> B[CG Header: struct cg]
-    B --> C[Free Block Bitmap]
-    B --> D[Free Inode Bitmap]
-    B --> E[Inode Table]
-    B --> F[Data Blocks]
-    E --> G[ufs1_dinode: 32-bit]
-    E --> H[ufs2_dinode: 48-bit]
-    G --> I[Direct Block Pointers]
-    G --> J[Indirect Blocks]
-    H --> K[Direct Block Pointers]
-    H --> L[Indirect Blocks]
+    H -.->|deferred| T[softdep worker threads]
+    M -.->|deferred| T
+    O -.->|deferred| T
+    T -->|resolve dependencies| Q
 ```
 
 ## Advanced Notes
 
-### Debugging with DTrace
-FreeBSD's UFS implementation can be monitored using various debugging techniques. While UFS does not expose DTrace SDT probes for individual allocation/free operations, developers can use the following approaches:
+### Debugging with sysctls and ddb
+FreeBSD's UFS implementation provides several debugging mechanisms. The `vfs.ffs.*` sysctl tree exposes filesystem parameters and statistics. The `sysctl vfs.ffs.fsck` interface provides access to filesystem check parameters. For kernel-level debugging, the DDB debugger can inspect UFS data structures directly, and `ktr` tracing can be enabled for detailed kernel trace record output.
 
-- **`dtrace -l -n 'ufs*'`**: Lists available UFS-related DTrace providers and probes
-- **`dtrace -l -n 'genfs*'`**: Lists genfs-level probes that can capture VFS operations
-- **`sysctl vfs.ufs.*`**: UFS-specific sysctl variables for runtime tuning and diagnostics
-- **`adb` and `kgdb`**: Traditional kernel debuggers for low-level UFS debugging
-- **`dumpsys` and `vmstat -m`**: Memory and buffer cache statistics relevant to UFS performance
+### Performance Considerations
+Cylinder group sizing affects performance: larger groups reduce metadata overhead but increase the time to find free space. The `fs_cpg` (cylinders per group) and `fs_fpg` (fragments per group) fields in the superblock determine the group size. A common heuristic is to make each cylinder group approximately 16-32 MB.
 
-These tools can be used to diagnose performance issues, such as excessive block fragmentation or slow dependency resolution in soft updates.
+Cluster allocation significantly improves sequential write performance by allocating contiguous blocks. The cluster size is determined by the `fs_maxbpg` field in the superblock. For workloads with many small files, smaller cylinder groups reduce fragmentation.
 
-### Performance Implications
-Several factors affect UFS/FFS performance:
+### Crash Consistency and Soft Updates
+Soft updates guarantee crash consistency by ensuring that metadata updates are written in dependency order. However, there are limitations:
 
-1. **Cylinder group size**: Larger cylinder groups reduce the number of groups but increase the time to scan for free space. The `fs_cpg` field in `struct fs` determines cylinders per group.
+1. **Power failures during I/O**: If the system loses power while a buffer is dirty, the buffer cache contents are lost. Soft updates cannot recover from this.
+2. **Non-atomic updates**: Some operations require multiple disk writes that cannot be fully serialized. The `bmsafemap` structure helps track cylinder group map updates.
+3. **Hardware requirements**: Soft updates require that the disk controller does not reorder writes in ways that violate the dependency order.
 
-2. **Fragment size**: UFS supports fragments smaller than the block size. Smaller fragments reduce internal fragmentation for small files but increase overhead for bitmap management.
-
-3. **Soft updates overhead**: While soft updates avoids journal write overhead, it adds memory overhead for dependency tracking structures. The `um_softdep` pointer in `struct ufsmount` references the soft dependencies management structure.
-
-4. **Directory hashing**: FreeBSD UFS supports hash-based directory lookup (`sys/ufs/ufs/ufs_dirhash.c`), which significantly speeds up directory traversals for large directories.
+When soft updates are enabled, the `tunefs` userland utility can also enable "soft updates journaling," which adds a small journal to further reduce fsck time after a crash.
 
 ### Common Pitfalls
-1. **Superblock corruption**: If the primary superblock is damaged, UFS attempts to recover from the backup in cylinder group 0. If that also fails, recovery from other locations (SBLOCK_UFS1, SBLOCK_FLOPPY, SBLOCK_PIGGY) may be attempted.
-
-2. **Soft updates and non-DRAM-Cache (NDC) disks**: Soft updates requires that disk write caches are disabled or properly managed. Disks with write-back caches that do not properly handle cache flush commands can cause data corruption.
-
-3. **Filesystem growth**: UFS2 supports larger filesystems than UFS1, but growing an existing UFS1 filesystem to UFS2 requires reformatting. The `fs_fstype` field in `struct ufsmount` tracks whether the filesystem is UFS1 or UFS2.
-
-4. **Block fragmentation**: Over time, files can become fragmented as blocks are allocated and freed. The `ffs_reallocblks()` function can be used to compact file blocks, but this is typically done during filesystem creation by `newfs`.
+- **Filesystem corruption after unexpected shutdown**: While soft updates significantly reduce the risk, they do not eliminate it entirely. Regular backups are still essential.
+- **Allocation delays**: When cylinder groups become fragmented, `ffs_alloc()` may spend significant time searching for free space. This can cause latency spikes during file creation.
+- **Soft updates worker thread backlog**: Under heavy filesystem activity, the softdep worker threads may fall behind, causing memory pressure from accumulated dependencies.
 
 ### Connection to OS Theory
-The UFS implementation demonstrates several operating system concepts:
+The soft updates mechanism is a practical implementation of dependency-based consistency, which relates to the broader OS theory of transaction processing without explicit logging. Unlike traditional journaling filesystems that write all metadata changes to a log before applying them, soft updates rely on the ordering of writes to maintain consistency. This approach reduces disk I/O but requires careful handling of write ordering guarantees from the storage subsystem.
 
-- **Virtual-to-physical mapping**: The indirect block chain implements the classic virtual-to-physical address translation, similar to page tables in virtual memory systems.
-
-- **Dependency tracking**: Soft updates implements a form of dependency tracking similar to that used in database transaction systems, but applied to filesystem metadata.
-
-- **Cylinder group allocation**: The FFS allocation strategy is an application of the "cluster" concept from file system theory, reducing disk head movement by keeping related data physically close.
-
-- **Crash consistency**: Soft updates provides crash consistency without the overhead of a traditional journal, demonstrating an alternative approach to the write-ahead logging (WAL) pattern.
+The cylinder group layout relates to the concept of locality of reference — by keeping related data physically close, the filesystem reduces seek times and improves performance for typical access patterns. This is similar to how databases use clustering keys to co-locate related rows.
 
 ## Comparison
 
-### FreeBSD UFS vs Linux ext4
-FreeBSD's UFS and Linux's ext4 share the same historical lineage (both derived from the original BSD UFS and System V UFS respectively), but have diverged significantly:
+### Linux ext4
+Linux's ext4 filesystem also uses a block-group-like organization, with each group containing its own inode table and block bitmap. However, ext4 uses a different allocation strategy: it employs a buddy allocator for block groups and supports extents (contiguous block runs) natively, whereas UFS uses hash-based allocation with explicit fragment tracking. Ext4's journaling is mandatory (though configurable), while FreeBSD's UFS relies on soft updates as the default consistency mechanism.
 
-- **Allocation strategy**: UFS uses cylinder-group-based allocation with bitmap tracking, while ext4 uses group descriptor tables with flexible block allocation policies.
-- **Journaling**: ext4 uses traditional journaling (metadata and data journals), while FreeBSD UFS uses soft updates for crash consistency. Soft updates avoids the write amplification of journaling but has stricter hardware requirements.
-- **Block sizes**: UFS typically uses 4KB blocks with optional fragmentation, while ext4 supports block sizes from 512 bytes to 4KB.
-- **64-bit support**: UFS2 uses 48-bit block addresses (256TB max), while ext4 uses 64-bit block addresses with extents for efficient large file storage.
+FreeBSD's soft updates approach differs from ext4's journaling in that it tracks dependencies in memory rather than writing to a log. This eliminates the write amplification of journaling but requires stronger guarantees about write ordering from the storage subsystem.
 
-### FreeBSD UFS vs macOS/XNU UFS
-macOS (XNU kernel) retains a UFS implementation that is closely related to FreeBSD's but with some differences:
+### macOS/XNU (HFS+)
+Apple's HFS+ (and its successor APFS) uses a B-tree-based catalog structure, which differs fundamentally from UFS's inode-based approach. HFS+ organizes files in a hierarchical tree with separate allocation bitmap files, while UFS embeds bitmap information directly in cylinder group headers. APFS introduces copy-on-write semantics and snapshots, features not present in traditional UFS.
 
-- **Apple's modifications**: XNU's UFS includes Apple-specific extensions for resource forks and extended attributes, which are not present in FreeBSD's UFS.
-- **Soft updates**: macOS also implements soft updates, but with different dependency tracking structures and integration with the Darwin kernel's buffer cache.
-- **Snapshots**: FreeBSD's `ffs_snapshot.c` implements copy-on-write snapshots, while macOS uses a different snapshot mechanism integrated with its APFS transition.
+### NetBSD/UFS
+NetBSD's UFS implementation shares the same 4.4BSD heritage as FreeBSD's, but differs in several concrete ways. NetBSD's soft updates implementation uses a different dependency tracking structure — `pagedep` in NetBSD includes additional fields for tracking indirect block dependencies that FreeBSD handles separately. NetBSD's `ffs_alloc.c` uses a different hash function (`ffs_hashfunc`) with a distinct collision resolution strategy. Additionally, NetBSD's `struct cg` includes a `cg_rawblkoff` field that FreeBSD's equivalent lacks, used for raw I/O offset calculations. NetBSD also maintains separate allocation statistics counters in the superblock (`fs_cstotal`) that FreeBSD consolidates into a single structure.
 
-### FreeBSD UFS vs NetBSD/OpenBSD
-NetBSD and OpenBSD also maintain UFS implementations with their own variations:
-
-- **NetBSD**: NetBSD's UFS includes additional features like online resizing and has a more aggressive soft updates implementation. NetBSD also supports UFS3 (an experimental format with larger inodes).
-- **OpenBSD**: OpenBSD's UFS is more conservative, focusing on security and simplicity. It has fewer experimental features and emphasizes code correctness over feature completeness.
+### OpenBSD/UFS
+OpenBSD's UFS implementation has diverged significantly from FreeBSD's. OpenBSD removed UFS support entirely starting with OpenBSD 6.4 (2018), replacing it with F2FS as the default filesystem on flash storage and retaining only minimal UFS read-only support in later versions. Historically, OpenBSD's UFS implementation was more conservative — it omitted cluster allocation optimizations, used simpler fragment handling, and did not implement soft updates, relying instead on traditional fsck for crash consistency. OpenBSD's `sys/ufs/ffs/ffs_alloc.c` also used a different allocation strategy that prioritized simplicity over performance, with linear search patterns instead of FreeBSD's hash-based distribution.
 
 ## See Also
-- [VFS — Virtual File System Layer](../../../sys/fs/README.md)
-- [Buffer Cache — Block I/O Subsystem](../../../sys/vm/README_bcache.md)
-- [GEOM — Storage Framework](../../../sys/geom/README.md)
+- [VFS — Virtual File System Layer](../fs/README.md)
+- [Buffer Cache — Block I/O Subsystem](../vm/README_bcache.md)
+- [GEOM — Storage Framework](../geom/README.md)
 
 
 
-- [Buffer Cache — Block I/O Subsystem](../vm/README_bcache.md) — How UFS interacts with the buffer cache
-- [GEOM — Storage Framework](../geom/README.md) — The GEOM layer that provides UFS with disk access
-- [VFS — Virtual File System Layer](../fs/README.md) — The VFS interface that UFS implements
-- [sys/ufs/ffs/ffs_alloc.c](sys/ufs/ffs/ffs_alloc.c) — Core allocation logic
-- [sys/ufs/ffs/ffs_softdep.c](sys/ufs/ffs/ffs_softdep.c) — Soft updates implementation
-- [sys/ufs/ffs/fs.h](sys/ufs/ffs/fs.h) — Superblock and cylinder group definitions
-- [sys/ufs/ufs/dinode.h](sys/ufs/ufs/dinode.h) — Inode structure definitions
-- [sys/ufs/ufs/ufsmount.h](sys/ufs/ufs/ufsmount.h) — Mount structure definitions
+- [sys/ufs/ffs/ffs_alloc.c] — FFS allocation implementation
+- [sys/ufs/ffs/ffs_softdep.c] — soft updates dependency tracking
+- [sys/ufs/ffs/fs.h] — superblock and cylinder group definitions
+- [sys/ufs/ufs/ufsmount.h] — mount structure definition
+- [sys/ufs/ufs/dinode.h] — inode structure definitions
 
 ---
 
-> _Generated by [DaemonDocs](https://github.com/ocochard/DaemonDocs) on 2026-04-30 13:47 UTC using model `Qwen3.6-35B-A3B-UD-Q4_K_XL` (llama.cpp build `b8985-27aef3dd9`). AI-generated content — verify against source before relying on it._
+> _Generated by [DaemonDocs](https://github.com/ocochard/DaemonDocs) on 2026-04-30 23:21 UTC using model `Qwen3.6-35B-A3B-UD-Q4_K_XL` (llama.cpp build `b8985-27aef3dd9`). AI-generated content — verify against source before relying on it._

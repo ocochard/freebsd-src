@@ -3,79 +3,29 @@
 
 ---
 **Navigation:**
+  **Up:** [Kernel Core — Structure and Entry Point](../README.md) ▸ [Source Tree — Layout and Conventions](../../README_internals.md)
   **Related:** [Kernel Core — Structure and Entry Point](../README.md) | [Process Management — Scheduling and Lifecycle](README_process.md) | [VNET — Virtual Network Stacks](../net/README_vnet.md) | [Capsicum — Capability Mode and Sandboxing](README_capsicum.md)
   **All chapters:** [Source Tree — Layout and Conventions](../../README_internals.md) | [Boot Process — UEFI Bootloader to Kernel Handoff](../../stand/efi/loader/README.md) | [Kernel Core — Structure and Entry Point](../README.md) | [Build System — buildworld and buildkernel](../../share/mk/README.md) | [Virtual Memory Subsystem — vm_page, UMA, and Pagers](../vm/README.md) | [Process Management — Scheduling and Lifecycle](README_process.md) | [Locking Primitives — Mutexes, sx, rmlocks, and Atomics](README_locking.md) | [Buffer Cache — Block I/O Subsystem](../vm/README_bcache.md) ...
 ---
 
 
 ## Quick Summary
-Jails provide a lightweight, kernel-level isolation mechanism that restricts a subset of processes from accessing the rest of the system. Introduced in FreeBSD 2.2, jails predate Linux namespaces by over a decade and serve as the foundation for containerization on FreeBSD. Unlike traditional chroot environments, which only change the apparent root directory, a jail enforces multiple security boundaries: it isolates the process identifier space, the network stack, the mount namespace, and user/group IDs. A process running inside a jail may have root privileges within that confined environment, but those privileges do not translate to the host system or other jails.
+Jails provide OS-level process isolation by creating nested execution environments that restrict a set of processes from accessing system resources outside their designated boundaries. Unlike traditional `chroot`, which only changes the apparent root directory but leaves processes with full privileges over the underlying kernel, jails attach each group of processes to a `prison` structure that enforces strict boundaries on network access, mount points, device nodes, and kernel parameters. This design allows untrusted or multi-tenant workloads to run on a single FreeBSD kernel without risking host compromise.
 
-The isolation is enforced through a central kernel structure that tracks the state and capabilities of each jail. When a process is created inside a jail, the kernel attaches it to this structure, which dictates what system calls are permitted and what resources are accessible. The jail subsystem uses a capability-based model: rather than denying specific operations, it maintains a bitmap of allowed actions. If a capability is not explicitly granted, the operation fails with `EPERM`. This design simplifies security policy management and reduces the attack surface by ensuring that only necessary privileges are delegated.
+The isolation model is capability-based rather than purely namespace-based. Each prison carries a bitmask of allowed operations (`pr_allow`), and the kernel checks this mask before permitting privileged syscalls. Network stacks can be isolated per-prison using VIMAGE, mount namespaces are enforced by tagging vnodes and mounts with a prison reference number (`pr_devfs_rsnum`), and resource accounting tracks per-prison usage. A process inherits its prison from its parent at fork time, creating a hierarchical tree of nested jails that share the same kernel but enforce independent security policies.
 
-Network and filesystem isolation are handled by integrating jails with FreeBSD's VIMAGE (virtual network stack) and DevFS frameworks. Each jail can be assigned its own virtual network interfaces and IP addresses, creating a completely separate network namespace. Filesystem isolation is achieved by mounting a private DevFS instance and allowing jail-specific mount points, preventing processes from traversing into the host's directory tree. These features make jails suitable for hosting untrusted services, running multi-tenant applications, and compartmentalizing system daemons.
+Jails are created and configured through explicit syscalls that allocate a new `prison` structure, copy user-supplied parameters, and attach the calling process to the new environment. The kernel maintains a reference-counted hierarchy of prisons, ensuring that resources are safely released only when all descendant processes exit. This architecture balances strong isolation with minimal overhead, making jails suitable for hosting untrusted services, running legacy applications, and compartmentalizing system daemons.
 
 ## Architecture
-The jail implementation resides primarily in `sys/kern/kern_jail.c` and `sys/sys/jail.h`. The kernel represents each jail instance as a `struct prison`, which is reference-counted and protected by a mutex (`pr_mtx`). The host system itself is represented by `prison0`, a statically initialized prison structure that defines the baseline security policy and available capabilities for the global environment. When a user invokes the `jail(2)` syscall, the kernel routes the request to `sys_jail` in `kern_jail.c`, which dispatches to either `jail_set` or `jail_get` depending on the operation.
+The jail subsystem lives primarily in `sys/kern/kern_jail.c` and is declared in `sys/sys/jail.h`. At boot, the kernel initializes `prison0`, the host prison that represents the global system namespace. Every process in the system is attached to exactly one prison at all times. When a process calls `jail_set()`, the syscall handler `kern_jail_set()` allocates a new `prison` structure, validates the requested parameters against the caller's existing permissions, and inserts the new prison into the hierarchy under the parent prison.
 
-Parameter validation is strict. The `jail_set` function parses an array of `struct iovec` descriptors, matching them against a table of recognized prison attributes. Each attribute corresponds to a flag or field in the `prison` structure. For network isolation, the kernel integrates with the VIMAGE subsystem (`sys/net/vnet.h`). If the `PR_VNET` flag is set, a new virtual network stack is allocated, and network interfaces are bound to it. For filesystem isolation, the kernel mounts a private DevFS instance and tracks mount points using the `pr_mounts` list.
+Isolation is enforced by checking the `pr_allow` capability bitmask before executing privileged operations. For example, a jail without `allow.sethostname` is blocked from changing the hostname via the `sethostname` syscall or sysctl, and a jail without `allow.sysvipc` is blocked from System V IPC operations. Network isolation relies on VIMAGE; when a jail is created with `PR_VNET`, the kernel allocates a separate virtual network stack (`pr_vnet`), giving the jail its own routing table, ARP cache, and socket state. Mount isolation works by tagging each vnode and mount point with a prison reference number. The kernel's VFS layer rejects operations on nodes belonging to a different prison unless explicitly permitted.
 
-Security boundaries are enforced at the syscall entry point and within individual subsystems. Functions like `prison_check()` are called before granting access to sensitive resources. The `pr_allow` bitmap acts as a master switch: it contains statically reserved bits (like `PR_ALLOW_RAWIP` or `PR_ALLOW_MOUNT`) and dynamically granted bits. When a process attempts an operation, the kernel checks the process's associated prison's `pr_allow` flags. If the required capability is missing, the syscall returns `EPERM`. This centralized check avoids scattering security logic across dozens of subsystems.
-
-The `pr_allow` bitmap also gates specific system calls. When a jail process invokes a restricted syscall, the kernel checks the corresponding flag and returns `EPERM` if denied. Common restricted syscalls include `sys_mount` (gated by `allow.mount`), which prevents mounting filesystems and exposing host directories; `sys_sethostname` / `sys_proc_set_hostname` (gated by `allow.set_hostname`), which prevents altering the global system hostname; `sys_socket` (gated by `allow.socket_af` and `allow.rawsockets`), which restricts network socket creation; and `sys_chflags` (gated by `allow.chflags`), which prevents modifying file attributes. This explicit gating ensures that only necessary privileges are delegated.
+The subsystem uses reference counting (`pr_ref` for kernel references, `pr_uref` for userland references) to manage lifecycle. When a jail is removed, it enters the `PRISON_STATE_DYING` state, deferring the release of network and mount resources until all attached processes exit. Iteration over the prison hierarchy uses `LIST_FOREACH()` on the `pr_children` list head to safely traverse the tree while holding the appropriate locks.
 
 ## Key Data Structures
-The jail subsystem exposes two primary structures to userspace: `struct jail` for configuration and `struct xprison` for retrieving runtime state via sysctls. The kernel internally uses `struct prison`, which is defined in `sys/kern/kern_jail.c`.
+The core of the jail subsystem is the `prison` structure, which aggregates all isolation parameters for a single namespace. Its layout is visible in the initialization of `prison0` in `sys/kern/kern_jail.c`:
 
-From `sys/sys/jail.h`, the userspace API structure is:
-```c
-struct jail {
-	uint32_t	version;
-	char		*path;
-	char		*hostname;
-	char		*jailname;
-	uint32_t	ip4s;
-	uint32_t	ip6s;
-	struct in_addr	*ip4;
-	struct in6_addr	*ip6;
-};
-#define	JAIL_API_VERSION	2
-```
-The `version` field must be set to `JAIL_API_VERSION`. `path` specifies the root directory for the jail, `hostname` sets the reported hostname, and `jailname` provides a unique identifier. `ip4s`/`ip6s` and the corresponding pointer arrays define the IPv4 and IPv6 addresses assigned to the jail.
-
-From `sys/sys/jail.h`, the sysctl retrieval structure is:
-```c
-struct xprison {
-	int		 pr_version;
-	int		 pr_id;
-	int		 pr_state;
-	cpusetid_t	 pr_cpusetid;
-	char		 pr_path[MAXPATHLEN];
-	char		 pr_host[MAXHOSTNAMELEN];
-	char		 pr_name[MAXHOSTNAMELEN];
-	uint32_t	 pr_ip4s;
-	uint32_t	 pr_ip6s;
-#if 0
-	/*
-	 * sizeof(xprison) will be malloced + size needed for all
-	 * IPv4 and IPv6 addesses. Offsets are based numbers of addresses.
-	 */
-	struct in_addr	 pr_ip4[];
-	struct in6_addr	 pr_ip6[];
-#endif
-};
-#define	XPRISON_VERSION		3
-```
-`pr_state` indicates the lifecycle phase of the jail, defined by the `enum prison_state` in the same header:
-```c
-enum prison_state {
-    PRISON_STATE_INVALID = 0,	/* New prison, not ready to be seen */
-    PRISON_STATE_ALIVE,		/* Current prison, visible to all */
-    PRISON_STATE_DYING		/* Removed but holding resources, */
-};				/* optionally visible. */
-```
-
-The internal `struct prison` in `sys/kern/kern_jail.c` begins with the host prison definition:
 ```c
 struct prison prison0 = {
 	.pr_id		= 0,
@@ -89,78 +39,107 @@ struct prison prison0 = {
 	.pr_childmax	= JAIL_MAX,
 	.pr_hostuuid	= DEFAULT_HOSTUUID,
 	.pr_children	= LIST_HEAD_INITIALIZER(prison0.pr_children),
-#ifdef VIMAGE
 	.pr_flags	= PR_HOST|PR_VNET|_PR_IP_SADDRSEL,
-#else
-	.pr_flags	= PR_HOST|_PR_IP_SADDRSEL,
-#endif
 	.pr_allow	= PR_ALLOW_PRISON0,
 };
 ```
-The `pr_flags` field controls structural properties like `PR_HOST` (allows access to host devices) and `PR_VNET` (enables virtual network stacks). `pr_allow` contains the capability bitmap that gates system calls.
+The `pr_children` list head exists to track nested jails, allowing the kernel to traverse the hierarchy and enforce parent-child permission inheritance. `pr_devfs_rsnum` tags mount points and device nodes with a reference number that the VFS and device layers check to prevent cross-prison access.
+
+Userland interacts with jails through the `jail` structure defined in `sys/sys/jail.h`:
+```c
+struct jail {
+	uint32_t	version;
+	char		*path;
+	char		*hostname;
+	char		*jailname;
+	uint32_t	ip4s;
+	uint32_t	ip6s;
+	struct in_addr	*ip4;
+	struct in6_addr	*ip6;
+};
+```
+This structure is passed to `jail_set()` and `jail_get()` to configure or query jail parameters. The kernel converts these user-space pointers into kernel-resident data during the `kern_jail_set()` call.
+
+For system monitoring, `sysctl` exposes `xprison`, which provides a snapshot of prison attributes to userland:
+```c
+struct xprison {
+	int		 pr_version;
+	int		 pr_id;
+	int		 pr_state;
+	cpusetid_t	 pr_cpusetid;
+	char		 pr_path[MAXPATHLEN];
+	char		 pr_host[MAXHOSTNAMELEN];
+	char		 pr_name[MAXHOSTNAMELEN];
+	uint32_t	 pr_ip4s;
+	uint32_t	 pr_ip6s;
+};
+```
+Additional structures like `prison_ip` manage IP address assignment and validation, while `prison_racct` tracks resource consumption per jail.
 
 ## Deep Dive
-Creating a jail involves parameter parsing, resource allocation, and state initialization. The entry point `sys_jail` (in `sys/kern/kern_jail.c`) validates the calling process's privileges using `priv_check()` to ensure the caller has the `PRIV_JAIL_ATTACH` or `PRIV_JAIL_CREATE` capability. Once validated, it calls `jail_set()` for creation or modification.
+Creating a jail begins with the `jail_set()` syscall, which invokes `kern_jail_set()` in `sys/kern/kern_jail.c`. The function first validates the caller's credentials and checks that the requested parameters do not violate existing security boundaries. It allocates a new `prison` structure using `M_PRISON` and initializes it with default values. The function then iterates through the user-supplied `jail` structure, applying parameters like `path`, `hostname`, and IP addresses.
 
-Inside `jail_set()`, the kernel iterates over the provided `iovec` array, matching each key-value pair against a static table of recognized attributes. For each valid parameter, it updates a temporary `prison` structure. After parsing, `malloc()` is used to allocate a new `struct prison` instance. This function initializes reference counts, copies the parsed parameters, and assigns a unique `pr_id`. The function then calls `prison_hold()` to safely insert the new prison into the global prison hash table.
+When IP addresses are specified, `kern_jail_set()` validates that the addresses do not conflict with existing jails and that the caller has permission to bind them. The kernel copies the addresses into a `prison_ip` structure attached to the new prison. If VIMAGE is enabled and `PR_VNET` is set, the kernel allocates a new virtual network stack and attaches it to the prison via `pr_vnet`.
 
-Network and mount isolation are configured next. If the `PR_VNET` flag is set in the parsed parameters, a new virtual network stack is allocated. Network interfaces are then associated with this stack. For filesystem isolation, the kernel mounts a private DevFS instance and records the mount point in the prison's mount list. This prevents jail processes from seeing or modifying host device nodes.
+Mount isolation is enforced by `pr_devfs_rsnum`. When a process inside a jail opens a device or mount point, the VFS layer checks the vnode's associated prison reference number. If it does not match the process's current prison, the operation is denied with `EACCES`. This mechanism prevents jail processes from traversing outside their designated `path` or accessing host-only devices.
 
-Finally, `jail_set()` attaches the calling process to the new jail by updating its `p_prison` pointer. This function adjusts resource limits and ensures that any subsequent syscalls are routed through the prison's capability checks. The process is now confined, and any attempt to violate the security boundaries will trigger an `EPERM` return.
+Attaching to a jail's network stack is handled by `do_jail_attach()`. When a process calls `jail_attach()`, the kernel verifies that the process is already a member of the target prison, then updates the thread's network context to use the jail's virtual stack. This allows the process to make network calls that are routed through the isolated stack rather than the host's global stack.
+
+Resource limits are managed through `prison_racct`. Each prison maintains a reference-counted accounting structure that tracks CPU time, memory usage, and file I/O. The `rctl` subsystem can impose hard limits on these resources, and the kernel enforces them by rejecting allocations that would exceed the prison's quota.
 
 ## Flow / Diagram
-The following diagram illustrates the data flow and component hierarchy during jail creation and process confinement:
+The following diagram illustrates the lifecycle and isolation enforcement flow for a jail:
 
 ```mermaid
 flowchart TD
-    A[User Process] -->|jail(2) syscall| B[sys_jail Entry]
-    B --> C{Operation?}
-    C -->|Create/Update| D[jail_set]
-    C -->|Get/Remove| E[jail_get / jail_remove]
-    D --> F[Parse iovec Parameters]
-    F --> G[prison_alloc]
-    G --> H[Initialize struct prison]
-    H --> I{VNET Flag Set?}
-    I -->|Yes| J[vnet_alloc]
-    I -->|No| K[Skip Network Isolation]
-    J --> L[Bind Interfaces to VNET]
-    K --> M[Mount Private DevFS]
-    L --> M
-    M --> N[prison_hold & Hash Table Insert]
-    N --> O[prison_set Process]
-    O --> P[Process Confined]
-    P --> Q[Syscall Enforcement]
-    Q --> R{pr_allow Check}
-    R -->|Allowed| S[Execute Syscall]
-    R -->|Denied| T[Return EPERM]
+    A[User Process] -->|jail_set()| B[kern_jail_set()]
+    B --> C{Validate pr_allow & Flags}
+    C -->|Denied| D[Return EPERM]
+    C -->|Allowed| E[Allocate struct prison]
+    E --> F[Initialize pr_children & pr_devfs_rsnum]
+    E --> G[Setup pr_vnet if PR_VNET]
+    G --> H[Insert into Prison Hierarchy]
+    H --> I[Attach Process to New Prison]
+    I --> J[Process Executes in Jail]
+    J -->|Syscall| K{Check pr_allow Bitmask}
+    K -->|Allowed| L[Execute Syscall]
+    K -->|Denied| M[Return EPERM]
+    J -->|Open VFS Node| N{Check pr_devfs_rsnum}
+    N -->|Mismatch| O[Return EACCES]
+    N -->|Match| P[Return File Descriptor]
+    J -->|Network Call| Q{Check pr_vnet}
+    Q -->|Isolated Stack| R[Route via Jail Network]
+    Q -->|Global Stack| S[Route via Host Network]
 ```
 
 ## Advanced Notes
-Debugging jail behavior often requires examining the `pr_allow` bitmap and the prison's state. The `pr_state` field transitions through `PRISON_STATE_INVALID` to `PRISON_STATE_ALIVE` during creation, and to `PRISON_STATE_DYING` when `jail_remove` is called. Processes in a dying jail continue to run until they exit, but cannot spawn new children or modify parameters.
+Debugging jail issues often involves examining the `kern.jail` sysctl tree, which exposes live `xprison` snapshots. DTrace can trace `kern_jail_set` and `do_jail_attach` probes to monitor jail creation and attachment events. The `pr_state` field transitions through `PRISON_STATE_INVALID`, `PRISON_STATE_ALIVE`, and `PRISON_STATE_DYING`, which can be monitored to detect resource leaks during jail removal.
 
-Performance overhead from jails is minimal because the kernel uses pointer checks and bitwise operations on the `pr_allow` bitmap. The `prison_check()` function typically compiles to a single `test` instruction followed by a conditional jump. However, misconfigured `allow.*` sysctls can lead to subtle privilege escalation bugs. Each `allow.*` parameter controls a specific security boundary: `allow.rawsockets` permits raw socket creation; `allow.sysvipc` grants access to System V IPC; `allow.mount` allows filesystem mounting; `allow.set_hostname` permits hostname changes; `allow.socket_af` defines permitted address families; `allow.chflags` allows file flag modifications; `allow.quotas` permits quota management; and `allow.floatingip` allows floating IP addresses. Administrators should adhere to the principle of least privilege, granting only the exact capabilities required by the workload. Historically, overly permissive `allow.sysvipc` or `allow.rawsockets` flags have been exploited to bypass network isolation.
+Performance overhead for jails is minimal. The primary cost is a pointer chase to the `prison` structure attached to each `proc` and a few bitwise checks against `pr_allow`. Network isolation adds negligible latency when VIMAGE is used, as the virtual stack shares the same packet processing pipeline as the host stack but maintains separate socket tables. The main pitfall is misconfigured `pr_allow` flags, which can either weaken isolation or break expected functionality. Always verify that `allow.mount` and `allow.sysvipc` are explicitly disabled unless required, as they significantly expand the attack surface.
 
-The jail model aligns with capability-based security theory, where privileges are explicitly delegated rather than assumed. Unlike mandatory access control (MAC) systems that label objects, jails label processes and enforce boundaries at the syscall level. This approach reduces complexity but requires careful management of the `pr_allow` flags. The FreeBSD MAC framework can be layered on top of jails to add file-level restrictions, creating a defense-in-depth strategy.
+The capability model in FreeBSD jails aligns with the principle of least privilege. Rather than relying on broad namespace isolation, FreeBSD explicitly gates each privileged operation. This design reduces the risk of privilege escalation through namespace traversal and makes security boundaries auditable via the `pr_allow` bitmask. The reference-counted lifecycle (`pr_ref` and `pr_uref`) prevents use-after-free vulnerabilities during jail removal, a common issue in early container implementations that relied on lazy resource cleanup.
 
 ## Comparison
-Linux implements isolation through a collection of cooperating namespaces (PID, mount, network, UTS, IPC, user) and control groups (cgroups) for resource accounting. FreeBSD's jail subsystem takes a different architectural path: a single `struct prison` encapsulates all isolation boundaries, and a unified capability bitmap (`pr_allow`) gates access to subsystems. This monolithic design simplifies permission checks but can make fine-grained resource control more complex compared to Linux's cgroup v2 hierarchy. FreeBSD compensates with the `rctl(8)` framework, which provides per-prison resource limits similar to cgroups.
+Linux implements isolation through a collection of namespace types (PID, network, mount, UTS, IPC, user) attached to `task_struct`. Each namespace is a separate kernel object, and processes can join multiple namespaces independently. FreeBSD takes a monolithic approach: a single `prison` structure encapsulates all isolation parameters, and processes cannot join namespaces independently of the prison. This simplifies the kernel code but makes fine-grained namespace manipulation less flexible.
 
-macOS/XNU historically supported jails but deprecated them in favor of session-based isolation and later sandboxing mechanisms. OpenBSD relies primarily on hardened chroot and privilege separation for daemons, avoiding kernel-level namespaces entirely. NetBSD implements jails with a design similar to FreeBSD but emphasizes stricter default deny policies and integrates closely with its MAC framework. FreeBSD's approach strikes a balance between simplicity and flexibility, making it a practical choice for hosting untrusted services without the overhead of full virtualization.
+macOS/XNU historically used a jail-like mechanism but transitioned to a capability-based sandbox (`seatbelt` and `sandbox_init()`) that enforces policy files rather than structural isolation. OpenBSD relies on `chroot` combined with `pledge()` and `unveil()`, which restrict system calls and file access at runtime rather than creating separate execution environments. NetBSD uses `chroot` and `pledge` similarly, with `rumpkernel` providing a lightweight virtualized environment for untrusted binaries. FreeBSD's jails offer a middle ground: structural isolation like Linux namespaces, but with a unified permission model and minimal runtime overhead.
+
+FreeBSD's `prison` structure avoids the complexity of Linux's per-namespace reference counting by tying all isolation dimensions to a single object. This reduces the attack surface for cross-namespace exploits but requires careful management of `pr_allow` flags. The VIMAGE subsystem provides network isolation comparable to Linux network namespaces, but uses a virtual switch architecture that shares the host's packet processing pipeline rather than duplicating it.
 
 ## See Also
-- [Process Management — Scheduling and Lifecycle](../../../sys/kern/README_process.md)
-- [VNET — Virtual Network Stacks](../../../sys/net/README_vnet.md)
-- [Capsicum — Capability Mode and Sandboxing](../../../sys/kern/README_capsicum.md)
-- [Kernel Core — Structure and Entry Point](../../sys/README.md)
+- [Process Management — Scheduling and Lifecycle](README_process.md)
+- [VNET — Virtual Network Stacks](../net/README_vnet.md)
+- [Capsicum — Capability Mode and Sandboxing](README_capsicum.md)
+- [Kernel Core — Structure and Entry Point](../README.md)
 
 
 
 - [Process Management — Scheduling and Lifecycle](kern/README_process.md)
-- [Virtual Memory Subsystem — vm_page, UMA, and Pagers](vm/README.md)
 - [Locking Primitives — Mutexes, sx, rmlocks, and Atomics](kern/README_locking.md)
-- [Security — MAC Framework and Privilege Checking](security/README_mac.md)
-- Source directories: `sys/kern/kern_jail.c`, `sys/sys/jail.h`, `sys/net/vnet.h`, `sys/security/mac/mac_framework.h`
+- [Virtual Network Stack — VIMAGE Internals](net/README_vimage.md)
+- [Resource Control — RACCT and RCTL](sys/README_rctl.md)
+- [Device Filesystem — devfs and Mount Namespaces](sys/README_devfs.md)
 
 ---
 
-> _Generated by [DaemonDocs](https://github.com/ocochard/DaemonDocs) on 2026-04-30 05:31 UTC using model `Qwen3.6-35B-A3B-UD-Q4_K_XL` (llama.cpp build `b8961-f42e29fdf`). AI-generated content — verify against source before relying on it._
+> _Generated by [DaemonDocs](https://github.com/ocochard/DaemonDocs) on 2026-05-01 03:33 UTC using model `Qwen3.6-35B-A3B-UD-Q4_K_XL` (llama.cpp build `b8985-27aef3dd9`). AI-generated content — verify against source before relying on it._
