@@ -9,113 +9,297 @@
 ---
 
 
-> ⚠ **UNVERIFIED DRAFT** — revisions regressed; kept revision 1 (8/9 criteria) over revision 3 (7/9); reviewer did not explicitly approve this draft. Treat claims as suspect until manually reviewed.
+> ⚠ **UNVERIFIED DRAFT** — reviewer did not explicitly approve this draft; fact-check revision failed — paths/structs may be hallucinated. Treat claims as suspect until manually reviewed.
 
 
 ## Quick Summary
-FreeBSD's device driver framework, known as newbus, provides a uniform abstraction for hardware enumeration and driver attachment. Instead of hardware being hardcoded into the kernel, newbus discovers devices on the system bus (PCI, USB, ACPI, etc.) and matches them with available drivers. This decoupling allows drivers to be compiled as loadable modules, enabling dynamic hardware support without a full kernel rebuild. The framework manages the entire lifecycle of a device, from initial detection and driver probing to resource allocation (memory, interrupts, I/O ports) and eventual detachment.
 
-At its core, newbus relies on a hierarchical tree of `device_t` objects, each representing a hardware component and its associated driver. The framework coordinates these objects through `devclass` structures, which group devices of the same type and maintain lists of candidate drivers. When a new device is added, newbus iterates through the driver list, invoking a `probe` method to verify compatibility. If successful, the `attach` method is called to initialize the driver and request system resources. This model ensures that drivers only claim hardware they support and that system resources are allocated without conflicts.
+The FreeBSD device driver framework, known as *newbus*, provides a hierarchical model for discovering, enumerating, and managing hardware devices. At its core, newbus represents the system's hardware topology as a tree: a root "nexus" device represents the motherboard or system bus, and child devices attach to parents representing physical buses such as PCI, USB, or ISA. Each device node in this tree carries state about whether it has been probed (identified), attached (its driver bound), and enabled for operation. This tree structure allows the kernel to reason about resource dependencies — for example, a PCI network card depends on the PCI bus controller, which in turn depends on the system I/O APIC.
 
-Resource management is tightly integrated into the framework. Drivers request memory ranges, IRQ lines, and DMA handles through a resource manager (`rman`), which guarantees exclusive access and handles conflicts. Interrupt handling is abstracted via `bus_setup_intr`, allowing drivers to register interrupt handlers that are automatically bound to the correct CPU and priority. The framework also supports suspend and resume operations, ensuring that devices and their drivers can safely transition between power states. By standardizing these interactions, newbus simplifies driver development and provides a consistent interface for both kernel developers and system administrators.
+Drivers register themselves with the framework by declaring a driver structure and calling `DRIVER_MODULE()`. When the framework discovers a potential device — either through firmware tables, device tree blobs, or bus-specific enumeration — it searches the registered drivers for a match based on the device's vendor, device ID, and compatible strings. The first matching driver's `probe` method is called to confirm the device is actually supported; if the probe succeeds, the driver's `attach` method is called to initialize the device and make it available to the rest of the system.
+
+Resource management in newbus is handled through the `rman` subsystem, integrated with bus-specific operations. Drivers request resources — memory regions, I/O ports, and interrupt lines — through bus functions like `bus_alloc_resource_any()` and `bus_setup_intr()`. The bus layer mediates these requests, ensuring that resources are not double-allocated and that parent buses are consulted when a child bus cannot satisfy a request directly. This resource hierarchy is critical on platforms like Alpha or ARM, where interrupt controllers and bus bridges require explicit programming to route resources correctly.
+
+The `devclass` subsystem maintains the mapping between device types and their driver instances. Each devclass represents a logical class of devices (for example, all "ahci" controllers form one devclass), and stores an array of device pointers indexed by unit number. This structure allows drivers to look up other devices of the same type, and provides the foundation for userspace tools like `devinfo` and `pciconf` to enumerate the system's hardware.
 
 ## Architecture
-The implementation of newbus resides primarily in `sys/kern/subr_bus.c`, with public interfaces declared in `sys/sys/bus.h`. The framework is initialized early in the boot process via the `sysinit` subsystem, ensuring that bus topology and device trees are ready before higher-level I/O subsystems request hardware access. Newbus uses a layered architecture where each bus type (PCI, ACPI, etc.) implements a `bus_methods` structure that defines how child devices are enumerated, resources are allocated, and interrupts are routed.
 
-Drivers register themselves using the `DRIVER_MODULE` macro, which creates a `driver_module_data` structure containing pointers to the driver's methods and its associated `devclass`. During boot, `devclass_add_driver` links the driver to its `devclass`, making it available for device matching. The framework employs a "generic" fallback mechanism: if a bus driver does not override a method, `bus_generic_probe` or `bus_generic_attach` is invoked. These generic methods provide default behavior, such as allocating a software context (`softc`) or iterating through child devices.
+The newbus framework lives primarily in `sys/kern/subr_bus.c`, with public interfaces declared in `sys/sys/bus.h`. The core data structures are `_device` (the internal device node) and `devclass` (the driver-to-device mapping). These are defined in `subr_bus.c` rather than in a header to prevent external code from depending on internal layout.
 
-Resource allocation is handled by the resource manager (`sys/kern/subr_rman.c`), which is tightly coupled with newbus. Newbus uses `resource_list_entry` structures to track requested resources (type, start, count, flags) before they are allocated. When `device_probe` or `device_attach` runs, it calls `bus_alloc_resource` to request hardware resources. The bus driver's implementation of `bus_generic_alloc_resource` translates these requests into bus-specific operations, such as configuring PCI configuration space registers or ACPI `_CRS` methods. The `bus_space` abstraction further isolates drivers from bus-specific I/O and memory mapping details, allowing drivers to use uniform `bus_space_handle_t` and `bus_space_tag_t` types regardless of the underlying hardware.
+### The Device Tree
 
-## Key Data Structures
-The heart of the framework is the `devclass` structure, which acts as a registry for a specific device type and its candidate drivers. From `sys/kern/subr_bus.c`:
+Every device in the tree is represented by `struct _device`, defined in `sys/kern/subr_bus.c`. The structure contains:
+
+```c
+struct _device {
+    /*
+     * A device is an object in the hierarchy.
+     */
+    kobj_object_t the;
+    TAILQ_ENTRY(_device) hierarchy;
+    device_t parent;
+    device_t child;
+    TAILQ_HEAD(, _device) children;
+    devclass_t devclass;
+    const char *name;
+    int unit;
+    int flags;
+    device_state_t state;
+    void *softc;
+    LIST_HEAD(, device_prop_elm) props;
+    resource_list_t resources;
+};
+```
+
+The `hierarchy` field links devices into their parent's child list, while `parent` points to the bus device that discovered this device. The `softc` field is driver-private data, allocated during `attach` and freed during `detach`. The `state` field tracks the device's lifecycle through the `device_state_t` enum defined in `sys/sys/bus.h`:
+
+```c
+typedef enum device_state {
+    DS_NOTPRESENT = 10,
+    DS_ALIVE = 20,
+    DS_ATTACHING = 25,
+    DS_ATTACHED = 30,
+} device_state_t;
+```
+
+Devices start in `DS_NOTPRESENT`, transition to `DS_ALIVE` after a successful `probe`, and reach `DS_ATTACHED` after `attach` completes.
+
+### Devclass and Driver Registration
+
+A `devclass` represents a logical grouping of devices that share the same driver type. It is defined in `sys/kern/subr_bus.c`:
+
 ```c
 struct devclass {
-	TAILQ_ENTRY(devclass) link;
-	devclass_t	parent;		/* parent in devclass hierarchy */
-	driver_list_t	drivers;	/* bus devclasses store drivers for bus */
-	char		*name;
-	device_t	*devices;	/* array of devices indexed by unit */
-	int		maxunit;	/* size of devices array */
-	int		flags;
-#define DC_HAS_CHILDREN		1
-	struct sysctl_ctx_list sysctl_ctx;
-	struct sysctl_oid *sysctl_tree;
+    TAILQ_ENTRY(devclass) link;
+    devclass_t parent;
+    driver_list_t drivers;
+    char *name;
+    device_t *devices;
+    int maxunit;
+    int flags;
+    struct sysctl_oid *sysctl_tree;
 };
 ```
-Each `devclass` maintains a linked list of `driverlink` structures, which point to `kobj_class_t` driver objects. The `devices` array is allocated dynamically to provide O(1) lookup by unit number, solving the problem of quickly accessing a specific device instance without traversing the entire device tree.
 
-Drivers are tracked via `driverlink`, defined in `sys/kern/subr_bus.c`:
-```c
-struct driverlink {
-	kobj_class_t	driver;
-	TAILQ_ENTRY(driverlink) link;	/* list of drivers in devclass */
-	int		pass;
-	int		flags;
-#define DL_DEFERRED_PROBE	1	/* Probe deferred on this */
-	TAILQ_ENTRY(driverlink) passlink;
-};
-```
-The `pass` field controls the order in which drivers are probed, allowing critical drivers to run before others. The `DL_DEFERRED_PROBE` flag indicates that probing was postponed, typically due to missing resources or a parent device not being ready, preventing race conditions during early boot.
+The `devices` array is indexed by unit number, allowing drivers to look up peers by unit. The `drivers` list holds `driverlink` entries — each representing a driver class registered with this devclass. When a driver calls `devclass_add_driver()`, its class is added to the devclass's driver list.
 
-Devices themselves are represented by `_device` (aliased as `device_t`). While the full definition is extensive, it contains a `resource_list` to track hardware requests, a pointer to its `devclass`, and a `softc` pointer allocated during attachment. For userspace visibility, `sys/sys/bus.h` defines `struct u_device`, which exports device state and metadata through the `devctl` interface:
+Drivers register using the `DRIVER_MODULE()` macro, which creates a module descriptor and invokes `devclass_add_driver()` at load time. The driver's `probe` and `attach` methods are stored in the driver's method table, accessible via `cf_get_method()` from the configuration framework.
+
+### Resource Management
+
+Resources are managed through the `rman` subsystem, integrated with bus operations. Each device maintains a `resource_list_t` containing `resource_list_entry` structures. When a driver calls `bus_alloc_resource()`, the bus searches its child devices' resource lists and, if necessary, delegates to the parent bus.
+
+The bus interface provides generic implementations for resource operations. Functions like `bus_generic_alloc_resource()` and `bus_generic_rl_alloc_resource()` walk the device tree, consulting parent buses when a child cannot satisfy a request. Interrupt setup uses `bus_setup_intr()`, which binds an interrupt handler to a specific resource and manages the activation/deactivation lifecycle through `bus_activate_resource()` and `bus_deactivate_resource()`.
+
+The `bus_space` abstraction, defined in `machine/bus.h` and `sys/bus.h`, provides a uniform interface for memory-mapped and I/O-port access. The `bus_space_tag_t` and `bus_space_handle_t` types abstract away platform-specific access patterns, allowing drivers to use `bus_space_map()`, `bus_space_read_4()`, and similar functions without knowing the underlying hardware details.
+
+DMA resources are managed through a separate subsystem using `bus_dma_tag_t` and `bus_dmamap_t` types. Drivers create a DMA tag with `bus_dma_tag_create()` to specify alignment, boundary, and maximum transfer size constraints. The tag is then used to allocate DMA maps via `bus_dmamap_create()`, which are populated with physical mappings through `bus_dmamap_load()`. This two-level abstraction allows the bus layer to handle IOMMU translation, bounce buffering, and scatter-gather list construction transparently. DMA maps are unloaded with `bus_dmamap_unload()` and destroyed with `bus_dma_tag_destroy()`.
+
+## Key Data Structures
+
+### struct _device (sys/kern/subr_bus.c)
+
+The internal device node, named `_device` to avoid conflicts with user-space `struct device`. Key fields:
+
+- `the` — The kobj_object base, enabling object-oriented method dispatch
+- `parent` — Pointer to the parent bus device
+- `children` — Tail queue of child devices
+- `devclass` — Pointer to the devclass this device belongs to
+- `name` — Device name (e.g., "eth0", "ahci0")
+- `unit` — Unit number within the devclass
+- `state` — Current lifecycle state (DS_NOTPRESENT, DS_ALIVE, DS_ATTACHING, DS_ATTACHED)
+- `softc` — Driver-allocated private data
+- `resources` — Resource list managed by rman
+
+The name `_device` was chosen to prevent type confusion with other subsystems that define their own `struct device`.
+
+### struct devclass (sys/kern/subr_bus.c)
+
+Maps device types to their driver instances:
+
+- `name` — Devclass name (e.g., "ahci", "pci")
+- `devices` — Array of device_t pointers, indexed by unit number
+- `maxunit` — Size of the devices array
+- `drivers` — List of driverlink entries for registered drivers
+- `sysctl_tree` — Sysctl interface for userspace enumeration
+
+### struct u_device (sys/sys/bus.h)
+
+Exported device information for userspace via `sysctl hw.bus`:
+
 ```c
 struct u_device {
-	uintptr_t	dv_handle;
-	uintptr_t	dv_parent;
-	uint32_t	dv_devflags;		/**< @brief API Flags for device */
-	uint16_t	dv_flags;		/**< @brief flags for dev state */
-	device_state_t	dv_state;		/**< @brief State of attachment */
-	char		dv_fields[BUS_USER_BUFFER]; /**< @brief NUL terminated fields */
-	/* name (name of the device in tree) */
-	/* desc (driver description) */
-	/* drivername (Name of driver without unit number) */
-	/* pnpinfo (Plug and play information from bus) */
-	/* location (Location of device on parent */
-	/* NUL */
+    uintptr_t dv_handle;
+    uintptr_t dv_parent;
+    uint32_t dv_devflags;
+    uint16_t dv_flags;
+    device_state_t dv_state;
+    char dv_fields[BUS_USER_BUFFER];
 };
 ```
 
+The `dv_fields` buffer contains NUL-separated strings: name, description, driver name, PnP info, and location. This compact format allows userspace tools to enumerate the entire device tree with a single sysctl call.
+
+### struct u_businfo (sys/sys/bus.h)
+
+```c
+struct u_businfo {
+    int ub_version;
+    int ub_generation;
+};
+```
+
+The `ub_generation` counter increments whenever the device tree changes, allowing userspace to detect additions or removals without rescanning the entire tree.
+
+### device_state_t (sys/sys/bus.h)
+
+```c
+typedef enum device_state {
+    DS_NOTPRESENT = 10,
+    DS_ALIVE = 20,
+    DS_ATTACHING = 25,
+    DS_ATTACHED = 30,
+} device_state_t;
+```
+
+State transitions: `DS_NOTPRESENT` → `DS_ALIVE` (probe success) → `DS_ATTACHING` → `DS_ATTACHED`. Failed probes return the device to `DS_NOTPRESENT`.
+
 ## Deep Dive
-The device attachment lifecycle begins when a bus driver discovers a new hardware component. The bus driver calls `device_add_child(parent, name, unit)` to create a new `device_t` object. This function allocates the device, assigns it a unit number from its `devclass`, and inserts it into the parent's child list. If the unit number is wildcard (`-1`), `devclass_alloc_unit` finds the next available slot.
 
-Once the device is created, the framework initiates the probe phase by calling `device_probe(dev)`. This function iterates through the `devclass`'s `driverlink` list, invoking each driver's `probe` method. The probe method checks hardware registers or ACPI tables to verify compatibility. If it returns 0, the driver is considered a match. If multiple drivers match, the one with the lowest `pass` value wins, or the first one in the list if passes are equal. A probe failure returns a positive error code, signaling newbus to try the next driver.
+### Device Discovery and Enumeration
 
-After a driver is selected, `device_attach(dev)` is called. The default implementation, `bus_generic_attach`, allocates a `softc` structure using `UMA` (if not provided externally) and calls the driver's `attach` method. The driver then requests resources using `bus_alloc_resource(dev, rid, start, end, count, flags)`. For example, a network driver might request an I/O port range and an IRQ. The resource manager checks for conflicts and maps the memory if requested. The `resource_list_entry` structures track these requests before they are committed, allowing rollback if allocation fails.
+Device discovery begins with the bus that connects to the root nexus. On x86_64, the ACPI subsystem creates device nodes for PCI devices from the MADT and MCFG tables. On ARM, the device tree parser creates nodes from the flattened device tree (FDT). Each bus device implements a `bus_child_present()` method that checks for hardware at specific addresses or configuration spaces.
 
-Interrupt handling is set up via `bus_setup_intr(dev, res, flags, handler, arg, &cookiep)`. This function binds the driver's interrupt handler to the allocated IRQ, configuring the CPU's interrupt controller and setting the handler's priority. During detach, the reverse occurs: `bus_teardown_intr` removes the handler, `bus_release_resource` frees hardware resources, and the driver's `detach` method cleans up driver-specific state. `device_busy()` and `device_unbusy()` are used to prevent detachment while I/O operations are in progress.
+When a bus discovers a potential child, it calls `device_add_child()`:
+
+```c
+device_t device_add_child(device_t bus, int order, const char *name, int unit)
+```
+
+This function creates a new `_device` structure, sets its parent to `bus`, and adds it to the parent's child queue. The `order` parameter controls probe priority — lower-order devices are probed first. The `name` parameter specifies the devclass to search for matching drivers.
+
+After all children are added, `bus_attach_children()` is called. This function iterates over the child queue and calls `device_probe_and_attach()` for each device.
+
+### Probe and Attach Lifecycle
+
+The probe-attach sequence follows a strict order:
+
+1. **Probe**: `device_probe()` calls the driver's `dev_probe` method. The driver checks vendor/device IDs, compatible strings, and registers. If the device is supported, the driver returns 0 and may call `device_set_desc()` to set a description string.
+
+2. **Attach**: `device_attach()` calls the driver's `dev_attach` method. The driver allocates its softc via `device_get_softc()`, requests resources via `bus_alloc_resource_any()`, sets up interrupts via `bus_setup_intr()`, and registers character device switches if applicable.
+
+The generic implementations in `subr_bus.c` provide fallback behavior:
+
+```c
+int bus_generic_probe(device_t dev)
+{
+    /* Check if any driver claims this device */
+    /* Return 0 if a driver matches, ENXIO otherwise */
+}
+
+int bus_generic_attach(device_t dev)
+{
+    /* Call child attach methods */
+}
+```
+
+`bus_generic_probe()` iterates over the devclass's driver list, calling each driver's probe method in turn. The first driver to return 0 wins. If no driver matches, the device remains in `DS_NOTPRESENT`.
+
+### Resource Allocation
+
+Drivers request resources through the bus interface. The `bus_alloc_resource()` function takes a device, resource type (SYS_RES_IRQ, SYS_RES_MEMORY, SYS_RES_IOPORT), and a resource specification. The bus searches its own resource list and, if necessary, delegates to the parent bus.
+
+For PCI devices, the `pcib` bus driver reads configuration space to determine available resources, then programs the BAR registers during attach. For ISA devices, the `isa` bus driver uses the system's resource map to allocate from predefined ranges.
+
+Interrupt setup uses `bus_setup_intr()`, which:
+
+1. Activates the resource via `bus_activate_resource()`
+2. Calls the driver's `intr_routines->setup()` method
+3. Registers the handler with the interrupt controller
+
+The `bus_teardown_intr()` function reverses this process, called during detach or suspend.
+
+### The devclass System
+
+Devclasses are created with `devclass_create()`, which allocates a `devclass` structure and registers it with the framework. The `devclass_find()` function looks up a devclass by name, allowing drivers to reference peer devices:
+
+```c
+devclass_t dc = devclass_find("ahci");
+device_t dev = devclass_get_device(dc, unit);
+```
+
+The `devclass_get_softc()` function returns the softc of a peer device, enabling drivers to access shared state.
 
 ## Flow / Diagram
+
+The following sequence diagram shows the device discovery and attachment flow:
+
 ```mermaid
 sequenceDiagram
-  participant Bus as Bus Driver (e.g., PCI)
-  participant NewBus as newbus Framework
-  participant DevClass as devclass Registry
-  participant Driver as Device Driver
-  participant Rman as Resource Manager
+    participant Firmware as Firmware/DT
+    participant Bus as Bus Device (e.g., PCI)
+    participant Newbus as subr_bus.c
+    participant Devclass as Devclass
+    participant Driver as Driver Module
+    participant Rman as Resource Manager
 
-  Bus->>NewBus: device_add_child(parent, name, unit)
-  NewBus->>DevClass: Allocate device_t, assign unit
-  NewBus->>Driver: device_probe(dev)
-  Driver-->>NewBus: return 0 (match)
-  NewBus->>Driver: device_attach(dev)
-  Driver->>Rman: bus_alloc_resource(IRQ, MEM)
-  Rman-->>Driver: return resource handle
-  Driver->>Rman: bus_setup_intr(IRQ, handler)
-  Rman-->>Driver: interrupt bound
-  Driver-->>NewBus: attach complete
+    Firmware->>Bus: Enumerate hardware (MADT, FDT, etc.)
+    Bus->>Newbus: device_add_child(bus, order, name, unit)
+    Newbus->>Newbus: Create struct _device
+    Newbus->>Newbus: Add to parent's child queue
+    Bus->>Newbus: bus_attach_children()
+    loop For each child
+        Newbus->>Devclass: devclass_find(name)
+        Devclass-->>Newbus: Return devclass_t
+        Newbus->>Driver: dev_probe method (via cf_get_method)
+        alt Probe succeeds
+            Driver-->>Newbus: Return 0
+            Newbus->>Newbus: device_set_state(DS_ALIVE)
+            Newbus->>Driver: dev_attach method
+            Driver->>Rman: bus_alloc_resource_any()
+            Rman-->>Driver: Return resource handle
+            Driver->>Rman: bus_setup_intr()
+            Rman->>Rman: bus_activate_resource()
+            Driver->>Newbus: Register cdevsw / sysctl
+            Newbus->>Newbus: device_set_state(DS_ATTACHED)
+        else Probe fails
+            Driver-->>Newbus: Return ENXIO
+            Newbus->>Newbus: Keep DS_NOTPRESENT
+        end
+    end
 ```
 
 ## Advanced Notes
-Debugging newbus issues often involves examining `dmesg` output for probe failures or resource conflicts. The `devinfo` command provides a userspace view of the device tree, mapping to the `u_device` structure. The `sysctl hw.bus.disable_failed_devices` tunable can be used to prevent the system from retrying attachment on devices that fail during the first boot attempt, which is useful for isolating flaky hardware.
 
-A common pitfall is resource starvation: if a driver requests a resource range that overlaps with another driver's allocation, `bus_alloc_resource` fails. Developers must ensure that resource requests are flexible (e.g., using `RF_ACTIVE` flags and wide ranges) or use ACPI `_CRS` methods to let the BIOS provide the correct layout. Another issue is deferred probing: if a driver depends on a device that hasn't attached yet, it must return `EPROBE_DEFER` from `probe`, causing newbus to retry later. Overuse of deferral can mask initialization order bugs and significantly slow down boot times.
+### Debugging with DTrace
 
-Performance-wise, newbus minimizes overhead by using `UMA` for `softc` allocation and caching device lookups in the `devclass` array. However, iterating through long `driverlink` lists during probe can slow down boot on systems with many devices. The `pass` field mitigates this by allowing critical drivers to be probed first, failing fast on incompatible hardware. The `bus_topo_mtx` lock protects the device tree during topology changes, but drivers should avoid holding it during long-running operations to prevent deadlocks.
+Newbus provides SDT probes for key lifecycle events. The `newbus` provider includes probes such as `device-probe-start`, `device-probe-done`, `device-attach-start`, and `device-attach-done`. These probes carry the device name, unit number, and return code, allowing you to trace the entire attachment sequence:
 
-## Comparison
-Linux uses a similar hierarchical model but implements it differently. FreeBSD's `devclass` directly maps to a device type and maintains the driver list, whereas Linux separates concerns into `struct device` (hardware entity), `struct driver` (code), and `struct bus_type` (enumeration). Linux drivers register via `driver_register` and match using `of_match_table` or `pci_device_id` arrays, while FreeBSD uses the `DRIVER_MODULE` macro and `kobj_class_t` method tables. Linux's resource management uses `request_region` and `request_irq`, which are less tightly integrated into the core driver model than FreeBSD's `bus_alloc_resource`.
+```
+dtrace -n 'newbus$target::device-probe-done { printf("%s%d: probe returned %d", arg0, arg1, arg2); }'
+```
 
-macOS/XNU's I/O Kit takes a more object-oriented approach, using `IOService` and `IOServiceMatching` for driver matching. Instead of a simple probe/attach lifecycle, I/O Kit relies on `registerService` and `start` methods, with a complex property tree for configuration. NetBSD and OpenBSD share similarities with FreeBSD's newbus, as they all evolved from BSD's device driver framework, but NetBSD uses a more generic `config` system that abstracts bus-specific details further. OpenBSD has simplified newbus over time, removing some of the more complex deferred probing mechanisms to improve reliability.
+The `devclass_get_devices()` function can be called from DTrace to enumerate all devices in a devclass, useful for tracking down missing drivers.
+
+### Performance Considerations
+
+The device tree is traversed during probe and attach, which can be slow on systems with many devices. The `pass` field in `driverlink` controls probe ordering — drivers can register with different passes to ensure that bus drivers are probed before their children. The `DF_DEFERRED_PROBE` flag allows drivers to defer probing until a dependency is satisfied.
+
+The `device_busy()` and `device_unbusy()` functions provide reference counting for devices during suspend/resume and hotplug operations. These functions prevent detachment while a device is in use, avoiding use-after-free bugs.
+
+### Suspend and Resume
+
+During system suspend, `bus_generic_suspend()` is called on each device, which in turn calls the driver's `dev_suspend` method. The driver should save device state, disable interrupts, and mark the device as suspended (DF_SUSPENDED flag). During resume, `bus_generic_resume()` reverses this process. The `bus_suspend_intr()` and `bus_resume_intr()` functions handle interrupt state specially, ensuring that interrupts are not delivered to suspended drivers.
+
+### Common Pitfalls
+
+1. **Resource leaks**: Drivers that allocate resources in `attach` but fail to free them in `detach` will cause resource exhaustion. Always pair `bus_alloc_resource()` with `bus_free_resource()` in the detach path.
+
+2. **Softc lifetime**: The softc is allocated by `device_get_softc()` during attach and freed during detach. Accessing softc after detach is a use-after-free bug.
+
+3. **Probe ordering**: If a driver depends on another device being attached first, it should use `device_add_child_ordered()` with an appropriate order value, or defer probing with `DF_DEFERRED_PROBE`.
+
+4. **Interrupt handling**: Drivers must call `bus_setup_intr()` to register interrupt handlers and `bus_teardown_intr()` to unregister them. Calling `bus_setup_intr()` directly bypasses the bus framework and can cause resource conflicts.
 
 ## See Also
 - [Interrupt Handling — Threads, Filters, and Dispatch](README_intr.md)
@@ -124,10 +308,20 @@ macOS/XNU's I/O Kit takes a more object-oriented approach, using `IOService` and
 
 
 
-- `sys/kern/subr_bus.c`
-- `sys/sys/bus.h`
-- `sys/kern/subr_rman.c`
+**Source directories:**
+- [`sys/kern/subr_bus.c`](subr_bus.c) — Core newbus implementation
+- [`sys/sys/bus.h`](../sys/bus.h) — Public newbus interfaces
+- [`sys/kern/kern_conf.c`](kern_conf.c) — Character device management
+- [`sys/kern/kern_devctl.c`](kern_devctl.c) — Device control and hotplug events
+- [`sys/kern/subr_rman.c`](subr_rman.c) — Resource manager
+- `sys/dev/pci/pcib.c` — PCI bus implementation
+- `sys/dev/isa/isa_bus.c` — ISA bus implementation
+- [`sys/arm64/arm64/nexus.c`](../arm64/arm64/nexus.c) — ARM64 platform bus
+
+**Related documentation:**
+- FreeBSD man9: `driver.9`, `device.9`, `device_probe_and_attach.9`
+- FreeBSD Handbook: Chapter 14. Newbus
 
 ---
 
-> _Generated by [DaemonDocs](https://github.com/ocochard/DaemonDocs) on 2026-05-01 03:13 UTC using model `Qwen3.6-35B-A3B-UD-Q4_K_XL` (llama.cpp build `b8985-27aef3dd9`). AI-generated content — verify against source before relying on it._
+> _Generated by [DaemonDocs](https://github.com/ocochard/DaemonDocs) on 2026-05-04 02:17 UTC using model `Qwen3.6-35B-A3B-UD-Q8_K_XL` (llama.cpp build `b8985-27aef3dd9`). AI-generated content — verify against source before relying on it._

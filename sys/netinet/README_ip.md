@@ -205,12 +205,12 @@ flowchart TD
 
 
 
-- `sys/netinet/ip_input.c`
-- `sys/netinet/ip_output.c`
-- `sys/netinet6/ip6_input.c`
-- `sys/netinet6/ip6_output.c`
-- `sys/net/route/nhop.c`
-- `sys/net/route/fib_algo.c`
+- [`sys/netinet/ip_input.c`](ip_input.c)
+- [`sys/netinet/ip_output.c`](ip_output.c)
+- [`sys/netinet6/ip6_input.c`](../netinet6/ip6_input.c)
+- [`sys/netinet6/ip6_output.c`](../netinet6/ip6_output.c)
+- [`sys/net/route/nhop.c`](../net/route/nhop.c)
+- [`sys/net/route/fib_algo.c`](../net/route/fib_algo.c)
 
 ---
 

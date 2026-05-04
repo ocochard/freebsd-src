@@ -368,12 +368,13 @@ The mbuf design has several performance implications:
 - [NIC Drivers — from if_vr to iflib to if_cxgbe](../dev/README_nic_drivers.md)
 
 
-- FreeBSD man9: mbuf(9), mbchain(9), mbuf_tags(9), zone(9)
+
+- FreeBSD man9: [mbuf(9)](../../share/man/man9/mbuf.9), [mbchain(9)](../../share/man/man9/mbchain.9), [mbuf_tags(9)](../../share/man/man9/mbuf_tags.9), [zone(9)](../../share/man/man9/zone.9)
 
 Source files:
-- `sys/sys/mbuf.h` — mbuf structure definitions, flags, and macros
-- `sys/kern/uipc_mbuf.c` — allocator functions, UMA zone management, SDT probes
-- `sys/kern/uipc_mbuf2.c` — chain manipulation functions (m_pullup, m_copydata, m_adj)
+- [`sys/sys/mbuf.h`](mbuf.h) — mbuf structure definitions, flags, and macros
+- [`sys/kern/uipc_mbuf.c`](../kern/uipc_mbuf.c) — allocator functions, UMA zone management, SDT probes
+- [`sys/kern/uipc_mbuf2.c`](../kern/uipc_mbuf2.c) — chain manipulation functions (m_pullup, m_copydata, m_adj)
 
 ---
 

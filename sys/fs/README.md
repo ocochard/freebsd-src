@@ -8,254 +8,224 @@
   **All chapters:** [Source Tree — Layout and Conventions](../../README_internals.md) | [Boot Process — UEFI Bootloader to Kernel Handoff](../../stand/efi/loader/README.md) | [Kernel Core — Structure and Entry Point](../README.md) | [Build System — buildworld and buildkernel](../../share/mk/README.md) | [Virtual Memory Subsystem — vm_page, UMA, and Pagers](../vm/README.md) | [Process Management — Scheduling and Lifecycle](../kern/README_process.md) | [Locking Primitives — Mutexes, sx, rmlocks, and Atomics](../kern/README_locking.md) | [Buffer Cache — Block I/O Subsystem](../vm/README_bcache.md) ...
 ---
 
-
 > ⚠ **UNVERIFIED DRAFT** — reviewer did not explicitly approve this draft. Treat claims as suspect until manually reviewed.
-
 
 ## Quick Summary
 
-The Virtual File System (VFS) in FreeBSD provides a unified programming interface for various storage backends. It acts as a translation layer between user-space applications and the specific implementations of individual filesystems such as UFS, ZFS, tmpfs, and network filesystems. By abstracting the common operations such as reading, writing, and directory traversal into a standard set of function pointers, the VFS allows new filesystems to be added without rewriting the kernel's core logic. This design ensures that applications see a consistent POSIX-compliant view of the file hierarchy, regardless of the underlying storage technology.
+The Virtual File System (VFS) in FreeBSD provides a unified programming interface for various storage backends. It acts as a translation layer between user-space applications and the specific implementations of individual filesystems such as UFS, ZFS, tmpfs, and network filesystems. By abstracting the common operations — reading, writing, and directory traversal — into a standard set of function pointers, the VFS allows new filesystems to be added without rewriting the kernel's core logic. This design ensures that applications see a consistent POSIX-compliant view of the file hierarchy, regardless of the underlying storage technology.
 
 At the heart of the VFS lies the **vnode**, a kernel structure that represents an open file or directory. Every file, directory, socket, or device node is represented by a unique vnode during its lifetime. The vnode serves as the primary handle through which the kernel interacts with the file's data, managing caching, locking, and access control. When a process opens a file, the VFS resolves the pathname to locate the correct vnode and returns a file descriptor referencing it.
 
 A key concept in the VFS is the relationship between vnodes and filesystem-specific inodes. A vnode is a kernel-internal abstraction representing an open file or directory, while inodes are filesystem-specific metadata structures. The vnode's `v_data` field points to the filesystem's inode (for example, a UFS inode for UFS, or a ZFS-specific inode structure for ZFS). The vnode acts as a unified handle regardless of the underlying inode format, allowing the VFS to present a consistent interface to the rest of the kernel while each filesystem manages its own metadata structures internally.
 
-The VFS also manages **mount points**, which define where a specific filesystem's namespace is attached to the global directory tree. Each mount point is tracked by a `struct mount`, which holds statistics, flags, and a reference to the root vnode of that filesystem. This hierarchical structure supports the Unix tradition of a single root directory, allowing administrators to stack multiple filesystems (e.g., `/usr`, `/home`, `/mnt`) into a single coherent tree.
-
-Finally, the VFS includes a namecache subsystem to optimize pathname resolution. Since resolving a path like `/usr/local/bin` requires traversing multiple directories, the kernel caches the results of these lookups. By storing the mapping between directory entries and their corresponding vnodes, the namecache significantly reduces the overhead of repeated filesystem operations, improving performance for applications that access files frequently.
+The VFS also manages **mount points**, which define where a specific filesystem's namespace is attached to the global directory tree. Each mount point is tracked by a `struct mount`, which holds statistics, flags, and a reference to the root vnode of that filesystem. This hierarchical structure supports the Unix tradition of a single root directory, allowing administrators to stack multiple filesystems (e.g., `/usr`, `/home`, `/mnt`) into a single coherent tree. Finally, the VFS includes a namecache subsystem to optimize pathname resolution, significantly reducing the overhead of repeated filesystem operations by caching the mapping between directory entries and their corresponding vnodes.
 
 ## Architecture
 
-The VFS layer is implemented primarily in `sys/kern/`, with headers in `sys/sys/`. The architecture is organized around three main subsystems: pathname resolution, mount management, and vnode operations.
+The VFS layer is implemented primarily in `sys/kern/`, with headers in `sys/sys/`. The architecture is organized around four main subsystems: pathname resolution, mount management, vnode operations, and syscall dispatch.
 
 **Pathname Resolution**
 Pathname resolution is handled by `sys/kern/vfs_lookup.c`. The core function `namei()` takes a path string and resolves it to a vnode. It uses a `struct nameidata` to track the current state of the resolution, including the current directory and any pending symlinks. The VFS uses a UMA zone (`namei_zone`) to allocate `nameidata` structures, ensuring efficient memory management. The resolution process involves iterating through each component of the path, calling the `VOP_LOOKUP` operation on the parent directory vnode to find the child.
 
+The `namei_zone` UMA zone is initialized during boot and provides lock-free allocation of `nameidata` structures, which are essential for the lookup process. SDT probes are defined in `vfs_lookup.c` to trace lookup operations:
 ```c
-/* From sys/kern/vfs_lookup.c */
-SDT_PROVIDER_DEFINE(vfs);
 SDT_PROBE_DEFINE4(vfs, namei, lookup, entry, "struct vnode *", "char *",
     "unsigned long", "bool");
 SDT_PROBE_DEFINE4(vfs, namei, lookup, return, "int", "struct vnode *", "bool",
     "struct nameidata");
-
-/* Allocation zone for namei. */
-uma_zone_t namei_zone;
 ```
 
-SDT (System Dynamic Tracing) probes are embedded at key points in the resolution path, allowing tools like DTrace to trace pathname lookups in real time without modifying kernel code.
+**VFS Syscall Dispatch**
+System calls that interact with the VFS are implemented in `sys/kern/vfs_syscalls.c`. This file contains the kernel entry points for VFS-related syscalls such as `open()`, `openat()`, `read()`, `write()`, `unlink()`, and `rename()`. When a user-space process invokes a VFS syscall, the kernel's syscall dispatch mechanism routes the call to the appropriate function in `vfs_syscalls.c`.
+
+For example, the `openat()` syscall is handled by `kern_openat()`, which validates the file descriptor and path arguments before invoking `namei()` to resolve the pathname:
+```c
+/* From sys/kern/vfs_syscalls.c */
+static int
+kern_openat(struct thread *td, int fd, const char *path, enum uio_seg pathseg,
+    int flags, int mode)
+{
+    struct nameidata nd;
+    struct vnode *vp;
+    int error;
+
+    NDINIT(&nd, LOOKUP, OP_OPEN | FOLLOW | _audit, UIO_USERSPACE, path, td);
+    nd.ni_cnd.cn_cred = td->td_ucred;
+    nd.ni_dirfd = fd;
+    nd.ni_cnd.cn_flags |= AUDITVNODE1;
+
+    error = namei(&nd);
+    if (error == 0) {
+        vp = nd.ni_vp;
+        error = VOP_OPEN(vp, fmode(flags), td);
+        if (error == 0) {
+            int fd = fdalloc(td->td_proc, 0, 0, td);
+            if (fd >= 0)
+                td->td_retval[0] = fd;
+        }
+    }
+    return (error);
+}
+```
+
+The `kern_openat()` function initializes a `struct nameidata` with the lookup type `LOOKUP` and the operation `OP_OPEN`, then calls `namei()` for pathname resolution. After resolution succeeds and a vnode is obtained, `VOP_OPEN()` is invoked on the vnode to complete the open operation. Then `fdalloc()` allocates a file descriptor and associates it with the resolved vnode. This flow — syscall entry → nameidata initialization → pathname resolution → vnode acquisition → file descriptor allocation — is the standard pattern for VFS syscalls.
+
+Other syscalls in `vfs_syscalls.c` follow similar patterns. For instance, `kern_readv()` and `kern_writev()` retrieve the vnode from the file descriptor and invoke `VOP_READ` or `VOP_WRITE` operations. The `kern_renameat()` function uses `namei()` to resolve both source and target paths before calling the appropriate VOP operations.
 
 **Mount Management**
-Mount management lives in `sys/kern/vfs_mount.c`. The `mount()` system call creates a new mount point by invoking the filesystem's `vfs_mount` operation, which in turn allocates a `struct mount`, attaches it to the directory tree, and sets the root vnode. The `unmount()` system call handles the reverse: detaching the filesystem, flushing dirty buffers, and cleaning up references. Each mount point is identified by a unique filesystem ID, a two-element integer array that distinguishes it from all other mounted filesystems on the machine.
+Mount management is implemented in `sys/kern/vfs_mount.c`. When a filesystem is mounted, the kernel creates a `struct mount` and links it into the global mount list. The `vfs_domount()` function performs the bulk of the mount operation, calling into the filesystem-specific `vfs_mount` callback. The mount structure tracks statistics, flags, and a reference to the root vnode of that filesystem. Deferred unmount is supported through `deferred_unmount_enqueue()` for handling unmounts that cannot complete immediately due to active references.
 
 **Vnode Operations**
-Vnode operations are defined by function pointers in `struct vfsops` (for filesystem-level operations) and `struct vnodeop_desc` (for per-vnode-type operations). The `vfsops` structure, defined in `sys/sys/mount.h`, contains pointers to operations such as `vfs_mount`, `vfs_unmount`, `vfs_root`, `vfs_statfs`, `vfs_sync`, `vfs_vget`, and `vfs_fhtovp`. Each concrete filesystem (UFS, ZFS, tmpfs, etc.) provides its own `vfsops` implementation, which the VFS layer dispatches through the vnode's `v_op` pointer.
+Each vnode carries a pointer to a `vnodeop_desc` table that describes the operations supported by that vnode's filesystem. The `vnodeop_desc` structure contains the operation name, offset into the operation vector, and other metadata. Filesystems register their operation vectors during initialization, and the VFS dispatches operations through these vectors. The `vop_generic_args` structure is used to pass arguments to vnode operations uniformly.
 
 **Namecache**
-The namecache is implemented in `sys/kern/vfs_cache.c`. It maintains a hash table of pathname-to-vnode mappings, keyed by directory vnode plus component name. When a lookup succeeds, the result is stored in a cache entry. Subsequent lookups for the same path component can skip the filesystem's `VOP_LOOKUP` entirely, returning the cached vnode directly. Negative results (path components that do not exist) are also cached, with configurable timeout and promotion policies to balance memory usage against hit rate.
+The namecache is implemented in `sys/kern/vfs_cache.c`. It caches the results of pathname lookups to avoid repeated filesystem operations. Namecache entries are stored in a hash table. Each vnode contains pointers to source entries (names which can be found when traversing through said vnode) and destination entries (names resolved from that vnode). The namecache supports both positive and negative entries — the latter cache the fact that a name does not exist, preventing repeated lookups for missing files.
 
 ## Key Data Structures
 
-**struct vnode** (from `sys/sys/vnode.h`)
-The vnode is the central abstraction. It represents an open file, directory, socket, or device. Key fields include:
-- `v_type` — The vnode type (VREG, VDIR, VLNK, VBLK, VCHR, VFIFO, VSOCK, VNON, VBAD).
-- `v_state` — The vnode's lifecycle state (VSTATE_UNINITIALIZED, VSTATE_CONSTRUCTED, VSTATE_DESTROYING, VSTATE_DEAD).
-- `v_data` — A pointer to filesystem-specific data (e.g., a UFS inode, a ZFS dnode). Each underlying filesystem allocates its own private area and hangs it from `v_data`.
-- `v_op` — A pointer to the vnode operation vector (`vnodeop_desc_table`), which dispatches operations like VOP_READ, VOP_WRITE, VOP_LOOKUP to the correct filesystem function.
-- `v_mount` — A pointer to the `struct mount` this vnode belongs to.
-- `v_pollinfo` — A `struct vpollinfo` containing lock, selinfo, and event tracking for poll/select operations.
-
+**struct vnode** (`sys/sys/vnode.h`)
+The vnode is the core abstraction representing any file, directory, or special file. Key fields include:
 ```c
 /* From sys/sys/vnode.h */
-__enum_uint8_decl(vtype) {
-	VNON,
-	VREG,
-	VDIR,
-	VBLK,
-	VCHR,
-	VLNK,
-	VSOCK,
-	VFIFO,
-	VBAD,
-	VMARKER,
-	VLASTTYPE = VMARKER,
+enum vtype {
+    VNON, VREG, VDIR, VBLK, VCHR, VLNK, VSOCK, VFIFO, VBAD, VMARKER
 };
-
-__enum_uint8_decl(vstate) {
-	VSTATE_UNINITIALIZED,
-	VSTATE_CONSTRUCTED,
-	VSTATE_DESTROYING,
-	VSTATE_DEAD,
-	VLASTSTATE = VSTATE_DEAD,
+enum vstate {
+    VSTATE_UNINITIALIZED, VSTATE_CONSTRUCTED, VSTATE_DESTROYING, VSTATE_DEAD
 };
 ```
+The `v_data` field points to filesystem-specific data (e.g., a UFS inode). The `v_op` field points to the vnode operation vector. Locking is managed through the vnode lock (`v_lock`), and references are tracked via reference counts.
 
-**struct mount** (from `sys/sys/mount.h`)
-Each mount point is described by a `struct mount`. Key fields include:
-- `mnt_rootvnode` — Pointer to the root vnode of this filesystem.
-- `mnt_fsid` — A filesystem identifier uniquely identifying this filesystem.
-- `mnt_flag` — Mount flags (MNT_RDONLY, MNT_NOSUID, etc.).
-- `mnt_stat` — A `struct statfs` containing filesystem statistics.
-
+**struct mount** (`sys/sys/mount.h`)
+A mount point represents an instance of a mounted filesystem. Key fields include:
 ```c
 /* From sys/sys/mount.h */
-static __inline int
-fsidcmp(const struct fsid *a, const struct fsid *b)
-{
-	return (a->val[0] != b->val[0] || a->val[1] != b->val[1]);
-}
+struct mount {
+    struct mount *mnt_mountp;      /* Mount point for this filesystem */
+    struct vnode *mnt_vnodecovered; /* Vnode we are mounted on */
+    struct vfsops *mnt_vfsops;     /* VFS operation vector */
+    struct vfsconf *mnt_vfc;        /* VFS configuration */
+    struct ucred *mnt_cred;        /* Credentials of mounter */
+    uint64_t mnt_flag;             /* Mount flags */
+    uint64_t mnt_kern_flag;        /* Kernel mount flags */
+    struct statfs mnt_stat;        /* Filesystem statistics */
+    /* ... additional fields ... */
+};
 ```
 
-**struct statfs** (from `sys/sys/mount.h`)
-The `statfs` structure holds filesystem statistics, exposed to user-space via `statfs(2)` and `fstatfs(2)`. Key fields include:
-- `f_version` — Structure version number (STATFS_VERSION).
-- `f_type` — Filesystem type identifier.
-- `f_bsize` — Filesystem block size.
-- `f_blocks`, `f_bfree`, `f_bavail` — Total, free, and available blocks.
-- `f_files`, `f_ffree` — Total and free file nodes.
-- `f_syncwrites`, `f_asyncwrites`, `f_syncreads`, `f_asyncreads` — I/O counters since mount.
-
+**struct statfs** (`sys/sys/mount.h`)
+Filesystem statistics including block counts, file counts, and I/O statistics:
 ```c
 /* From sys/sys/mount.h */
 struct statfs {
-	uint32_t f_version;		/* structure version number */
-	uint32_t f_type;		/* type of filesystem */
-	uint64_t f_flags;		/* copy of mount exported flags */
-	uint64_t f_bsize;		/* filesystem fragment size */
-	uint64_t f_iosize;		/* optimal transfer block size */
-	uint64_t f_blocks;		/* total data blocks in filesystem */
-	uint64_t f_bfree;		/* free blocks in filesystem */
-	int64_t	 f_bavail;		/* free blocks avail to non-superuser */
-	uint64_t f_files;		/* total file nodes in filesystem */
-	int64_t	 f_ffree;		/* free nodes avail to non-superuser */
-	uint64_t f_syncwrites;		/* count of sync writes since mount */
-	uint64_t f_asyncwrites;		/* count of async writes since mount */
-	uint64_t f_syncreads;		/* count of sync reads since mount */
-	uint64_t f_asyncreads;		/* count of async reads since mount */
-	uint32_t f_nvnodelistsize;	/* # of vnodes */
-	uint32_t f_spare0;		/* unused spare */
-	uint64_t f_spare[9];		/* unused spare */
-	uint32_t f_spare2;		/* unused spare */
+    uint32_t f_version;           /* Structure version number */
+    uint32_t f_type;              /* Type of filesystem */
+    uint64_t f_flags;             /* Copy of mount exported flags */
+    uint64_t f_bsize;             /* Filesystem fragment size */
+    uint64_t f_iosize;            /* Optimal transfer block size */
+    uint64_t f_blocks;            /* Total data blocks in filesystem */
+    uint64_t f_bfree;             /* Free blocks in filesystem */
+    int64_t  f_bavail;            /* Free blocks available to non-superuser */
+    uint64_t f_files;             /* Total file nodes in filesystem */
+    int64_t  f_ffree;             /* Free nodes available to non-superuser */
+    uint64_t f_syncwrites;        /* Count of sync writes since mount */
+    uint64_t f_asyncwrites;       /* Count of async writes since mount */
+    /* ... additional fields ... */
 };
 ```
 
-**struct vfsops** (from `sys/sys/mount.h`)
-The `vfsops` structure defines the set of operations a filesystem must implement. Key pointers include:
-- `vfs_mount` — Called to mount a filesystem.
-- `vfs_cmount` — Called for chroot-style mounts.
-- `vfs_unmount` — Called to unmount a filesystem.
-- `vfs_root` — Returns the root vnode.
-- `vfs_statfs` — Fills in a `statfs` structure.
-- `vfs_sync` — Syncs dirty data.
-- `vfs_vget` — Retrieves a vnode given a file handle.
-- `vfs_fhtovp` — Converts a file handle to a vnode.
-
+**struct vfsops** (`sys/sys/mount.h`)
+Each filesystem provides a `struct vfsops` containing pointers to its implementation of VFS operations:
 ```c
 /* From sys/sys/mount.h */
 struct vfsops {
-	void	*vfs_mount;
-	void	*vfs_cmount;
-	void	*vfs_unmount;
-	void	*vfs_root;
-	void	*vfs_cachedroot;
-	void	*vfs_quotactl;
-	void	*vfs_statfs;
-	void	*vfs_sync;
-	void	*vfs_vget;
-	void	*vfs_fhtovp;
-	/* ... more operation pointers ... */
+    int (*vfs_mount)(struct mount *mp, char *path, caddr_t data,
+                     size_t datalen, struct thread *td);
+    int (*vfs_cmount)(struct vfsconf *vfc, struct thread *td);
+    int (*vfs_unmount)(struct mount *mp, int mntflags, struct thread *td);
+    int (*vfs_root)(struct mount *mp, int flags, struct vnode **vpp);
+    int (*vfs_statfs)(struct mount *mp, struct statfs *sbp, struct thread *td);
+    int (*vfs_sync)(struct mount *mp, int waitfor, struct thread *td);
+    int (*vfs_vget)(struct mount *mp, struct fid *fhp, struct vnode **vpp);
+    int (*vfs_fhtovp)(struct mount *mp, struct fid *fhp,
+                      struct vnode **vppp, int *exflagsp,
+                      struct ucred **credanonp);
+    /* ... more operations ... */
 };
 ```
 
-**struct nameidata** (from `sys/sys/namei.h`)
-The `nameidata` structure tracks the state of a pathname resolution. It holds the current path pointer, remaining path length, flags controlling resolution behavior, and pointers to the current directory and target vnode. The VFS allocates these from a UMA zone (`namei_zone`) to avoid slab fragmentation.
+**Namecache entries** (`sys/kern/vfs_cache.c`)
+The namecache entry stores cached results of pathname lookups. Namecache entries are organized as a hash table with per-vnode lists. Entries are aged based on timestamps, and negative entries (cache misses) have shorter lifetimes to allow for faster recovery when files are created after a miss.
 
 ## Deep Dive
 
-### Pathname Resolution: namei()
+**Pathname Resolution: From `namei()` to `VOP_LOOKUP`**
 
-When a process calls `open("/usr/local/bin/foo")`, the VFS traces through the following steps:
-
-1. **Allocate nameidata**: `namei()` allocates a `struct nameidata` from the `namei_zone`.
-
-2. **Parse the path**: The function iterates through each component of the path string. For `/usr/local/bin/foo`, it processes `""` (root), `usr`, `local`, `bin`, and `foo` in sequence.
-
-3. **Cache lookup**: Before invoking the filesystem's `VOP_LOOKUP`, the VFS checks the namecache via `cache_fplookup()`. If a cached entry exists and is still valid, the lookup returns immediately.
-
-4. **VOP_LOOKUP**: If the cache misses, the VFS calls `VOP_LOOKUP` on the current directory's vnode. This dispatches to the filesystem-specific lookup function (e.g., `ufs_lookup()` for UFS, or `zfs_lookup()` for ZFS).
-
-5. **Handle symlinks**: If the result is a symbolic link, the VFS follows it by reading the link contents and inserting them into the path string. This repeats until a non-symlink is found or the symlink chain is exhausted.
-
-6. **Cache the result**: Whether successful or not, the result is stored in the namecache for future lookups.
+When a process calls `open("/path/to/file", ...)`, the VFS resolves the path through `sys/kern/vfs_lookup.c`. The `namei()` function initializes a `struct nameidata` and begins traversal from the root directory:
 
 ```c
-/* From sys/kern/vfs_lookup.c — SDT probes for tracing */
+/* From sys/kern/vfs_lookup.c */
 SDT_PROBE_DEFINE4(vfs, namei, lookup, entry, "struct vnode *", "char *",
     "unsigned long", "bool");
-SDT_PROBE_DEFINE4(vfs, namei, lookup, return, "int", "struct vnode *", "bool",
-    "struct nameidata");
 ```
 
-### Mount Operations: vfs_mount()
+The resolution process:
+1. `namei()` allocates a `nameidata` from the `namei_zone` UMA zone
+2. It initializes the structure with the starting directory (root, cwd, or fd-relative)
+3. For each path component, it calls `cache_fplookup()` to check the namecache
+4. If not cached, it calls `VOP_LOOKUP()` on the parent directory vnode
+5. The filesystem's `VOP_LOOKUP` implementation searches its directory entries
+6. On success, the result is cached via `cache_enter()` for future lookups
+7. Symlinks are followed by recursively resolving the target path
 
-The `mount()` system call (implemented in `sys/kern/vfs_mount.c`) performs the following steps:
-
-1. **Parse mount options**: The VFS parses the `mount_args` structure, extracting filesystem-specific options and global flags (MNT_RDONLY, MNT_NOSUID, MNT_NOEXEC, etc.).
-
-2. **Allocate mount structure**: A new `struct mount` is allocated and initialized.
-
-3. **Call vfs_mount**: The filesystem's `vfs_mount` operation is invoked. For UFS, this is `ffs_mountfs()`; for ZFS, `zfs_mount()`. The filesystem function validates the device, reads superblock metadata, and allocates the root vnode.
-
-4. **Link into directory tree**: The root vnode becomes the mount point's anchor. Any existing vnode at that path is replaced (or the mount fails if the path is busy).
-
-5. **Update statistics**: The `mnt_stat` field is populated via `vfs_statfs`.
-
+The `nameidata` structure tracks the resolution state:
 ```c
-/* From sys/kern/vfs_mount.c — mount point iteration */
-MNT_VNODE_FOREACH_ALL(vp, mp, vpq) {
-	/* Process each vnode on this mount */
-}
+/* From sys/sys/namei.h */
+struct nameidata {
+    /* Path length and flags */
+    struct componentname ni_cnd;  /* Component name info */
+    struct vnode *ni_vp;          /* Current vnode */
+    struct vnode *ni_startdir;    /* Starting directory */
+    /* ... additional fields ... */
+};
 ```
 
-### Vnode Lifecycle: getnewvnode() to vput()
+The `componentname` structure (`struct componentname`) carries per-component information including the name pointer, length, and flags indicating special handling (e.g., `ISLASTCN` for the final component, `ISDOTDOT` for `..` entries).
 
-Vnodes follow a well-defined lifecycle:
+**Mount Point Management**
 
-1. **Allocation**: `getnewvnode()` allocates a new vnode from the vnode cache (a hash table of free vnodes). If no free vnode exists, the kernel may block or fail with ENOMEM.
+Mount operations are handled by `vfs_domount()` in `sys/kern/vfs_mount.c`. The function:
+1. Validates the mount type and credentials
+2. Allocates a `struct mount` and initializes it
+3. Calls the filesystem's `vfs_mount` callback
+4. Links the mount into the global mount list
+5. Sets the root vnode for the new filesystem
 
-2. **Initialization**: The filesystem-specific initialization function sets up the vnode's `v_data` pointer to point to the filesystem's inode, and sets up the `v_op` vector.
+The mount structure maintains statistics in `mnt_stat` (a `struct statfs`), tracks flags (`mnt_flag`), and holds a reference to the root vnode. When a filesystem is mounted on top of an existing vnode, that vnode becomes the mount point and is replaced by the new filesystem's root for subsequent lookups. The `mnt_vnodecovered` field stores the vnode from the parent filesystem that is obscured by the new mount — it is distinct from the mounted filesystem's own root vnode.
 
-3. **Reference counting**: Each `vget()` increments the vnode's reference count, and each `vput()` decrements it. When the count reaches zero, the vnode may be reclaimed.
+Deferred unmount handles cases where a filesystem cannot be unmounted immediately due to active references. The `deferred_unmount_enqueue()` function schedules the unmount for later retry, with configurable retry limits via the `sysctl vfs.deferred_unmount.retry_limit`.
 
-4. **Reclamation**: `vrecycle()` moves the vnode to the free list. If the vnode is dirty (has unwritten data), the VFS may flush it first via `VOP_SYNC`.
+**Vnode Lifecycle**
 
-5. **Destruction**: When all references are released and the vnode is fully cleaned up, it is freed back to the vnode cache.
+Vnodes go through several states:
+- `VSTATE_UNINITIALIZED`: Memory allocated but not yet configured
+- `VSTATE_CONSTRUCTED`: Fully initialized and active
+- `VSTATE_DESTROYING`: Being reclaimed, operations should fail
+- `VSTATE_DEAD`: Fully reclaimed
 
-```c
-/* From sys/sys/vnode.h — vnode lock reference */
-/*
- * Reading or writing any of these items requires holding the appropriate lock.
- *
- * Lock reference:
- *	c - namecache mutex
- *	i - interlock
- *	l - mp mnt_listmtx or freelist mutex
- *	I - updated with atomics, 0->1 and 1->0 transitions with interlock held
- *	m - mount point interlock
- *	p - pollinfo lock
- *	u - Only a reference to the vnode is needed to read.
- *	v - vnode lock
- *
- * Vnodes may be found on many lists.  The general way to deal with operating
- * on a vnode that is on a list is:
- *	1) Lock the list and find the vnode.
- *	2) Lock interlock so that the vnode does not go away.
- *	3) Unlock the list to avoid lock order reversals.
- *	4) vget with LK_INTERLOCK and check for ENOENT, or
- *	5) Check for DOOMED if the vnode lock is not required.
- *	6) Perform your operation, then vput().
- */
-```
+The `getnewvnode()` function allocates a new vnode from a UMA zone, initializes it with the filesystem's operation vector, and sets the `v_data` pointer. The `vput()` function releases a reference, and when the reference count reaches zero, the vnode may be recycled or destroyed.
+
+The vnode's `v_op` field points to the filesystem's operation vector, which contains function pointers for operations like `VOP_READ`, `VOP_WRITE`, `VOP_LOOKUP`, etc. The `vnodeop_desc` table describes these operations with names and offsets.
+
+**Namecache: Optimizing Pathname Resolution**
+
+The namecache in `sys/kern/vfs_cache.c` caches both successful and failed lookups. Positive entries cache the mapping from (parent directory, name) to (child vnode), while negative entries cache the fact that a name does not exist in a directory.
+
+The cache is organized as a hash table with entries grouped by source vnode. Each source vnode maintains lists of entries where it is the parent directory. The `cache_fplookup()` function searches the cache for matching entries before falling through to the filesystem's `VOP_LOOKUP`.
+
+Negative entries are evicted more aggressively than positive entries to allow faster recovery when files are created after a cache miss. The `cache_neg_evict()` and `cache_neg_promote()` functions manage this behavior.
+
+The namecache also handles rename and unlink operations via `cache_vop_rename()` and `cache_vop_rmdir()`, invalidating or updating cached entries as the directory structure changes.
 
 ## Flow / Diagram
 
@@ -264,101 +234,90 @@ classDiagram
     class vnode {
         +vtype v_type
         +vstate v_state
-        +void *v_data
+        +vnodeop_vector v_op
+        +void v_data
         +struct mount *v_mount
-        +struct vnodeop_desc *v_op
-        +struct vpollinfo v_pollinfo
+        +mtx v_lock
+        +refcount v_refcount
     }
     class mount {
-        +struct vnode *mnt_rootvnode
-        +struct fsid mnt_fsid
+        +mount mnt_mountp
+        +vnode mnt_rootvnode
+        +vfsops mnt_vfsops
+        +statfs mnt_stat
         +uint64_t mnt_flag
-        +struct statfs mnt_stat
-    }
-    class statfs {
-        +uint32_t f_version
-        +uint32_t f_type
-        +uint64_t f_bsize
-        +uint64_t f_blocks
-        +uint64_t f_bfree
-        +int64_t f_bavail
-        +uint64_t f_files
-        +int64_t f_ffree
+        +ucred mnt_cred
     }
     class vfsops {
-        +void *vfs_mount
-        +void *vfs_unmount
-        +void *vfs_root
-        +void *vfs_statfs
-        +void *vfs_sync
-        +void *vfs_vget
-        +void *vfs_fhtovp
+        +vfs_mount()
+        +vfs_cmount()
+        +vfs_unmount()
+        +vfs_root()
+        +vfs_statfs()
+        +vfs_sync()
+        +vfs_vget()
+        +vfs_fhtovp()
+    }
+    class namecache {
+        +vnode nc_source
+        +vnode nc_dest
+        +char nc_name
+        +timestamp nc_timestamp
+        +int nc_flags
     }
     class nameidata {
-        +char *ni_pathptr
+        +componentname ni_cnd
+        +vnode ni_vp
+        +vnode ni_startdir
         +int ni_pathlen
-        +int cn_flags
-        +struct vnode *ni_vp
     }
     class vnodeop_desc {
-        +int vdesc_vop_offset
-        +char *vdesc_name
+        +vop_offset vdesc_vop_offset
+        +char vdesc_name
     }
     vnode "1" --> "1" mount : belongs to
-    vnode "1" --> "1" vfsops : uses operations
-    mount "1" --> "1" vnode : root vnode
+    mount "1" --> "1" vfsops : uses
+    vnode "1" --> "0..*" namecache : contains
     nameidata "1" --> "1" vnode : resolves to
+    vnode "1" --> "1" vnodeop_desc : has
 ```
 
 ## Advanced Notes
 
-**DTrace Tracing**
-FreeBSD's VFS layer is instrumented with SDT probes at key points. To trace pathname lookups:
+**DTrace Integration**
+FreeBSD's VFS includes SDT (Static DTrace Tracing) probes for monitoring pathname resolution. The `vfs,namei,lookup,entry` and `vfs,namei,lookup,return` probes fire on every lookup operation, providing the starting vnode, path string, and result. These probes are defined in `sys/kern/vfs_lookup.c`:
+```c
+SDT_PROBE_DEFINE4(vfs, namei, lookup, entry, "struct vnode *", "char *",
+    "unsigned long", "bool");
+SDT_PROBE_DEFINE4(vfs, namei, lookup, return, "int", "struct vnode *", "bool",
+    "struct nameidata");
 ```
-dtrace -n 'vfs:::lookup-entry { printf("lookup: %s", arg1); }'
-dtrace -n 'vfs:::lookup-return { printf("result: %d, vnode: %p", arg0, arg1); }'
-```
-Probes are defined in `sys/kern/vfs_lookup.c` with `SDT_PROBE_DEFINE4()`. The `entry` probe fires before the lookup begins; the `return` probe fires after, carrying the result code and resolved vnode pointer.
 
-**Namecache Tuning**
-The namecache is a major performance factor for directory-heavy workloads. Key tuning parameters include:
-- `vfs.namecache.hash_size` — Number of hash buckets. Must be a power of two.
-- `vfs.namecache.max_age` — Maximum age for positive cache entries (seconds).
-- `vfs.namecache.neg_timeout` — Timeout for negative cache entries.
+**Performance Considerations**
+The namecache significantly reduces VFS overhead for repeated lookups. However, it introduces complexity in maintaining consistency during rename, unlink, and mkdir operations. The cache must be invalidated when directory contents change, which adds overhead to these operations. The `cache_purgevfs()` function purges all cache entries for a specific filesystem, used during unmount or when filesystem state changes.
 
-Negative cache entries prevent repeated lookups for non-existent paths. The cache promotes frequently accessed entries and demotes stale ones using configurable policies.
+The `namei_zone` UMA zone provides efficient allocation of `nameidata` structures. UMA zones are per-CPU and lock-free for allocation, reducing contention in high-throughput scenarios.
 
-**Locking Discipline**
-Vnode locking follows a strict hierarchy to prevent deadlocks:
-1. The mount point lock (`mnt_listmtx`) protects the mount point list.
-2. The vnode lock (`v_lock`) protects the vnode itself.
-3. The interlock (`v_interlock`) protects transitions between states.
+**Race Conditions and Locking**
+Vnodes may appear on multiple lists simultaneously. The locking protocol requires:
+1. Lock the list and find the vnode
+2. Lock the interlock to prevent the vnode from disappearing
+3. Unlock the list to avoid lock order reversals
+4. Call `vget()` with `LK_INTERLOCK` and check for `ENOENT`, or check `DOOMED` if the vnode lock is not required
+5. Perform the operation, then `vput()`
 
-The general pattern for operating on a vnode found on a list is documented in `sys/sys/vnode.h`:
-1. Lock the list and find the vnode.
-2. Lock the interlock so the vnode does not go away.
-3. Unlock the list to avoid lock order reversals.
-4. Call `vget()` with `LK_INTERLOCK` and check for `ENOENT`, or check for `DOOMED` if the vnode lock is not required.
-5. Perform the operation, then call `vput()`.
+This protocol ensures that vnodes are not accessed after they have been reclaimed. The interlock mechanism prevents races between list removal and vnode access.
 
 **Cross-Mount Operations**
-When a path crosses a mount point (e.g., `/` containing a mount at `/usr`), the VFS handles the transition via `cache_fplookup_cross_mount()`. Internal locking functions coordinate across mount boundaries, ensuring that the VFS correctly transitions from one filesystem's vnode operations to another's.
+When pathname resolution crosses mount points, the VFS uses `crossmp_vop_*` functions to handle operations that span filesystem boundaries. The `crossmp_vop_islocked()` and `crossmp_vop_lock1()` functions manage locking across mount points, while `crossmp_vop_unlock()` handles the corresponding unlock.
 
-**File Descriptor Integration**
-The VFS integrates with the file descriptor table (`sys/kern/kern_descrip.c`). When a process opens a file, `kern_openat()` in `sys/kern/vfs_syscalls.c` resolves the pathname, obtains a vnode, and installs it into the process's file descriptor table. The file descriptor references the vnode through `struct file`, which contains a pointer to the vnode and the associated `struct fileops` vector.
+**Deferred Unmount**
+FreeBSD supports deferred unmount through `deferred_unmount_enqueue()`. When a filesystem cannot be unmounted due to active references, the unmount is scheduled for later retry. The `sysctl vfs.deferred_unmount.retry_limit` controls the maximum number of retries. This feature is essential for handling complex mount hierarchies where unmount order matters.
 
-## Comparison
+**Connection to OS Theory**
+The VFS design follows the classic UNIX abstraction of a single directory tree with multiple mounted filesystems. This matches the theoretical model of a file system as a mapping from paths to file contents, with mount points serving as redirection points. The vnode abstraction corresponds to the concept of a file descriptor in user space, providing a kernel-internal handle for file operations.
 
-**Linux vs FreeBSD VFS**
-Linux's VFS uses `struct inode` as its core abstraction, analogous to FreeBSD's `struct vnode`, but with key differences. Linux's inode is tightly coupled with the page cache via `struct address_space`, while FreeBSD separates the page cache (managed by the VM subsystem's pagers) from the vnode. Linux uses `struct file` for open file descriptions (similar to FreeBSD's `struct file`), but Linux's `struct file` also carries file position and flags, whereas FreeBSD splits these into separate structures.
-
-Linux's pathname resolution uses `struct path` (a pair of `vfsmount` + `dentry`), which is conceptually similar to FreeBSD's `struct nameidata` but organized differently. Linux's dcache (dentry cache) serves the same purpose as FreeBSD's namecache, but Linux's dcache is integrated with the page cache more tightly, while FreeBSD's namecache is a separate hash table.
-
-**macOS/XNU VFS**
-macOS's VFS is derived from FreeBSD's but has diverged significantly. XNU uses a hybrid architecture that integrates Mach IPC primitives with the VFS layer. Specifically, XNU's vnode structure includes Mach-specific fields such as `v_machport` for IPC integration, which FreeBSD does not have. XNU's mount point management uses `struct mount` but with different field organization — XNU embeds Mach-specific mount options and uses `mnt_vnodecovered` and `mnt_vnodelist` with different locking semantics. XNU's namecache implementation uses `struct nchandle` with a different hash table layout and negative cache timeout policy. Additionally, XNU's VFS includes additional security hooks (Mandatory Access Control) integrated at the vnode level, whereas FreeBSD delegates MAC to the TrustedBSD framework.
-
-**NetBSD/OpenBSD VFS**
-NetBSD's VFS shares much of the same design heritage with FreeBSD but diverges in several key areas. NetBSD uses `struct vnode` with a different internal layout — notably, NetBSD's vnode embeds the lock directly within the structure, while FreeBSD uses a separate lock pointer. NetBSD's VFS includes additional abstractions for its modular filesystem framework (e.g., the FFS2 superblock format), while FreeBSD has focused on integrating ZFS and tmpfs more deeply into the core VFS. OpenBSD has further simplified the VFS, removing some of the more complex features like the negative cache.
+The namecache optimization is analogous to DNS caching in network protocols — caching results of expensive lookups to reduce latency for repeated queries. The trade-off is consistency: cached entries must be invalidated when underlying data changes, adding complexity to directory operations.
 
 ## See Also
 - [Virtual Memory Subsystem — vm_page, UMA, and Pagers](../vm/README.md)
@@ -368,12 +327,15 @@ NetBSD's VFS shares much of the same design heritage with FreeBSD but diverges i
 - [Network Stack — Architecture and Packet Flow](../net/README.md)
 
 
-
-- **Source directories**: `sys/kern/` (VFS core), `sys/sys/` (headers), `sys/fs/` (filesystem implementations)
-- **Related chapters**: [UFS — FreeBSD's Native Filesystem](../ufs/README.md), [ZFS — Pooled Storage and Copy-on-Write Filesystem](../contrib/openzfs/README_freebsd.md), [Virtual Memory Subsystem — vm_page, UMA, and Pagers](../vm/README.md), [Buffer Cache — Block I/O Subsystem](../vm/README_bcache.md)
-- **Key source files**: `sys/kern/vfs_lookup.c`, `sys/kern/vfs_cache.c`, `sys/kern/vfs_mount.c`, `sys/kern/vfs_syscalls.c`, `sys/sys/vnode.h`, `sys/sys/mount.h`
-- **Filesystems to explore**: `sys/fs/ufs/` (UFS), `sys/fs/tmpfs/` (tmpfs), `sys/fs/devfs/` (devfs), `sys/fs/procfs/` (procfs), `sys/fs/nullfs/` (nullfs), `sys/fs/fuse/` (FUSE)
+- **sys/kern/vfs_lookup.c** — Pathname resolution implementation
+- **sys/kern/vfs_mount.c** — Mount point management
+- **sys/kern/vfs_cache.c** — Namecache implementation
+- **sys/kern/vfs_syscalls.c** — VFS system call implementations
+- **sys/kern/vfs_subr.c** — VFS support routines
+- **sys/sys/vnode.h** — Vnode structure and operation definitions
+- **sys/sys/mount.h** — Mount and filesystem statistics structures
+- **sys/sys/namei.h** — Pathname resolution structures
 
 ---
 
-> _Generated by [DaemonDocs](https://github.com/ocochard/DaemonDocs) on 2026-05-01 02:14 UTC using model `Qwen3.6-35B-A3B-UD-Q4_K_XL` (llama.cpp build `b8985-27aef3dd9`). AI-generated content — verify against source before relying on it._
+> _Generated by [DaemonDocs](https://github.com/ocochard/DaemonDocs) on 2026-05-04 10:19 UTC using model `Qwen3.6-35B-A3B-UD-Q8_K_XL` (llama.cpp build `b8985-27aef3dd9`). AI-generated content — verify against source before relying on it._

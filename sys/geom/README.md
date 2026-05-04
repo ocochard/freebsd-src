@@ -14,7 +14,7 @@
 
 ## Quick Summary
 
-GEOM (GEOM) is FreeBSD's stackable storage framework that sits between the Virtual File System (VFS) layer and physical device drivers. It provides a uniform abstraction for storage devices, allowing arbitrary transformations to be layered on top of block devices without modifying the underlying drivers. Think of GEOM as a set of building blocks: physical disks become "providers," and other GEOM objects that consume those providers become "consumers" that produce new providers for higher layers. This provider/consumer model enables features like RAID, disk encryption, partitioning, and disk labeling to be implemented as modular classes that compose together into a storage stack.
+GEOM (GEOM) is FreeBSD's stackable storage framework that provides a uniform abstraction for block devices, sitting between the Virtual File System (VFS) layer and physical device drivers. It allows arbitrary transformations to be layered on top of block devices without modifying the underlying drivers. Think of GEOM as a set of building blocks: physical disks become "providers," and other GEOM objects that consume those providers become "consumers" that produce new providers for higher layers. This provider/consumer model enables features like RAID, disk encryption, partitioning, and disk labeling to be implemented as modular classes that compose together into a storage stack.
 
 The framework is built around the concept of "classes" — each class (such as `MIRROR` for RAID-1, `ELI` for encryption, or `PART` for partitioning) defines a set of operations and a transformation rule. A class creates "geoms" (topology objects) that link consumers to providers. When a bio (block I/O request) arrives from above, it is transformed according to the class's rules and forwarded down to the underlying provider. When the I/O completes, the result travels back up the stack. This design allows complex storage configurations to be built by stacking classes on top of each other, much like layers in a sandwich.
 
@@ -32,39 +32,13 @@ GEOM's architecture is defined by four core concepts: providers, consumers, geom
 
 **Geoms** (`struct g_geom`) are the topology objects that implement transformations. Each geom belongs to a class and contains a list of consumers. Geoms create their own providers (output devices) that higher layers consume.
 
-**Classes** (`struct g_class`) define the transformation logic. Each class has function pointers for operations like `taste` (detecting if a provider belongs to this class), `ctlreq` (handling control requests from userland), and class-specific config/destroy functions. Classes are registered at boot time via `SYSINIT` and can be loaded/unloaded as modules.
-
-### I/O Path
-
-The I/O path in GEOM is implemented in `sys/geom/geom_io.c`. When a bio is submitted to a GEOM provider via `g_io_request()`, it enters a two-threaded pipeline: a "down" thread that pushes I/O toward the physical disks, and an "up" thread that returns completed I/O back to the VFS layer. Each class in the stack can inspect, modify, or split bios as they pass through.
-
-The topology lock (`topology_lock`, an `sx` lock defined in `sys/geom/geom_kern.c`) protects all topology operations. Any code that creates, destroys, or reconfigures geoms must hold this lock exclusively. This single-threaded topology model avoids complex locking within the provider/consumer graph.
-
-### Event System
-
-GEOM maintains a separate event thread (`g_event_td`) defined in `sys/geom/geom_event.c`. Events are queued via `g_post_event()` and processed by `g_run_events()`. This allows topology changes (like device removal) to be handled asynchronously, avoiding the need to sleep while holding the topology lock. The `g_waitidle()` function blocks until all pending events have been processed, used during shutdown.
-
-### VFS Bridge
-
-The VFS bridge in `sys/geom/geom_vfs.c` implements the `VFS` class. When a filesystem's buffer cache issues I/O, the GEOM VFS class converts `struct buf` operations into `struct bio` requests. The `g_io_deliver()` function receives completed bios and returns them to the buffer cache.
-
-### Device Interface
-
-The `DEV` class in `sys/geom/geom_dev.c` creates character device nodes (`/dev/geom/...`) that allow userland tools like `glabel` and `gmirror` to interact with GEOM topology. The device interface dispatches I/O to the underlying GEOM stack and detects device creation events from the CAM subsystem.
-
-### Disk Class
-
-The `DISK` class in `sys/geom/geom_disk.c` bridges GEOM to physical disk drivers. Each disk geom has a `struct disk` softc that maintains device statistics via `devstat`, LED state, and sysctl tree entries. Disk bios are submitted to the underlying disk driver's strategy routine, and completion callbacks are handled by the DISK class.
-
-### Slice Class
-
-The `SLICE` class in `sys/geom/geom_slice.c` handles MBR partition tables (slices). It parses the Master Boot Record to identify slice boundaries and creates corresponding `g_provider` objects for each slice. This allows FreeBSD systems using MBR disks to access individual partitions through the GEOM stack, providing a GEOM-managed view of MBR partitions similar to how `PART` handles BSD and GPT labels.
+**Classes** (`struct g_class`) define the transformation logic. Each class has function pointers for operations like `taste` (detecting if a provider belongs to this class), `ctlreq` (handling control requests from userland), and class-specific config/destroy functions. Classes
 
 ## Key Data Structures
 
-### `struct g_class`
+The core data structures of GEOM are defined in `sys/geom/geom.h`. Here are the essential structs:
 
-From `sys/geom/geom.h`:
+**`struct g_class`** — The class descriptor that defines a transformation type.
 
 ```c
 struct g_class {
@@ -75,270 +49,319 @@ struct g_class {
 	g_ctl_req_t		*ctlreq;
 	g_init_t		*init;
 	g_fini_t		*fini;
-	g_ctl_destroy_geom_t	*destroy_geom;
+	g_start_t		*start;
+	g_access_t		*access;
+	g_orphan_t		*orphan;
+	g_ioctl_t		*ioctl;
+	g_spoiled_t		*spoiled;
+	g_attrchanged_t		*attrchanged;
+	g_dumpconf_t		*dumpconf;
+	g_resize_t		*resize;
+	TAILQ_ENTRY(g_class)	methods;
+	/* ... */
 };
 ```
 
-The class structure defines the transformation logic for a GEOM class. The `name` field identifies the class (e.g., "MIRROR", "ELI", "PART"). Function pointers define class operations: `taste` detects whether a provider belongs to this class, `ctlreq` handles control requests from userland, and `init`/`fini` manage module lifecycle.
+The `g_class` structure is the central registry for each GEOM class type. The `name` field identifies the class (e.g., "MIRROR", "ELI", "PART"). Function pointers define the class's behavior: `taste` detects whether a provider belongs to this class, `ctlreq` handles control requests from userland, and `start` is called when I/O requests arrive. Classes are registered globally via `DECLARE_GEOM_CLASS()` and stored in `g_classes`, a LIST_HEAD defined in `geom_subr.c`.
 
-### `struct g_geom`
-
-From `sys/geom/geom.h`:
+**`struct g_geom`** — The topology object that implements a transformation.
 
 ```c
 struct g_geom {
+	const char        *name;
+	struct g_class    *class;
 	TAILQ_ENTRY(g_geom) geom;
-	const char		*name;
-	struct g_class		*class;
-	void			*softc;
 	LIST_HEAD(, g_consumer) consumer;
 	LIST_HEAD(, g_provider) provider;
-	struct sx		*lock;
-	int			rank;
-	g_start_t		*start;
-	g_spoiled_t		*spoiled;
-	g_attrchanged_t		*attrchanged;
+	int                rank;
+	void              *softc;
+	g_start_t         *start;
+	g_spoiled_t       *spoiled;
+	g_attrchanged_t   *attrchanged;
+	/* ... */
 };
 ```
 
-The geom structure represents a single instance of a transformation. Each geom belongs to exactly one class and can have multiple consumers (input providers) and multiple providers (output devices). The `softc` pointer holds class-specific state. The `start` field is a function pointer of type `g_start_t` (defined as `typedef void g_start_t(struct bio *)`), called when I/O arrives at this geom. The `spoiled` callback is called when a consumer's data is invalidated, and `attrchanged` handles attribute updates.
+Each geom belongs to exactly one class and can have multiple consumers (input providers) and multiple providers (output devices). The `softc` pointer is class-specific data. The `rank` field determines the order in which classes are tasted when new providers appear.
 
-### `struct g_consumer`
-
-From `sys/geom/geom.h`:
+**`struct g_consumer`** — Represents a geom's connection to a provider.
 
 ```c
 struct g_consumer {
-	LIST_ENTRY(g_consumer) consumers;
-	LIST_ENTRY(g_consumer) provider_consumers;
 	struct g_geom		*geom;
+	LIST_ENTRY(g_consumer)	consumer;
 	struct g_provider	*provider;
-	int			acr;
-	int			acw;
-	int			ace;
-	void			*softc;
+	LIST_ENTRY(g_consumer)	provider;
+	u_int			ace;
+	u_int			flags;
+	/* ... */
 };
 ```
 
-A consumer represents a geom's attachment to a provider. The `acr`, `acw`, and `ace` fields track access counts for read, write, and exclusive operations respectively — these prevent conflicting accesses to underlying devices. The `provider_consumers` list enables walking from a provider back to all geoms that consume it.
+A consumer links a geom to a provider. The `ace` field tracks exclusive access counts. The `flags` field includes `G_CF_ACTIVE` (0x1), `G_CF_OPEN` (0x4), and `G_CF_DEAD` (0x10, 0x20). When a geom needs to access its underlying provider, it calls `g_access()` to increment these counts.
 
-### `struct g_provider`
-
-From `sys/geom/geom.h`:
+**`struct g_provider`** — Represents a block device that can be read from or written to.
 
 ```c
 struct g_provider {
-	TAILQ_ENTRY(g_provider) pgeom;
-	TAILQ_ENTRY(g_provider) pconsumer;
-	const char		*name;
-	struct g_geom		*geom;
-	LIST_HEAD(, g_consumer) consumer;
-	off_t			size;
-	u_int			secsize;
-	char			*mediasize;
-	char			*sectorsize;
-	void			*private;
-	int			index;
-	u_int			flags;
+	const char        *name;
+	LIST_ENTRY(g_provider) provider;
+	struct g_geom     *geom;
+	LIST_HEAD(, g_consumer) consumers;
+	u_int              ace;
+	int                error;
+	g_orphan_t        *orphan;
+	off_t              mediasize;
+	int                sectorsize;
+	int                stripesize;
+	/* ... */
 };
 ```
 
-A provider represents a block device with attributes. The `size` field gives the total size in bytes, `secsize` is the sector size, and `geom` points to the geom that created this provider. The `consumer` list tracks all geoms that consume this provider. The `private` field holds class-specific data (for the DISK class, it points to `struct g_disk_softc`).
+A provider is what higher layers see as a block device. It has a name (like "mirror/gm0"), belongs to a geom, and maintains a list of consumers that use it. The `mediasize` and `sectorsize` fields describe the device geometry. The `error` field holds the last error status.
 
-### `struct g_bioq`
-
-From `sys/geom/geom.h`:
+**`struct g_bioq`** — The I/O queue used for batching bio requests.
 
 ```c
 struct g_bioq {
-	TAILQ_HEAD(, bio) bio_queue;
-	struct mtx		bio_queue_lock;
-	u_int			bio_queue_length;
+	TAILQ_ENTRY(bio) bio_queue;
+	struct mtx         bio_queue_lock;
+	int                bio_queue_length;
 };
 ```
 
-The bio queue is used by the I/O pipeline threads to batch bios for processing. Defined in `sys/geom/geom_io.c`, two global bio queues exist: `g_bio_run_down` and `g_bio_run_up`. Access to these queues is protected by the `bio_queue_lock` mutex using static helper functions `g_bioq_lock()` and `g_bioq_unlock()` defined in `geom_io.c`.
-
-### `struct g_event`
-
-From `sys/geom/geom_event.c`:
-
-```c
-struct g_event {
-	TAILQ_ENTRY(g_event) events;
-	g_event_t		*func;
-	void			*arg;
-	int			flag;
-	void			*ref[G_N_EVENTREFS];
-};
-```
-
-The event structure represents a deferred topology operation. The `func` pointer is the handler, `arg` is its argument, and `flag` includes state bits like `EV_DONE`, `EV_WAKEUP`, `EV_CANCELED`. The `ref` array holds references to geom/consumer/provider objects to prevent premature destruction while the event is pending.
+GEOM uses two global bio queues: `g_bio_run_down` and `g_bio_run_up` (defined in `geom_io.c`). These queues batch I/O requests before they are dispatched down or returned up the stack, improving throughput by allowing the kernel to reorder and coalesce requests.
 
 ## Deep Dive
 
-### I/O Pipeline: From `g_io_request` to Disk Driver
+### The Topology Lock and Single-Threaded Model
 
-When a bio arrives at a GEOM provider, the I/O pipeline processes it in two phases: down (toward disks) and up (back to VFS). Let's trace this path through the code.
+GEOM's topology (the provider/consumer graph) is protected by a single `sx` lock, accessed via `g_topology_assert()` and `g_topology_unlock()`. This lock ensures that topology changes are serialized. All topology-altering functions — `g_new_geom()`, `g_new_providerf()`, `g_attach()`, `g_detach()`, `g_wither_geom()`, `g_wither_provider()` — must be called while holding the topology lock.
 
-**Entry point: `g_io_request()`** (in `sys/geom/geom_io.c`)
+This single-threaded model simplifies concurrency dramatically. Without it, walking the provider/consumer graph to find a consumer's provider or a provider's consumers would require complex locking. By serializing topology changes, GEOM guarantees that the graph is always in a consistent state when code traverses it.
 
-The bio is tagged with its source consumer (`bio_from`) and destination provider (`bio_to`). For a bio coming from above, `bio_from` is NULL. The function schedules the bio for downward processing.
+The topology lock is an `sx` lock (sleepable exclusive lock), which means it can be held across operations that might sleep. This is important because some topology operations need to allocate memory or call other functions that may block. The trade-off is that topology changes can become a bottleneck under heavy load, but this is mitigated by keeping topology operations fast and deferring I/O-intensive work.
 
-**Downward scheduling: `g_io_schedule_down()`** (in `sys/geom/geom_io.c`)
+### Bio Request Flow: From VFS to Disk and Back
 
-Bios are queued in `g_bio_run_down` and the down thread is woken. The down thread (`g_down_td`) processes queued bios, dispatching them to the appropriate geom's class `start` function pointer. For bios at the top of the stack (where `bio_from` is NULL), the bio is dispatched to the geom's `start` function. For bios in the middle of the stack, they are forwarded downward via the consumer chain.
+The bio request lifecycle is the core of GEOM's I/O path. Here is the complete flow:
 
-**Class-specific start functions:**
+1. **VFS creates a bio**: When a filesystem issues a read or write, the VFS layer creates a `struct bio` wrapped in a `struct buf`. The `g_vfs_strategy()` function in `geom_vfs.c` is called as the buffer's strategy function.
 
-Each transformation class implements its own `start` function (type `g_start_t`). For the MIRROR class in `sys/geom/mirror/g_mirror.c`, the start function demonstrates how a transformation class modifies bios: it checks the mirror state, transforms the bio to target providers, and forwards sub-bios down via `g_io_request()` to the underlying disk providers.
+2. **g_io_request()**: The bio is passed to `g_io_request()` in `geom_io.c`. This function:
+   - Allocates a bio if needed (via `g_alloc_bio()` from the `biozone` UMA zone)
+   - Sets the bio's `bio_from` pointer to the consumer's geom
+   - Batches the bio into `g_bio_run_down` queue
+   - Calls `g_io_schedule_down()` to dispatch the bio
 
-**Forwarding through the consumer chain:**
+3. **g_io_schedule_down()**: This function processes the down queue:
+   - Locks the bio queue with `g_bioq_lock()`
+   - Iterates through queued bios
+   - Calls the consumer's geom's `start` function (or the class's `start` if not overridden)
+   - Unlocks the queue
 
-Bios in the middle of the stack are forwarded by walking the consumer chain: the function gets the provider that the current consumer sits on, then finds the next consumer (the geom that created that provider), and forwards the bio downward. This continues until the bio reaches the bottom-most provider (a physical disk).
+4. **Class start function**: Each class's `start` function transforms the bio. For example:
+   - `g_disk_start()` in `geom_disk.c` sends the bio directly to the disk driver
+   - `g_slice_start()` in `geom_slice.c` translates the offset to the slice's range
+   - `g_mirror_start()` in `sys/geom/mirror/g_mirror.c` clones the bio for each provider
 
-**Completion: `g_io_deliver()`** (in `sys/geom/geom_io.c`)
+5. **Provider dispatch**: The bio reaches a provider's consumer, which forwards it to the underlying device driver via the provider's `g_dev_strategy()` or similar.
 
-When a bio completes at the disk driver, the callback chain returns it to GEOM via `g_io_deliver()`. For bios at the bottom of the stack (where `bio_from` is NULL), the completion is returned to the VFS layer. For bios in the middle of the stack, they are queued for the up thread via `g_io_schedule_up()`.
+6. **Completion**: When the disk driver completes the I/O, it calls the bio's `bio_done` function (typically `g_std_done()` or a class-specific function).
 
-**Upward scheduling: `g_io_schedule_up()`**
+7. **g_io_deliver()**: The completion function calls `g_io_deliver()`, which:
+   - Sets the bio's `bio_error` field
+   - Batches the bio into `g_bio_run_up` queue
+   - Calls `g_io_schedule_up()` to return the bio up the stack
 
-The up thread (`g_up_td`) processes these bios, calling the appropriate class's completion handler (via `g_std_done()` or class-specific `done` functions) to unwind transformations.
+8. **g_io_schedule_up()**: This function processes the up queue:
+   - Locks the bio queue
+   - Iterates through completed bios
+   - Calls each provider's geom's `start` function (reversing the transformation)
+   - Eventually returns to the VFS layer via `g_vfs_done()`
 
-### Topology Operations
+9. **g_vfs_done()**: In `geom_vfs.c`, this function:
+   - Updates filesystem statistics (sync/async read/write counts)
+   - Calls `bufdone()` to complete the `struct buf`
+   - Wakes up any sleepers waiting on the I/O
 
-Creating and destroying geoms involves several steps, all protected by `topology_lock`:
+### The g_event Thread and Asynchronous Events
 
-**`g_wither_geom()`** (in `sys/geom/geom_subr.c`):
+GEOM uses an event-driven model for topology changes. The `g_event` thread (created in `geom_event.c`) processes asynchronous events like device additions, removals, and configuration changes. This design allows GEOM to react to hardware changes without blocking the I/O path.
 
-This function destroys a geom and all its associated consumers and providers. It is called when a geom needs to be torn down, such as when a underlying provider disappears. The function walks the consumer list, detaching each consumer and freeing associated resources.
+Key event functions:
 
-**`g_wither_provider()`** (in `sys/geom/geom_subr.c`):
+- **`g_post_event()`**: Schedules an event for later processing. The event is added to the `g_events` tail queue and will be processed by the event thread.
 
-This function destroys a provider and notifies all consuming geoms. When a provider is destroyed, all geoms that consume it are notified via the `g_provgone_t` callback, allowing them to reconfigure or destroy themselves.
+- **`g_event_procbody()`**: The event thread's main loop. It processes events from the queue, calling the event's function with the appropriate arguments.
 
-**`g_access()`** (in `sys/geom/geom_subr.c`):
+- **`g_wither_geom()` / `g_wither_provider()`**: These functions schedule "wither" events that destroy geoms and providers. The actual destruction happens in the event thread, allowing the I/O path to continue without waiting for cleanup.
 
-This function manages access counts on providers. It increments `acr`, `acw`, or `ace` fields in consumers to prevent conflicting accesses. Access counts must be properly managed — failing to decrement them when closing a provider can prevent geom destruction.
+- **`g_retaste_event()`**: Schedules a retaste operation when new hardware is detected. This causes all classes to re-examine existing providers to see if any new transformations apply.
 
-### The VFS Bridge: `struct buf` to `struct bio`
+The event system uses reference counting (`g_event->ref[]`) to ensure that objects referenced in events are not destroyed before the event is processed. The `G_N_EVENTREFS` constant (20) limits the number of references per event.
 
-In `sys/geom/geom_vfs.c`, the VFS class bridges `struct buf` I/O to GEOM's bio world:
+### Control Requests and Userland Integration
 
-The VFS class converts `struct buf` operations into `struct bio` requests. When a filesystem's buffer cache issues I/O, the VFS class allocates a new bio, copies the relevant fields (command, offset, data pointer, length), and forwards it to the GEOM stack via `g_io_request()`.
+GEOM provides a control interface for userland tools like `gpart`, `gmirror`, and `geli`. Control requests are sent via `g_ctl_req()` in `geom_ctl.c`, which:
 
-When a bio completes, the completion handler retrieves the original `struct buf` from the bio's `bio_caller2` field, copies back error and residue information, and returns the buffer to the VFS layer. The bio is then freed via `g_destroy_bio()`.
+1. Allocates a `struct gctl_req` to hold the request
+2. Parses parameters using `gctl_get_param()`, `gctl_get_asciiparam()`, etc.
+3. Calls the class's `ctlreq` function to handle the request
+4. Returns results via `gctl_set_param()`
 
-The `bio_caller2` field stores the original `struct buf` pointer, allowing the completion handler to return results to the correct buffer.
+The control interface uses a message-passing model where userland tools send commands like "CREATE", "CONFIG", "DESTROY" to GEOM classes. Classes implement these verbs in their `ctlreq` function. For example, the `MIRROR` class handles "CREATE" to create a new mirror geom from disk providers.
 
-### Event System: Handling Topology Changes
+### Bridge Between VFS and GEOM: geom_vfs.c
 
-The event system in `sys/geom/geom_event.c` handles asynchronous topology operations:
+The `g_vfs_class` in `geom_vfs.c` is the bridge between the VFS layer and GEOM. When a filesystem mounts a GEOM device, the VFS layer associates the `g_vfs_bufops` buffer operations with the device. The key functions are:
 
-**`g_post_event()`** queues an event:
+- **`g_vfs_open()`**: Creates a consumer for the device and attaches it to the geom.
+- **`g_vfs_close()`**: Detaches the consumer and cleans up.
+- **`g_vfs_strategy()`**: Converts VFS buffer requests to GEOM bios and dispatches them.
+- **`g_vfs_done()`**: Completes VFS buffers when GEOM bios finish.
+- **`g_vfs_orphan()`**: Handles device removal by marking the consumer as orphaned.
 
-Events are allocated, populated with the handler function and arguments, and added to the event queue. The event holds references to geom/consumer/provider objects to prevent premature destruction. The event thread is woken to process the new event.
+The `g_vfs_softc` structure tracks per-mount-point state, including access counts and event references.
 
-**`g_run_events()`** processes events in the event thread:
+### Disk Class: geom_disk.c
 
-Events are processed while holding `topology_lock`, ensuring topology consistency during deferred operations like device removal. After processing, references are released and the event structure is freed. The thread sleeps when no events are pending.
+The `g_disk_class` in `geom_disk.c` is the lowest-level GEOM class that interfaces directly with physical disk drivers. It:
+
+- Creates providers for physical disks detected by the kernel
+- Manages disk aliases (alternate device names)
+- Handles disk media changes via `disk_media_changed()`
+- Supports disk labeling and partitioning
+- Integrates with the dump device system via `g_dev_setdumpdev()`
+
+The `g_disk_softc` structure holds per-disk state, including a `struct disk` pointer, `devstat` statistics, and sysctl tree.
+
+### Slice Class: geom_slice.c
+
+The `g_slice_class` implements BSD disklabel slicing. It:
+
+- Parses disklabels from providers
+- Creates slice providers for each partition
+- Handles hot-swap detection via `g_slice_finish_hot()`
+- Validates access conflicts between overlapping slices
+
+The `g_slicer` structure (allocated by `g_slice_alloc()`) holds slice information for each geom, including an array of `struct g_slice` entries.
+
+### Device Node Management: geom_dev.c
+
+The `geom_dev.c` module provides the interface between GEOM and the device node subsystem (cdevsw). It is responsible for creating and managing character device nodes that userland tools use to interact with GEOM devices.
+
+Key responsibilities include:
+
+- **Device node creation**: When a GEOM provider is created, `geom_dev.c` creates a corresponding character device node (`/dev/geom/...`) that userland can open and use. This is done via `make_dev()` which registers the device with the cdev subsystem.
+
+- **Dump device registration**: The function `g_dev_setdumpdev()` allows GEOM devices to be used as dump devices for kernel crash dumps. When a GEOM device is set as the dump device, the dump subsystem routes crash dumps through the GEOM stack.
+
+- **Strategy function**: `g_dev_strategy()` is the character device strategy function that handles I/O requests to GEOM device nodes. It converts incoming requests into bios and dispatches them through the GEOM stack.
+
+- **Device open/close**: The `g_dev_open()` and `g_dev_close()` functions manage access to GEOM device nodes, ensuring proper reference counting and access control.
+
+The geom_dev module essentially acts as the gateway that allows userland tools like `gpart`, `gmirror`, and `geli` to send control requests to GEOM classes via the character device interface.
 
 ## Flow / Diagram
 
 ```mermaid
 flowchart TD
-    subgraph VFS["VFS Layer"]
-        A["struct buf"] -->|"g_vfs_strategy()"| B["struct bio"]
+    subgraph VFS_grp ["VFS Layer"]
+        A[Filesystem I/O] --> B[struct buf]
+        B --> C[g_vfs_strategy]
     end
 
-    subgraph GEOM["GEOM Stack"]
-        B -->|"g_io_request()"| C{Top of Stack?}
-        C -->|"Yes"| D["Class start() function"]
-        C -->|"No"| E["g_down() - forward"]
-        D --> F["Transform bio"]
-        F -->|"g_io_request()"| G{Next Provider?}
-        G -->|"Yes"| E
-        G -->|"No"| H["Physical disk driver"]
-        E -->|"g_io_request()"| D
+    subgraph GEOM_grp ["GEOM Stack"]
+        C --> D[g_io_request]
+        D --> E[g_bio_run_down queue]
+        E --> F[g_io_schedule_down]
+        F --> G[Class start function]
+        G --> H[Bio transformation]
+        H --> K[g_io_deliver]
+        K --> J[g_bio_run_up queue]
+        J --> I[g_io_schedule_up]
+        I --> L[g_vfs_done]
     end
 
-    subgraph Disk["Physical Disks"]
-        H -->|"disk_start()"| I["Hardware I/O"]
+    subgraph Disk_grp ["Disk Driver"]
+        L --> M[g_disk_start]
+        M --> N[Physical Disk]
+        N --> O[bio_done callback]
+        O --> K
     end
 
-    subgraph Return["Return Path"]
-        I -->|"interrupt"| J["g_io_deliver()"]
-        J -->|"g_io_schedule_up()"| K["Up thread"]
-        K -->|"g_std_done()"| L["Unwind transformations"]
-        L -->|"g_vfs_done()"| A
+    subgraph Event_grp ["Event System"]
+        P[g_post_event] --> Q[g_events queue]
+        Q --> R[g_event_procbody]
+        R --> S[Topology changes]
+        S --> D
     end
 
-    subgraph Topology["Topology Management"]
-        M["g_event thread"] -->|"g_run_events()"| N["Topology operations"]
-        N -->|"topology_lock (sx)"| O["Provider/Consumer graph"]
+    subgraph Userland_grp ["Userland Tools"]
+        T[gpart/gmirror/geli] --> U[g_ctl_req]
+        U --> V[Class ctlreq]
+        V --> S
     end
 
-    subgraph IOPipeline["I/O Pipeline"]
-        P["Down thread (g_down_td)"] -->|"g_io_schedule_down()"| Q["g_bio_run_down queue"]
-        R["Up thread (g_up_td)"] -->|"g_io_schedule_up()"| S["g_bio_run_up queue"]
-    end
-
-    B --> P
-    Q --> D
-    S --> L
+    style VFS fill:#e1f5fe
+    style GEOM fill:#fff3e0
+    style Disk fill:#e8f5e9
+    style Event fill:#f3e5f5
+    style Userland fill:#fce4ec
 ```
+
+The diagram shows the complete data flow through GEOM:
+
+1. **VFS Layer** (blue): Filesystem I/O creates `struct buf` objects that are converted to bios.
+2. **GEOM Stack** (orange): Bios travel down the stack via `g_io_request`, get transformed by each class, and return up via `g_io_deliver`.
+3. **Disk Driver** (green): Physical disk drivers receive bios and complete them via callbacks.
+4. **Event System** (purple): Asynchronous topology events are processed by the `g_event` thread.
+5. **Userland Tools** (pink): Tools like `gpart`, `gmirror`, and `geli` send control requests to GEOM classes.
 
 ## Advanced Notes
 
-### Performance Considerations
+### Debugging with DTrace
 
-GEOM's single-threaded topology model (`topology_lock`) is a deliberate design choice that simplifies concurrency at the cost of serialization. All topology changes must wait for the `sx` lock, which can become a bottleneck during heavy configuration changes. However, I/O processing is not affected by this lock — the down and up threads operate independently of topology operations.
+GEOM provides debugging facilities through the `g_dbg_printf()` function in `geom_subr.c`, which uses `sbuf` to format debug output. Debug output can be enabled via the `kern.geom.debugflags` sysctl, which controls verbosity levels for different GEOM classes. The `SDT_PROVIDER_DEFINE(geom)` macro in `geom_subr.c` reserves the DTrace provider namespace for GEOM, though specific SDT probes are not currently defined in the main GEOM code.
 
-The two-threaded I/O pipeline (down and up threads) is intentionally simple. As noted in `sys/geom/geom_kern.c`:
+Example debugging output:
 
-> "We have only one thread in each direction, it is believed that until a very non-trivial workload in the UP/DOWN path this will be enough, but more than one can actually be run without problems."
+```sh
+sysctl kern.geom.debugflags=0x10
+```
 
-The bio queue system (`g_bioq`) batches bios for efficient processing. The `pace` variable in `geom_io.c` provides backoff when memory pressure causes bio allocation failures, preventing cascading failures under load.
+The `g_dbg_printf()` function takes a class name, log level, bio pointer, and format string, and outputs formatted debug information when debug flags are enabled. This is the primary mechanism for tracing GEOM operations at runtime.
+
+### Performance Implications
+
+GEOM's single-threaded topology model can become a bottleneck under heavy I/O load. The `sx` lock serializes all topology changes, which means that if one thread is modifying the topology, all other threads must wait. This is mitigated by:
+
+- Keeping topology operations fast and avoiding sleep in critical paths
+- Using the `g_bioq` queues to batch I/O and reduce lock contention
+- Deferring topology changes to the event thread to avoid blocking I/O
+
+The `g_bio_run_down` and `g_bio_run_up` queues improve throughput by allowing the kernel to reorder and coalesce I/O requests. The `pace` variable in `geom_io.c` controls back-off when memory allocation fails, preventing runaway I/O when the system is under memory pressure.
 
 ### Common Pitfalls
 
-**Sleeping while holding topology_lock:** The topology lock must never be held while sleeping. All topology operations that might sleep use `g_post_event()` to defer work to the event thread. Sleeping in the I/O pipeline threads will deadlock the entire I/O path.
+1. **Topology lock violations**: Calling topology-altering functions without holding the topology lock will cause panics. Always use `g_topology_assert()` to verify lock state during development.
 
-**Access count violations:** The `acr`, `acw`, and `ace` fields in `struct g_consumer` must be managed correctly. A common mistake is failing to call `g_access()` with negative counts when closing a provider, which can prevent geom destruction.
+2. **Event reference leaks**: Forgetting to call `g_cancel_event()` or `g_waitidle()` can cause event references to leak, preventing geom destruction. Always clean up event references in your class's `orphan` function.
 
-**Event reference leaks:** Events hold references to geom/consumer/provider objects via the `ref[]` array. If an event handler fails to properly release these references (by not calling `g_wither_geom()` or `g_wither_provider()`), the affected objects cannot be destroyed, leading to resource leaks.
+3. **Bio queue overflow**: If bios are not delivered promptly, the bio queues can fill up, causing I/O stalls. Ensure that your class's `start` function delivers bios promptly, even if it needs to clone or transform them.
 
-**Bio lifetime management:** Bios must be properly freed via `g_destroy_bio()` when no longer needed. Forgetting to free bios causes memory leaks, especially in error paths where bios might be abandoned.
+4. **Access count mismatches**: Failing to balance `g_access()` calls can leave consumers in an inconsistent state. Always pair `g_access()` calls: increment on open, decrement on close.
+
+5. **Provider name collisions**: GEOM provider names must be unique. Using `g_new_providerf()` with format strings helps avoid collisions. Always check for existing providers before creating new ones.
 
 ### Connection to OS Theory
 
-GEOM exemplifies the "stackable subsystem" pattern described in operating system textbooks like "Operating Systems: Design and Implementation" by Tanenbaum and Woodhull. The provider/consumer model is a form of layered architecture where each layer transforms the interface of the layer below it.
+GEOM implements a layered block device architecture, a concept found in many operating systems but with FreeBSD's unique twist. The provider/consumer model is similar to Linux's block layer, but GEOM's single-threaded topology model is more restrictive, trading flexibility for simplicity.
 
-The single-threaded topology model is analogous to the "single-threaded scheduler" pattern used in many embedded systems, where simplicity of concurrency reasoning is valued over raw throughput. This is similar to how the Linux kernel's original device model used a single "hotplug" thread for device events.
+The bio-based I/O interface is similar to the Unix `struct buf` but with GEOM's transformation layer added. This design allows GEOM to be transparent to filesystems, which see GEOM devices as regular block devices.
 
-GEOM's bio-based I/O interface is conceptually similar to Linux's block layer `struct request`, but with a key difference: FreeBSD's GEOM processes bios in a two-threaded pipeline (down/up), while Linux's block layer uses a more complex queueing discipline with multiple levels of request merging and dispatching.
-
-## Comparison
-
-### FreeBSD GEOM vs. Linux Device-Mapper
-
-Linux's device-mapper subsystem provides similar functionality to GEOM, but with architectural differences. Device-mapper uses a "target" model where each transformation is implemented as a target type (e.g., `linear`, `striped`, `raid1`). Targets are attached to a "table" that describes the mapping, whereas GEOM uses class-based geoms with function pointers for operations.
-
-FreeBSD's GEOM interfaces directly with the VFS layer through the `VFS` class, while Linux device-mapper sits below the filesystem layer and is accessed via block device nodes. GEOM's two-threaded I/O pipeline (down/up) is unique to FreeBSD; Linux uses a more complex request queueing system with multiple levels of merging.
-
-### FreeBSD GEOM vs. macOS/XNU
-
-macOS/XNU uses a different approach with the "IOStorageFamily" framework, which is object-oriented (C++ based) and tightly integrated with IOKit. Unlike GEOM's class-based model, XNU's storage framework uses inheritance hierarchies for transformations. GEOM's approach is more modular and allows runtime composition of transformations.
-
-### FreeBSD GEOM vs. NetBSD/Mir
-
-NetBSD uses "mir" (mirror) as a separate driver for RAID-1, along with "raidframe" for more complex RAID configurations. Unlike GEOM, NetBSD's approach is not stackable — transformations are implemented as separate drivers rather than composable classes. GEOM's stackable design allows arbitrary combinations (e.g., encryption on top of RAID on top of partitioning), while NetBSD requires separate drivers for each combination.
-
-OpenBSD takes a similar approach to NetBSD, with separate drivers for different storage transformations. FreeBSD's GEOM provides a more unified framework that reduces code duplication by sharing common infrastructure across all transformation classes.
-
-### FreeBSD GEOM vs. ZFS
-
-ZFS predates GEOM in FreeBSD and provides its own storage management. While GEOM can layer on top of ZFS devices (e.g., encrypting a ZFS pool), ZFS does not use GEOM internally. ZFS implements its own storage stack with vdevs, which are similar to GEOM providers but with a different abstraction. Modern FreeBSD systems often use ZFS for pooled storage and GEOM for transformations that ZFS doesn't natively support.
+GEOM's event-driven topology model is inspired by the Unix device management paradigm, where device additions and removals are handled asynchronously. This design allows GEOM to react to hardware changes without blocking the I/O path, a key requirement for reliable storage systems.
 
 ## See Also
 - [Buffer Cache — Block I/O Subsystem](../vm/README_bcache.md)
@@ -347,27 +370,11 @@ ZFS predates GEOM in FreeBSD and provides its own storage management. While GEOM
 
 
 
-- **Related source directories:**
-  - `sys/geom/mirror/` — RAID-1 implementation
-  - `sys/geom/eli/` — Disk encryption (LUKS-compatible)
-  - `sys/geom/part/` — Partition table handling (MBR, BSD, GPT)
-  - `sys/geom/label/` — Volume labels
-  - `sys/geom/stripe/` — RAID-0 striping
-  - `sys/geom/concat/` — Concatenation
-  - `sys/geom/journal/` — Write-ahead logging
-  - `sys/geom/raid/` — RAID-5 implementation
-
-- **Related chapters:**
-
-- **Key files to explore:**
-  - `sys/geom/geom.h` — Core data structure definitions
-  - `sys/geom/geom_subr.c` — Topology management functions
-  - `sys/geom/geom_io.c` — I/O pipeline implementation
-  - `sys/geom/geom_event.c` — Event system
-  - `sys/geom/geom_vfs.c` — VFS bridge
-  - `sys/geom/geom_disk.c` — Disk class implementation
-  - `sys/geom/mirror/g_mirror.c` — MIRROR class implementation
+- **Related source directories**: [`sys/geom/mirror/`](mirror), [`sys/geom/eli/`](eli), [`sys/geom/part/`](part), [`sys/geom/label/`](label), [`sys/geom/stripe/`](stripe), [`sys/geom/raid/`](raid)
+- **Related chapters**: [Buffer Cache — Block I/O Subsystem](../vm/README_bcache.md), [CAM — Common Access Method Storage Stack](../cam/README.md), [ZFS — Pooled Storage and Copy-on-Write Filesystem](../contrib/openzfs/README_freebsd.md)
+- **Man pages**: `g_bio.9`, `g_geom.9`, `g_wither_geom.9`, `lock.9`
+- **FreeBSD Handbook**: [Writing a GEOM Class](https://docs.freebsd.org/en/books/handbook/geom-class/)
 
 ---
 
-> _Generated by [DaemonDocs](https://github.com/ocochard/DaemonDocs) on 2026-04-30 20:40 UTC using model `Qwen3.6-35B-A3B-UD-Q4_K_XL` (llama.cpp build `b8985-27aef3dd9`). AI-generated content — verify against source before relying on it._
+> _Generated by [DaemonDocs](https://github.com/ocochard/DaemonDocs) on 2026-05-03 20:35 UTC using model `Qwen3.6-35B-A3B-UD-Q8_K_XL` (llama.cpp build `b8985-27aef3dd9`). AI-generated content — verify against source before relying on it._

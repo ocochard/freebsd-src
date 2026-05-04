@@ -9,112 +9,239 @@
 ---
 
 
-> ⚠ **UNVERIFIED DRAFT** — reviewer did not explicitly approve this draft. Treat claims as suspect until manually reviewed.
-
-
 ## Quick Summary
-The transition from UEFI firmware to the FreeBSD kernel involves a carefully orchestrated handoff that bridges the firmware environment and the operating system's early initialization phase. The `loader.efi` program acts as the intermediary, responsible for reading the kernel binary from the EFI System Partition, mapping it into physical memory, and preparing the execution environment. This stage is critical because the kernel assumes that certain hardware resources are already configured and that memory regions are correctly classified before it begins its own initialization routines.
 
-A central component of this handoff is the EFI memory map, which enumerates every physical memory region known to the firmware along with its type and attributes. The bootloader extracts this map and embeds it into a boot information structure that the kernel reads immediately upon entry. The kernel uses this data to construct its physical memory management structures, marking reserved regions, ACPI tables, and memory-mapped I/O as off-limits to virtual memory allocation. Without this map, the kernel would lack the necessary context to safely manage physical pages.
+The FreeBSD EFI bootloader bridges the gap between UEFI firmware and the FreeBSD kernel. It performs three critical tasks:
 
-The mechanism for passing control differs between architectures due to divergent calling conventions and early boot models. On x86_64, the bootloader sets up a minimal page table, copies the kernel to its final virtual address if relocation is required, and invokes a trampoline routine that switches the CPU into a trusted stack before calling into the kernel's initialization path. On ARM64, the process is more direct: the bootloader flushes instruction and data caches, invokes the kernel entry point with a single argument pointing to the boot information structure, and the kernel immediately configures its early page tables and stack. These architectural variations reflect the different hardware initialization sequences and memory management unit designs of each platform.
+1. **Memory Map Preservation**: The bootloader receives the EFI memory map from firmware and passes it to the kernel via `struct bootinfo`, enabling the kernel to identify usable memory regions.
+2. **Module Loading**: ELF kernel and module files are loaded into memory, with their metadata (headers, symbols) preserved for kernel consumption.
+3. **Handoff**: The bootloader constructs a `struct bootinfo` containing the memory map, loaded modules (`struct preloaded_file`), and boot arguments, then jumps to the kernel entry point with a pointer to this structure.
+
+This chapter explains how these mechanisms work, why they are designed this way, and how FreeBSD's approach compares to Linux and other systems.
 
 ## Architecture
-The EFI bootloader-to-kernel handoff spans the `stand/efi/loader` tree and architecture-specific kernel entry points. The primary entry point resides in `stand/efi/loader/efi_main.c`, where the UEFI firmware passes the system table and boot services table. After initializing console output and EFI library support, the loader proceeds to load the kernel ELF binary. The architecture-specific ELF loaders handle the actual memory mapping and control transfer.
 
-On amd64, `stand/efi/loader/arch/amd64/elf64_freebsd.c` implements `elf64_exec()`. This function allocates a dedicated trampoline page using `BS->AllocatePages`, copies the trampoline assembly code (`amd64_tramp.S`), and sets up early 4-level page tables if copy staging is enabled. It constructs the module metadata chain by calling `md_copymodules()` from `stand/common/modinfo.c`, which iterates over preloaded files and emits self-describing metadata entries. Finally, it jumps to the trampoline, passing the stack pointer, kernel end address, module list pointer, page table base, and kernel entry point.
+FreeBSD's boot process on UEFI systems follows a multi-stage design:
 
-On arm64, `stand/efi/loader/arch/arm64/exec.c` provides a simpler `elf64_exec()`. Before calling `BS->ExitBootServices()`, the loader calls `dev_cleanup()` to release driver resources. It then builds the module information structure via `bi_load()`, flushes the D-cache and invalidates the I-cache for the kernel region using `cpu_flush_dcache()` and `cpu_inval_icache()`, and calls the kernel entry point directly with the module pointer as the sole argument.
+```
+UEFI Firmware → boot1 (GPT boot code) → loader.efi → kernel
+```
 
-Boot information construction is centralized in `stand/common/modinfo.c` and `stand/common/metadata.c`. The `md_copymodules()` function walks the preloaded file chain, emitting identifiers, sizes, addresses, and environment variables into a contiguous memory region. The EFI loader in `stand/efi/loader/bootinfo.c` wraps this process, attaching the EFI memory map and command-line arguments to the boot information structure before the kernel reads it.
+The `loader.efi` binary is the second-stage bootloader. It runs in UEFI runtime services mode, with access to:
+
+- UEFI Boot Services (memory allocation, protocol handles)
+- UEFI Runtime Services (time, variables, reset)
+- GOP (Graphics Output Protocol) for console output
+- Simple File System protocol for disk access
+
+The bootloader operates in a minimal environment with no MMU protection, no virtual memory, and no kernel services. All memory management is done through UEFI Boot Services `AllocatePages()` calls.
+
+**Key Design Principle**: The bootloader must preserve the EFI memory map because the kernel uses it to identify which memory regions are usable, reserved, or ACPI data. Without this map, the kernel cannot safely initialize the virtual memory subsystem.
 
 ## Key Data Structures
-The boot information passed from `loader.efi` to the kernel is built using a chain of `struct file_metadata` entries. Each entry describes a loaded module or a piece of kernel metadata. The `struct file_metadata` type is defined in `stand/common/bootstrap.h` and contains fields for the data pointer, size, type identifier, and a next-pointer for chain traversal. The `md_type` field uses identifiers like `MODINFOMD_ELFHDR` to distinguish between the ELF header, kernel end address, and environment pointers. These are assembled by macros in `stand/common/modinfo.c` such as `MOD_ADDR` and `MOD_SIZE`.
 
-The preloaded file chain is represented by `struct preloaded_file`, defined in `stand/common/bootstrap.h`. Each entry tracks the file name, type, arguments, address, size, and a pointer to associated metadata via `f_metadata`. The kernel reads this chain to discover its own ELF header, the location of additional modules (like kernel modules or device trees), and the boot command line.
+### struct bootinfo
 
-**The boot information structure (`struct bootinfo`)** is the central data structure that the kernel reads upon entry. Defined in `sys/i386/include/bootinfo.h`, it contains version information (`bi_version`), the kernel name string (`bi_kernelname`), environment pointers (`bi_envp`), and a pointer to the module chain (`bi_modulep`). 
+The `struct bootinfo` is the central data structure passed from the bootloader to the kernel. It contains:
 
-**The `bi_module` field (`bi_modulep`)** is a pointer to a self-describing chain of module metadata entries constructed by the bootloader. Each entry in the chain consists of a 32-bit type identifier followed by a 32-bit size field and the data payload. The kernel's `start()` function (in `sys/amd64/amd64/locore.S` / `sys/kern/init_main.c`) reads `bootinfo.bi_modulep` to locate the module chain, iterates through it to find the memory map entry (`MODINFO_MEMMAP`), and uses that to initialize the physical memory manager. This design allows the bootloader to pass arbitrary metadata in a self-describing format where each entry carries its type and size, enabling extensibility without changing the kernel entry point signature.
+- **Memory Map**: The EFI memory map received from firmware, with entries describing each memory region (type, physical address, length, attributes).
+- **preloaded module list**: A linked list of loaded modules (kernel, kernel modules, device tree blobs), each described by a `struct preloaded_file` structure.
+- **Boot Arguments**: Command line arguments, howto flags (e.g., `RB_SINGLE`, `RB_KDB`), console settings.
+- **Metadata Pointers**: Pointers to architecture-specific metadata (e.g., ELF headers, FDT blobs).
 
-The EFI loader constructs this structure in `stand/efi/loader/bootinfo.c` by first calling `md_copymodules()` to build the module metadata chain, then embedding the EFI memory map as a `MODINFO_MEMMAP` entry within that chain.
+The structure is allocated by the bootloader in loader memory and passed to the kernel via the `rdi` register (on amd64) or `x0` register (on arm64) at handoff time.
+
+### preloaded_file Structure
+
+Each loaded module (kernel, kld, FDT) is described by a `struct preloaded_file` structure, defined in `stand/common/bootstrap.h`. It contains:
+
+- A pointer to the file (`f_fp`)
+- A linked list link (`f_next`)
+- Module metadata (type, name, address, size)
+- A metadata list (`f_metadata`) containing ELF headers, linker hints, and other file-specific information
+
+This structure is used throughout the loader to track all loaded files. The kernel accesses the module list via the `bi_modulep` field of `struct bootinfo`, which points to the first `struct preloaded_file` in the chain.
+
+### EFI Memory Map
+
+The EFI memory map is a list of memory descriptor structures received from UEFI firmware via `GetMemoryMap()`. Each entry describes:
+
+- **Type**: Memory type (Conventional, Reserved, ACPI Reclaim, Runtime Services, etc.)
+- **Physical Start**: Starting physical address
+- **Page Count**: Number of 4KB pages
+- **Attributes**: Memory attributes (Write-back, Write-protect, Runtime, etc.)
+
+**Why This Matters**: The kernel uses the EFI memory map during VM initialization to:
+
+1. Identify usable memory for the kernel heap and page tables
+2. Skip reserved regions that may contain firmware data
+3. Preserve ACPI tables in memory
+4. Set up the physical map (pmap) with correct attributes
+
+Without the EFI memory map, the kernel would have no reliable way to determine which memory is safe to use.
 
 ## Deep Dive
-The boot sequence begins in `stand/efi/loader/efi_main.c`. After the UEFI firmware hands over control, `efi_main()` initializes the EFI library, parses the command line, and probes for a bootable device. Once a device is selected, the kernel ELF file is loaded into memory.
 
-On amd64, the handoff is complex due to the need for early virtual memory support. In `stand/efi/loader/arch/amd64/elf64_freebsd.c`, `elf64_exec()` first determines whether copy staging is required. If the kernel is relocatable, staging is disabled; otherwise, it is enabled. The loader allocates a page for the trampoline code (`amd64_tramp.S`):
-```c
-trampcode = copy_staging == COPY_STAGING_ENABLE ?
-    (vm_offset_t)G(1) : (vm_offset_t)G(4);
-err = BS->AllocatePages(AllocateMaxAddress, EfiLoaderData, 1,
-    (EFI_PHYSICAL_ADDRESS *)&trampcode);
-```
-If staging is enabled, three additional pages are allocated for the 4-level page table (`PT4`). The trampoline code is copied, and the page tables are populated to map the kernel and the boot information structure. Finally, the trampoline is invoked:
-```c
-trampoline(trampstack, efi_copy_finish, kernend, modulep, PT4, entry);
-```
-The trampoline switches the CPU to long mode, sets up a stack, and jumps to the kernel entry point.
+### Entry Point: `efi_main`
 
-On arm64, the process is streamlined. In `stand/efi/loader/arch/arm64/exec.c`, `elf64_exec()` calls `dev_cleanup()` to free EFI driver resources before exiting boot services. It then calls `bi_load()` to build the boot information structure:
+The entry point for `loader.efi` is `efi_main()` in `stand/efi/loader/efi_main.c`. This function is called by UEFI firmware with the image handle and system table.
+
 ```c
-err = bi_load(fp->f_args, &modulep, &kernendp, true);
+EFI_STATUS
+efi_main(EFI_HANDLE image_handle, EFI_SYSTEM_TABLE *system_table)
+{
+    // ...
+    IH = image_handle;
+    ST = system_table;
+    BS = ST->BootServices;
+    RS = ST->RuntimeServices;
+
+    // Allocate 64MB heap for loader use
+    heapsize = 64 * 1024 * 1024;
+    status = BS->AllocatePages(AllocateAnyPages, EfiLoaderData,
+        EFI_SIZE_TO_PAGES(heapsize), &heap);
+    // ...
+    setheap((void *)(uintptr_t)heap, (void *)(uintptr_t)(heap + heapsize));
+    // ...
+}
 ```
-The loader then ensures cache coherency by cleaning the D-cache over the kernel region and invalidating the I-cache:
+
+The bootloader allocates a 64MB heap using `AllocatePages()` and initializes the standard library heap. It then parses the load options (command line arguments) and calls `main()`.
+
+### Building Boot Info: `bi_load`
+
+The core function for building the boot information is `bi_load()` in `stand/efi/loader/bootinfo.c`. This function:
+
+1. Collects all loaded modules (kernel, modules, FDT).
+2. Retrieves the EFI memory map from firmware.
+3. Constructs the `struct bootinfo` structure.
+4. Populates the module list with `struct preloaded_file` entries.
+
+The `bi_getboothowto()` function in the same file parses boot arguments and sets flags like `RB_SERIAL` or `RB_KDB`.
+
+### Handoff: amd64
+
+On amd64, the handoff is complex due to the need to set up page tables and potentially relocate the kernel. The entry point is `elf64_exec()` in `stand/efi/loader/arch/amd64/elf64_freebsd.c`.
+
 ```c
-cpu_flush_dcache((void *)clean_addr, clean_size);
-cpu_inval_icache();
+static int
+elf64_exec(struct preloaded_file *fp)
+{
+    // ...
+    // Allocate trampoline code
+    trampcode = (vm_offset_t)G(1);
+    err = BS->AllocatePages(AllocateMaxAddress, EfiLoaderData, 1,
+        (EFI_PHYSICAL_ADDRESS *)&trampcode);
+    // ...
+    bcopy((void *)&amd64_tramp, (void *)trampcode, amd64_tramp_size);
+    trampoline = (void *)trampcode;
+
+    // Allocate page tables
+    PT4 = (pml4_entry_t *)G(1);
+    err = BS->AllocatePages(AllocateMaxAddress, EfiLoaderData, 3,
+        (EFI_PHYSICAL_ADDRESS *)&PT4);
+    // ...
+}
 ```
-Finally, it calls the kernel entry point directly:
+
+The amd64 handoff involves:
+
+1. **Trampoline Allocation**: A small piece of code (`amd64_tramp.S`) is allocated and copied. This trampoline sets up the final page tables and jumps to the kernel.
+2. **Page Table Setup**: The bootloader allocates page tables (`PT4`, `PT3`, `PT2`) and maps the kernel and modules into the final address space.
+3. **Staging Copy**: If the kernel is loaded in a temporary location (staging), it is copied to its final address using the trampoline.
+4. **Jump to Kernel**: The trampoline is executed, which sets up the identity-mapped page tables, copies the kernel if needed, and jumps to the kernel entry point.
+
+### Handoff: arm64
+
+On arm64, the handoff is simpler. The entry point is `elf64_exec()` in `stand/efi/loader/arch/arm64/exec.c`.
+
 ```c
-(*entry)(modulep);
+static int
+elf64_exec(struct preloaded_file *fp)
+{
+    // ...
+    dev_cleanup();
+    efi_time_fini();
+    err = bi_load(fp->f_args, &modulep, &kernendp, true);
+    // ...
+    entry = efi_translate(ehdr->e_entry);
+
+    // Clean D-cache under kernel area and invalidate whole I-cache
+    clean_addr = (vm_offset_t)efi_translate(fp->f_addr);
+    clean_size = (vm_offset_t)efi_translate(kernendp) - clean_addr;
+    cpu_flush_dcache((void *)clean_addr, clean_size);
+    cpu_inval_icache();
+
+    (*entry)(modulep);
+    // ...
+}
 ```
-The kernel entry point on arm64 immediately interprets the `modulep` pointer to reconstruct the boot information structure and begin initialization.
+
+The arm64 handoff involves:
+
+1. **Cleanup**: Device drivers and EFI time services are cleaned up.
+2. **Boot Info Build**: `bi_load()` is called to build the boot information.
+3. **Cache Maintenance**: The D-cache is cleaned and the I-cache is invalidated to ensure the kernel code is coherent.
+4. **Jump to Kernel**: The kernel entry point is called directly with the `modulep` pointer.
 
 ## Flow / Diagram
+
 ```mermaid
 sequenceDiagram
     participant UEFI as UEFI Firmware
     participant Loader as loader.efi
-    participant AMD as amd64/elf64_freebsd.c
-    participant ARM as arm64/exec.c
-    participant Trampoline as amd64_tramp.S
     participant Kernel as FreeBSD Kernel
 
-    UEFI->>Loader: Pass SystemTable, BootServices
-    Loader->>Loader: efi_main() - init console, parse args
-    Loader->>Loader: Load kernel ELF to memory
+    UEFI->>Loader: Call efi_main() with image_handle, system_table
+    Loader->>Loader: Allocate heap (64MB)
+    Loader->>Loader: Parse load options
+    Loader->>Loader: Call main()
+
+    Loader->>Loader: Load kernel and modules
+    Loader->>Loader: Call bi_load() to build bootinfo
 
     alt amd64
-        Loader->>AMD: elf64_exec()
-        AMD->>AMD: Allocate trampoline page
-        AMD->>AMD: Setup 4-level page tables
-        AMD->>AMD: Call md_copymodules() for metadata
-        AMD->>AMD: Jump to trampoline (amd64_tramp.S)
-        Trampoline->>Kernel: Switch to long mode, call entry
+        Loader->>Loader: Allocate trampoline code
+        Loader->>Loader: Allocate page tables (PT4, PT3, PT2)
+        Loader->>Loader: Copy kernel to final address (if needed)
+        Loader->>Loader: Execute trampoline
+        Loader->>Kernel: Jump to kernel entry point
     else arm64
-        Loader->>ARM: elf64_exec()
-        ARM->>ARM: dev_cleanup()
-        ARM->>ARM: bi_load() - build boot info
-        ARM->>ARM: cpu_flush_dcache(), cpu_inval_icache()
-        ARM->>Kernel: Call entry(modulep)
+        Loader->>Loader: Call bi_load()
+        Loader->>Loader: Flush D-cache, Invalidate I-cache
+        Loader->>Kernel: Call kernel entry point
     end
 
-    Kernel->>Kernel: Parse boot info, init VM, start init
+    Kernel->>Kernel: Initialize system using bootinfo
 ```
 
 ## Advanced Notes
-When debugging the boot process, `dmesg` output early in the boot sequence can be sparse. The `loader.efi` environment provides commands like `show bootinfo` to inspect the memory map and module chain before the kernel takes over. If the kernel panics immediately upon entry, the issue often lies in the boot information structure layout or the EFI memory map classification.
 
-On amd64, enabling or disabling copy staging (`set loader.efi.copy_staging=on/off`) can resolve memory layout conflicts on systems with unusual EFI memory maps. The staging mechanism manages the temporary mapping of the kernel into high virtual addresses.
+### Staging Copy
 
-Race conditions are minimal in the bootloader phase because it runs single-threaded under EFI boot services. However, failing to call `dev_cleanup()` on arm64 before `BS->ExitBootServices()` can lead to resource leaks or firmware crashes, as the firmware may reclaim memory that the kernel still expects to be accessible.
+On amd64, the kernel may be loaded in a temporary location (staging) if the final address is not available or if the kernel is relocatable. The `copy_staging` variable controls this behavior. The trampoline code is responsible for copying the kernel to its final address and setting up the page tables.
+
+### Multiboot2 Support
+
+FreeBSD's EFI bootloader also supports booting via Multiboot2, primarily for Xen Dom0. The `multiboot2.c` file in `stand/efi/loader/arch/amd64/` implements a subset of the Multiboot2 specification. This allows the bootloader to be used as a multiboot2-compliant bootloader, passing a `multiboot_header` and related tags to the kernel.
+
+### Cache Maintenance
+
+On arm64, cache maintenance is critical before jumping to the kernel. The `cpu_flush_dcache()` and `cpu_inval_icache()` functions ensure that the kernel code is coherent and visible to the CPU. Failure to do so can result in unpredictable behavior.
+
+### EFI Memory Map Preservation
+
+The EFI memory map is critical for the kernel's virtual memory initialization. The bootloader must ensure that the memory map is passed correctly to the kernel via `struct bootinfo`. The kernel uses this map to identify usable memory regions and set up the physical map (pmap) accordingly.
 
 ## Comparison
-Linux uses a different approach for the EFI handoff. Instead of a custom module metadata chain, Linux relies on the EFI memory map passed via the `efi_memmap` structure and a device tree or ACPI tables for hardware description. The Linux bootloader (often `bzImage` with `setup.x86_64`) performs its own early page table setup and decompression, whereas FreeBSD's `loader.efi` fully loads the kernel ELF before transferring control.
 
-macOS/XNU uses a different boot architecture entirely: the booter (`boot.efi`) loads the kernel and passes a boot-args string and a device-tree blob via a simple handoff structure, rather than a self-describing module metadata chain. The XNU kernel entry point expects a device tree and does not use a FreeBSD-style `struct bootinfo` with `bi_modulep` chains. This contrasts with FreeBSD's extensible module chain design where each entry carries its own type and size.
+### Linux
 
-FreeBSD's use of `struct file_metadata` allows for a highly extensible boot environment where additional modules (like ZFS drivers or custom kernel modules) can be preloaded and described without changing the kernel's entry point signature. This contrasts with Linux's more rigid reliance on firmware-provided tables.
+Linux uses a different approach. The `efi_stub` code is integrated into the kernel image and is executed directly by UEFI firmware, bypassing a separate bootloader. This simplifies the boot process but reduces flexibility. FreeBSD's `loader.efi` provides more flexibility, allowing for module loading, configuration, and user interaction.
+
+### NetBSD/OpenBSD
+
+NetBSD and OpenBSD also use separate bootloaders (`bootxx`, `boot`). Their EFI bootloaders are similar in concept to FreeBSD's `loader.efi`, but the implementation details differ. For example, NetBSD's EFI bootloader (`bootxx_efi`) passes a `struct bootinfo` to the kernel that uses `bi_machdep` for architecture-specific data rather than FreeBSD's flat field layout. OpenBSD's EFI bootloader uses a different module loading strategy where modules are loaded via the `modload` command and stored in a linked list of `struct file` entries rather than FreeBSD's `struct preloaded_file` chain.
 
 ## See Also
 - [Kernel Core — Structure and Entry Point](../../../sys/README.md)
@@ -122,12 +249,6 @@ FreeBSD's use of `struct file_metadata` allows for a highly extensible boot envi
 
 
 
-- `stand/efi/loader/efi_main.c` — UEFI entry point and initialization
-- `sys/kern/init_main.c` — Kernel entry point and early initialization
-- `sys/vm/vm_page.c` — Physical memory management using the EFI memory map
-- `stand/common/modinfo.c` — Module metadata construction
-- `sys/x86/x86/identcpu.c` — CPU identification during early boot
-
 ---
 
-> _Generated by [DaemonDocs](https://github.com/ocochard/DaemonDocs) on 2026-05-01 04:06 UTC using model `Qwen3.6-35B-A3B-UD-Q4_K_XL` (llama.cpp build `b8985-27aef3dd9`). AI-generated content — verify against source before relying on it._
+> _Generated by [DaemonDocs](https://github.com/ocochard/DaemonDocs) on 2026-05-02 20:58 UTC using model `Qwen3.6-35B-A3B-UD-Q8_K_XL` (llama.cpp build `b8985-27aef3dd9`). AI-generated content — verify against source before relying on it._

@@ -15,190 +15,150 @@
 ## Quick Summary
 DTrace is a dynamic tracing framework that enables system administrators and developers to observe the behavior of a running FreeBSD system without stopping execution or modifying source code. Originally developed by Sun Microsystems and inherited by FreeBSD under the Common Development and Distribution License (CDDL), DTrace allows runtime instrumentation of both kernel and userland components. Unlike traditional debugging approaches that require recompiling software or inserting permanent `printf` calls, DTrace attaches probes to virtually any event point, collects data, and even modifies execution behavior with minimal performance impact.
 
-The framework operates through a clear separation of concerns: providers register probes at specific event points, a DIF (DTrace Intermediate Format) interpreter executes user-supplied tracing logic in-kernel, and the userspace `dtrace(1)` command parses D scripts, compiles them into DIF bytecode, and retrieves results. Probes that are not actively enabled carry essentially zero overhead because the kernel skips over them entirely. This design allows pervasive instrumentation to be enabled at any event point without imposing a performance penalty in production, making DTrace viable in environments where even small overhead is unacceptable.
+The framework operates through a clear separation of concerns: providers register probes at specific event points, a DIF (DTrace Intermediate Format) interpreter executes user-supplied tracing logic in-kernel, and the userspace [`dtrace(1)`](../../../../cddl/contrib/opensolaris/cmd/dtrace/dtrace.1) command parses D scripts, compiles them into DIF bytecode, and retrieves results. Probes that are not actively enabled carry essentially zero overhead because the kernel skips over them entirely. This design allows pervasive instrumentation to be enabled at any event point without imposing a performance penalty in production, making DTrace viable in environments where even small overhead is unacceptable.
 
 FreeBSD's implementation organizes tracing logic around Enabling Control Blocks (ECBs) and aggregations. When a probe fires, the framework evaluates a predicate, executes a sequence of bounded DIF instructions, and routes the output to either a buffer for userspace consumption or an in-kernel aggregation. Aggregations compute summary statistics like sums, counts, averages, and histograms directly in the kernel. In-kernel aggregation was chosen over per-event userspace delivery to reduce context-switch overhead and handle high-frequency probes without overwhelming userspace with individual events.
 
 ## Architecture
-The DTrace architecture in FreeBSD is built around four interacting components distributed across `sys/cddl/`. Providers are kernel modules that create probes at specific events. Each provider registers with the framework by creating probe entries that are indexed into hash tables for rapid lookup by module, function, or name. Core providers include `fbt` (function boundary tracing), which instruments kernel function entry and return by temporarily replacing target instructions with trap instructions; `syscall`, which fires on every system call transition; `profile`, which generates periodic interrupts for CPU profiling; `proc`, which traces process lifecycle events; `sdt` (Static DTrace), which uses `SDT_PROBE()` macros embedded directly in kernel code; and `fasttrap`, which instruments userland processes.
+The DTrace architecture in FreeBSD is built around four interacting components distributed across `sys/cddl/`. Providers are kernel modules that create probes at specific events. Each provider registers with the framework by creating probe entries that are indexed into hash tables for rapid lookup by module, function, or name. Core providers include `fbt` (function boundary tracing), which instruments kernel function entry and return; `syscall`, which fires on every system call transition; `profile`, which generates periodic interrupts for CPU profiling; `proc`, which traces process lifecycle events; `sdt` (Static DTrace), which uses `SDT_PROBE()` macros embedded directly in kernel code; and `fasttrap`, which instruments userland processes.
 
 Provider registration and framework initialization occur in `sys/cddl/dev/dtrace/dtrace_load.c`. The `dtrace_load()` function initializes core mutexes (`dtrace_lock`, `dtrace_provider_lock`, `dtrace_meta_lock`), creates hash tables for probe indexing (`dtrace_bymod`, `dtrace_byfunc`, `dtrace_byname`), and registers event handlers for KLD load/unload events to dynamically update probe availability. The framework maintains a linked list of providers (`dtrace_provider`), accessible via the `sysctl_dtrace_providers` sysctl in `sys/cddl/dev/dtrace/dtrace_sysctl.c`.
 
-The DIF interpreter, implemented in `sys/cddl/contrib/opensolaris/uts/common/dtrace/dtrace.c`, executes user-supplied D code as bytecode. The `dtrace(1)` command parses D scripts, validates them against a DOF (DTrace Object Format) schema, and sends the compiled bytecode to the kernel via `/dev/dtrace/interpreter`. The interpreter runs a stack-based virtual machine that supports register allocation, memory access, arithmetic, and control flow, but deliberately excludes unbounded loops and recursive calls. This restriction prevents untrusted user scripts from causing kernel panics through infinite loops or stack overflow, maintaining real-time determinism in production environments. When a probe fires, the framework iterates through the probe's ECB list, evaluates predicates, and executes the associated DIF actions.
+The DIF interpreter, implemented in `sys/cddl/contrib/opensolaris/uts/common/dtrace/dtrace.c`, executes user-supplied D code as bytecode. The [`dtrace(1)`](../../../../cddl/contrib/opensolaris/cmd/dtrace/dtrace.1) command parses D scripts, validates them against a DOF (DTrace Object Format) specification, and uses the `DTRACEHIOC_ADDDOF` ioctl to load the compiled bytecode into the kernel. The kernel's `dtrace_ioctl_helper()` function in `sys/cddl/dev/dtrace/dtrace_ioctl.c` handles the ioctl, copying the DOF payload into kernel space and linking it to the caller's execution context.
 
-ECBs connect probes to actions. Each enabled probe has a list of ECBs (enabling control blocks), each of which contains a predicate and a sequence of DIF actions. The predicate determines whether the actions should execute, and the actions compute values that are stored in buffers or aggregations. Aggregations use hash tables to accumulate statistics keyed by arbitrary dimensions, enabling rich summarization without per-event userspace traffic.
-
-The `fasttrap` provider in `sys/cddl/contrib/opensolaris/uts/common/dtrace/fasttrap.c` provides userland tracing. It replaces user-level instructions with trap instructions, saves the original instructions in a hash table keyed by process ID and program counter, and on trap entry executes the saved instruction in scratch space before resuming normal execution. This mechanism allows tracing of any userland function entry, return, or offset without recompilation.
+The `fasttrap` provider, defined in `sys/cddl/contrib/opensolaris/uts/common/dtrace/fasttrap.c`, allows tracing of any userland instruction. It replaces target instructions with trap instructions, saving the original instruction in a per-process hash table. When the trapped instruction executes, the kernel's trap handler (`fasttrap_sigtrap()`) emulates the instruction, fires the DTrace probes, and resumes execution. This mechanism enables precise instrumentation of userland entry/return points and arbitrary instruction offsets without requiring recompilation of user applications.
 
 ## Key Data Structures
-The FreeBSD DTrace implementation uses several key data structures defined across the source tree.
+The DTrace framework relies on several critical data structures to manage probes, states, and aggregations.
 
-**`kdtrace_thread_t`** (defined in `sys/cddl/dev/dtrace/dtrace_cddl.h`):
 ```c
+# From sys/cddl/dev/dtrace/dtrace_cddl.h
 typedef struct kdtrace_thread {
-    uint8_t     td_dtrace_stop;     /* Indicates a DTrace-desired stop */
-    uint8_t     td_dtrace_sig;      /* Signal sent via DTrace's raise() */
-    uint8_t     td_dtrace_inprobe;  /* Are we in a probe? */
-    u_int       td_predcache;       /* DTrace predicate cache */
-    uint64_t    td_dtrace_vtime;    /* DTrace virtual time */
-    uint64_t    td_dtrace_start;    /* DTrace slice start time */
-    uintptr_t   td_dtrace_pc;       /* DTrace saved pc from fasttrap */
-    uintptr_t   td_dtrace_npc;      /* DTrace next pc from fasttrap */
-    uintptr_t   td_dtrace_scrpc;    /* DTrace per-thread scratch location */
-    uintptr_t   td_dtrace_astpc;    /* DTrace return sequence location */
-    struct trapframe *td_dtrace_trapframe; /* Trap frame from invop */
+	uint8_t		td_dtrace_stop;
+	uint8_t		td_dtrace_sig;
+	uint8_t		td_dtrace_inprobe;
+	u_int		td_predcache;
+	uint64_t	td_dtrace_vtime;
+	uint64_t	td_dtrace_start;
+
+	union __tdu {
+		struct __tds {
+			uint8_t		_td_dtrace_on;
+			uint8_t		_td_dtrace_step;
+			uint8_t		_td_dtrace_ret;
+			uint8_t		_td_dtrace_ast;
+		} _tds;
+		u_long	_td_dtrace_ft;
+	} _tdu;
+
+	uintptr_t	td_dtrace_pc;
+	uintptr_t	td_dtrace_npc;
+	/* ... additional fields ... */
 } kdtrace_thread_t;
 ```
-This structure extends the FreeBSD `struct thread` with DTrace-specific state. The `td_dtrace_vtime` field tracks virtual time for profiling, `td_dtrace_start` tracks the slice start time, and `td_dtrace_pc` and `td_dtrace_npc` store the program counter before and after trap execution for fasttrap probes. Embedded within this structure is a union containing `struct __tds` which holds per-thread DTrace state flags (`_td_dtrace_on` for fasttrap tracepoints, `_td_dtrace_step` for kernel return, `_td_dtrace_ret` for return probes, and `_td_dtrace_ast` for saved AST flags).
+The `kdtrace_thread_t` structure is a FreeBSD-specific extension to `struct thread`, providing thread-local DTrace context. The nested `__tds` structure within the `__tdu` union holds per-thread DTrace state flags, allowing the framework to track which DTrace states are active for a given thread. This is essential for efficiently determining whether a probe should fire without scanning a global list of every active consumer.
 
-**`kdtrace_proc_t`** (defined in `sys/cddl/dev/dtrace/dtrace_cddl.h`):
 ```c
-typedef struct kdtrace_proc {
-    int         p_dtrace_probes;    /* Are there probes for this proc? */
-    uint64_t    p_dtrace_count;     /* Number of DTrace tracepoints */
-    void        *p_dtrace_helpers;  /* DTrace helpers, if any */
-    int         p_dtrace_model;
-    uint64_t    p_fasttrap_tp_gen;  /* Tracepoint hash table gen */
-} kdtrace_proc_t;
-```
-This structure extends `struct proc` with DTrace metadata, tracking whether probes exist for the process and the generation counter for the fasttrap tracepoint hash table.
-
-**`struct dtrace_debug_data`** (defined in `sys/cddl/dev/dtrace/dtrace_debug.c`):
-```c
+# From sys/cddl/dev/dtrace/dtrace_debug.c
 struct dtrace_debug_data {
-    uintptr_t lock __aligned(CACHE_LINE_SIZE);
-    char bufr[DTRACE_DEBUG_BUFR_SIZE];
-    char *first;
-    char *last;
-    char *next;
-} dtrace_debug_data[MAXCPU];
+	/* Debug output buffer and state */
+};
 ```
-This per-CPU structure provides a circular buffer for DTrace debug output. The lock field is aligned to cache line size to avoid false sharing between CPUs.
+The `dtrace_debug_data` structure manages the internal debug output mechanism, used by functions like `dtrace_debug_printf()` and `dtrace_debug_vprintf()` to emit diagnostic messages during probe execution or framework initialization. This is particularly useful for troubleshooting D scripts that fail to compile or execute correctly.
+
+The core probe management relies on hash tables created during `dtrace_load()`. These tables map module names, function names, and probe names to `dtrace_probe_t` structures, enabling O(1) lookup when a provider fires an event. The `dtrace_state_cache` is a kernel memory cache (`kmem_cache_create()`) that allocates per-CPU state structures for each active DTrace consumer. This per-CPU design minimizes lock contention when multiple CPUs evaluate DIF instructions simultaneously.
+
+Aggregations are managed through internal state tracked within `dtrace_state_t` structures. The `dtrace_aggid2agg()` function in `dtrace_ioctl.c` resolves aggregation IDs to their kernel structures during ioctl calls like `DTRACEIOC_AGGDESC`, allowing userspace to query aggregation metadata.
 
 ## Deep Dive
-The DTrace framework initializes in `sys/cddl/dev/dtrace/dtrace_load.c`. The `dtrace_load()` function performs the following steps:
+The lifecycle of a DTrace probe begins with provider registration and ends with userspace consumption. When the DTrace module loads, `dtrace_load()` in `sys/cddl/dev/dtrace/dtrace_load.c` sets up the foundational infrastructure. It registers the `dtrace_trap_func` hook to intercept traps (used by `fasttrap` and `fbt`), and the `dtrace_vtime_switch_func` hook to track virtual time during thread switches. It also creates a taskq (`dtrace_taskq`) for deferred work, such as cleaning up inactive probes or flushing aggregated data.
 
-1. **Initialize mutexes**: Three core mutexes are created — `dtrace_lock` for probe state, `dtrace_provider_lock` for provider state, and `dtrace_meta_lock` for meta-provider state. These are initialized without witness debugging to avoid malloc-related panics in low-memory situations.
+```c
+# From sys/cddl/dev/dtrace/dtrace_load.c
+static void
+dtrace_load(void *dummy)
+{
+	/* ... initialization ... */
+	mutex_init(&dtrace_lock,"dtrace probe state", MUTEX_DEFAULT, NULL);
+	mutex_init(&dtrace_provider_lock,"dtrace provider state", MUTEX_DEFAULT, NULL);
+	mutex_init(&dtrace_meta_lock,"dtrace meta-provider state", MUTEX_DEFAULT, NULL);
 
-2. **Create hash tables**: Three hash tables index probes for rapid lookup:
-   - `dtrace_bymod`: indexed by module name
-   - `dtrace_byfunc`: indexed by function name
-   - `dtrace_byname`: indexed by probe name
+	dtrace_state_cache = kmem_cache_create("dtrace_state_cache",
+	    sizeof (dtrace_dstate_percpu_t) * (mp_maxid + 1),
+	    DTRACE_STATE_ALIGN, NULL, NULL, NULL, NULL, NULL, 0);
 
-3. **Register KLD hooks**: Event handlers for `kld_load` and `kld_unload_try` events ensure providers are available when modules load and removed when they unload.
+	dtrace_bymod = dtrace_hash_create(offsetof(dtrace_probe_t, dtpr_mod),
+	    offsetof(dtrace_probe_t, dtpr_nextmod),
+	    offsetof(dtrace_probe_t, dtpr_prevmod));
+	/* ... more hash tables ... */
+}
+```
+The use of `kmem_cache_create()` for `dtrace_state_cache` ensures that per-CPU state structures are allocated efficiently, with alignment optimized for cache lines. The hash tables (`dtrace_bymod`, `dtrace_byfunc`, `dtrace_byname`) are initialized with offsets to the probe's name fields, allowing the framework to quickly find probes by any of these attributes when a provider fires.
 
-4. **Set up CPU-specific state**: The `dtrace_ap_start()` function (registered via `SYSINIT(dtrace_ap_start, SI_SUB_SMP, SI_ORDER_ANY, dtrace_ap_start, NULL)`) sets up DTrace on all APs after SMP initialization, calling `dtrace_cpu_setup(CPU_CONFIG, i)` for each non-bootstrap CPU.
+When a user runs a D script, [`dtrace(1)`](../../../../cddl/contrib/opensolaris/cmd/dtrace/dtrace.1) compiles it into DOF bytecode. The kernel receives this via `DTRACEHIOC_ADDDOF` ioctl, handled by `dtrace_ioctl_helper()` in `sys/cddl/dev/dtrace/dtrace_ioctl.c`. The function calls `dtrace_dof_copyin()` to safely copy the DOF payload from userspace, then `dtrace_helper_slurp()` to parse and link the probes to the caller's execution context. This separation ensures that kernel memory is not directly mapped from untrusted userspace.
 
-The DIF interpreter in `sys/cddl/contrib/opensolaris/uts/common/dtrace/dtrace.c` executes user-supplied D code as bytecode. Key aspects of the interpreter:
+The DIF interpreter executes bytecode in a bounded manner. Each DIF instruction has a fixed execution cost, and the interpreter enforces a maximum instruction count to prevent infinite loops. When a probe fires, the interpreter evaluates predicates first; if a predicate is false, the DIF bytecode is skipped entirely. If true, the interpreter executes the DIF instructions, which may update variables, write to buffers, or invoke aggregations.
 
-- **Bounded execution**: The interpreter deliberately excludes unbounded loops and recursive calls. All loops have a maximum iteration count specified at compile time. This restriction prevents untrusted user scripts from causing kernel panics through infinite loops or stack overflow, maintaining real-time determinism in production environments where system stability is paramount.
-- **Register-based**: DIF uses a set of virtual registers for data manipulation.
-- **Memory access**: The interpreter can read kernel and user memory but validates all access to prevent panics.
-- **Stack-based**: The interpreter uses a stack for temporary values and function calls.
+The `fbt` provider instruments kernel functions by replacing target instructions with trap instructions. When a function is enabled for tracing, `fbt_enable()` in `sys/cddl/dev/fbt/fbt.c` creates `fbt_probe_t` structures for each trace point and patches the target instruction with a trap. When the instrumented instruction executes, the CPU raises a trap, transferring control to `fbt_invop()`, which looks up the original instruction, fires the associated DTrace probes, and resumes execution. This mechanism allows fbt to instrument function entry and return points at arbitrary addresses without requiring recompilation of the kernel.
 
-When a probe fires, the framework:
-1. Evaluates the probe's predicate (cached in `td_predcache` for performance)
-2. If the predicate is true, iterates through the ECB list
-3. For each ECB, executes the DIF actions
-4. Routes output to buffers or aggregations
+The connection between probes and actions is mediated by ECBs. Each `dtrace_probe_t` structure contains `dtpr_ecb` and `dtpr_ecb_last` pointers that link to a linked list of `dtrace_ecb_t` structures. When a probe fires, the framework iterates over its ECB list, evaluating each ECB's predicate and executing its DIF instructions. Each ECB in turn contains pointers to its associated `dtrace_action_t` structures, which define the output behavior (buffer writes, variable updates, aggregation updates). This hierarchical structure—probe containing ECBs containing actions—allows a single probe to trigger multiple independent actions, each with its own DIF instruction sequence and output destination.
 
-Aggregations in DTrace are computed in-kernel using hash tables. Each aggregation has a set of dimensions (keys) and an action (sum, count, avg, histogram). When a probe fires, the DIF actions compute key values and the aggregation updates its statistics. This design minimizes userspace traffic by only transferring summary statistics rather than per-event data. In-kernel aggregation was designed this way to reduce context-switch overhead and handle high-frequency probes without overwhelming userspace, which would be impractical if every probe event required a separate delivery to userspace.
-
-The fasttrap provider in `sys/cddl/contrib/opensolaris/uts/common/dtrace/fasttrap.c` implements userland tracing through instruction replacement. When a userland probe is enabled, the `dtrace(1)` command sends a `FASTTRAPIOC_MAKEPROBE` ioctl to the kernel, which causes the kernel to:
-
-1. Save the original instruction at the target address in a hash table keyed by process ID and program counter
-2. Replace the instruction with a trap instruction (INT3 on x86)
-3. On trap entry, execute the saved instruction in scratch space reserved in the thread's `kdtrace_thread` structure
-4. Adjust the program counter to continue from the next instruction
-5. Restore the original instruction or install a new trap for subsequent hits
-
-This mechanism allows tracing of any userland function entry, return, or offset without recompilation. Probe enabling and disabling is managed through the `dtrace_ioctl()` function in `sys/cddl/dev/dtrace/dtrace_ioctl.c`. The ioctl handler retrieves the DTrace state from the device private data using `devfs_get_cdevpriv()`, then dispatches based on the command code. For example, `DTRACEIOC_AGGDESC` retrieves aggregation descriptor information by looking up the aggregation ID via `dtrace_aggid2agg()`, then copying out the aggregation's action records and metadata. Helper ioctls are handled by `dtrace_ioctl_helper()`, which processes `DTRACEHIOC_ADDDOF` to load DOF modules (via `dtrace_helper_slurp()`) and `DTRACEHIOC_REMOVE` to unload them (via `dtrace_helper_destroygen()`). These ioctls are the primary mechanism by which the userspace `dtrace(1)` command communicates probe definitions, enabling/disabling, and aggregation queries to the kernel.
+For userland tracing, `fasttrap` replaces target instructions with trap instructions. When a trapped instruction executes, the CPU raises a trap, transferring control to the kernel. `fasttrap_sigtrap()` intercepts this trap, looks up the original instruction in the per-process hash table, emulates it, and fires any associated DTrace probes. This mechanism allows precise instrumentation of userland code without modifying the application's binary.
 
 ## Flow / Diagram
+The following Mermaid class diagram illustrates the key data structures and their relationships in the DTrace framework.
+
 ```mermaid
 classDiagram
     class dtrace_probe_t {
-        dtrace_provider_t *dtpr_provider
-        dtrace_state_t *dtpr_state
-        const char *dtpr_mod
-        const char *dtpr_func
-        const char *dtpr_name
-        dtrace_ecb_t *dtpr_ecbs
+        +dtrace_id_t dtpr_id
+        +dtrace_ecb_t *dtpr_ecb
+        +dtrace_ecb_t *dtpr_ecb_last
+        +dtrace_probe_t *dtpr_nextmod
+        +dtrace_probe_t *dtpr_nextfunc
+        +dtrace_probe_t *dtpr_nextname
     }
+
     class dtrace_ecb_t {
-        dtrace_pred_t dte_pred
-        dtrace_action_t dte_action
-        dtrace_recdesc_t dte_rec
+        +dtrace_difinst_t *dte_insts
+        +dtrace_action_t *dte_actions
+        +dtrace_predicate_t *dte_predicate
     }
-    class dtrace_aggregation_t {
-        dtrace_action_t dtag_action
-        dtrace_state_t *dtag_state
-        void *dtag_base
+
+    class dtrace_action_t {
+        +uint32_t dta_kind
+        +dtrace_recdesc_t dta_rec
+        +dtrace_action_t *dta_next
     }
+
     class dtrace_state_t {
-        dtrace_dstate_percpu_t *dts_percpu
-        dof_helper_t *dts_dof
-        int dts_anon
+        +int dtds_cpu
+        +dtrace_state_t dtds_state
     }
+
     class kdtrace_thread_t {
-        uint8_t td_dtrace_inprobe
-        uint64_t td_dtrace_vtime
-        uintptr_t td_dtrace_pc
-        uintptr_t td_dtrace_npc
+        +uint8_t td_dtrace_inprobe
+        +uint8_t td_dtrace_on
+        +uintptr_t td_dtrace_pc
+        +uintptr_t td_dtrace_npc
     }
-    class kdtrace_proc_t {
-        int p_dtrace_probes
-        uint64_t p_dtrace_count
-    }
-    class fasttrap_probe_t {
-        uintptr_t ft_addr
-        uint32_t ft_inst
-        fasttrap_proc_t *ft_proc
-    }
-    dtrace_probe_t --> dtrace_ecb_t : has
-    dtrace_ecb_t --> dtrace_aggregation_t : may contain
-    dtrace_probe_t --> dtrace_state_t : belongs to
-    kdtrace_thread_t ..> dtrace_state_t : references
-    kdtrace_proc_t ..> dtrace_state_t : references
-    fasttrap_probe_t --> dtrace_probe_t : implements
+
+    dtrace_probe_t --> dtrace_ecb_t : contains
+    dtrace_ecb_t --> dtrace_action_t : contains
+    dtrace_action_t ..> dtrace_state_t : updates
+    kdtrace_thread_t ..> dtrace_state_t : evaluates
 ```
 
 ## Advanced Notes
-DTrace's safety in production environments stems from several design decisions:
+DTrace's safety in production environments stems from its bounded execution model and zero-overhead inactive probes. The DIF interpreter does not allow unbounded loops; all control flow is resolved at compile time, and the interpreter enforces a maximum instruction count. This prevents a misbehaving D script from hanging the kernel. Additionally, inactive probes are skipped entirely, meaning the kernel pays no performance penalty for having probes registered but not enabled.
 
-1. **Zero-overhead disabled probes**: Probes that are not enabled carry essentially zero overhead. The kernel skips over probe points entirely when no consumer has them enabled. This design was chosen to enable pervasive instrumentation at any event point without performance penalty, making DTrace viable in production where even small overhead is unacceptable.
+When debugging DTrace scripts, the `dtrace_debug_printf()` and related functions in `dtrace_debug.c` can be used to emit diagnostic messages. These are particularly useful when a script fails to compile or when probes do not fire as expected. The `dtrace_debug_data` structure manages the output buffer, ensuring that debug messages do not interfere with normal probe execution.
 
-2. **Bounded execution**: The DIF interpreter excludes unbounded loops and recursive calls. All loops have a maximum iteration count, preventing infinite loops from freezing the system. This restriction is necessary because DTrace allows user scripts to execute in kernel context; without bounds, a malicious or buggy script could cause a kernel panic or denial of service.
+Performance tuning for DTrace involves understanding the cost of aggregations versus per-event delivery. Aggregations are efficient for high-frequency probes because they batch data in-kernel, reducing context-switch overhead. However, large aggregations can consume significant kernel memory. The `dtrace_retain_max` sysctl controls the maximum number of retained DTrace states, preventing a single consumer from exhausting kernel memory.
 
-3. **Memory validation**: The interpreter validates all memory access to prevent panics from invalid pointers.
+Common pitfalls include forgetting that DTrace probes fire in interrupt context for some providers (like `profile`), which restricts the available functions and data structures. Another pitfall is assuming that `fbt` probes can be enabled on every kernel function without performance impact; while the probes themselves have zero overhead when disabled, enabling them on high-frequency functions like `cpu_idle` or `sched_switch` can introduce significant overhead due to the trap instruction replacement and context switching.
 
-4. **In-kernel aggregations**: By computing statistics in-kernel, DTrace minimizes the amount of data transferred to userspace, reducing context-switch overhead.
-
-5. **Destructive mode**: DTrace has a destructive mode that allows modifying program execution, but this is disabled by default and requires explicit configuration.
-
-Common pitfalls when using DTrace:
-
-- **Over-aggregation**: Creating too many unique aggregation keys can consume significant kernel memory. Use dimension limits to prevent this.
-- **Predicate complexity**: Complex predicates can slow down probe firing. Keep predicates simple and evaluate them early.
-- **Provider conflicts**: Multiple providers may instrument the same event. Be aware of potential conflicts when combining providers.
-- **Memory pressure**: DTrace can consume significant memory for buffers and aggregations. Monitor memory usage in production.
-
-The `dtrace_debug_data` structure in `sys/cddl/dev/dtrace/dtrace_debug.c` provides a per-CPU circular buffer for debug output. This is useful for tracing issues within probe context where normal printf is not available. The locking mechanism uses atomic compare-and-swap operations with spinlocks, aligned to cache lines to avoid false sharing between CPUs.
-
-For debugging with DTrace, the `dtrace(1)` command supports several useful options:
-- `dtrace -n 'provider:::action'` for specifying probes by name
-- `dtrace -c 'command'` for tracing a specific command
-- `dtrace -p pid` for attaching to a running process
-- `dtrace -x` for setting DTrace options
-
-## Comparison
-FreeBSD's DTrace implementation differs from Linux's tracing infrastructure in several ways. Linux uses kprobes, ftrace, and eBPF for similar functionality. kprobes allows inserting probes at arbitrary kernel instructions, similar to FreeBSD's fbt provider. ftrace provides a framework for tracing functions, while eBPF provides JIT-compiled (rather than interpreted) programs with a verifier that validates programs before loading them. A key differentiator is that eBPF can attach to kernel hooks like TC (traffic control) and XDP (eXpress Data Path) that DTrace does not support, and eBPF programs are compiled to machine code by the kernel's JIT compiler rather than interpreted as bytecode.
-
-macOS/XNU includes DTrace as well, inherited from Solaris through Apple's licensing. XNU's DTrace implementation includes several Apple-specific providers beyond FreeBSD's: the `mach` provider for Mach kernel events, the `io` provider for I/O subsystem tracing, and the `syscall` provider with extended argument decoding for macOS-specific system calls. XNU also includes Apple-specific extensions to the standard DTrace providers.
-
-NetBSD does not include DTrace in its default kernel. Instead, NetBSD uses `ktrace` for system call tracing and `ptrace` for userland debugging. These mechanisms operate at a different level than DTrace: `ktrace` records system call arguments and return values through a dedicated tracing facility built into the syscall layer, while `ptrace` provides a process debugging interface for inspection and modification. Neither provides the in-kernel bytecode interpreter model that DTrace uses, nor the ability to instrument arbitrary event points with user-defined actions.
-
-The key structural difference between FreeBSD's DTrace and Linux's eBPF is in the execution model. DTrace uses a DIF bytecode interpreter that executes user-supplied D code in-kernel, while eBPF uses a verifier to validate eBPF programs before loading them into the kernel. Both approaches provide safe in-kernel execution, but eBPF's verifier provides additional safety guarantees by analyzing programs before they are loaded.
+The `fasttrap` provider's use of trap instructions means that tracing userland code can interfere with debugging tools like `gdb` if both attempt to control the same process. Additionally, `fasttrap` must carefully handle instruction emulation for branches and jumps, which can be complex on certain architectures. The `fasttrap_sigtrap()` function in `fasttrap.c` contains architecture-specific code to handle these cases, ensuring that the emulated instruction executes correctly before resuming userland execution.
 
 ## See Also
 - [Kernel Core — Structure and Entry Point](../../../README.md)
@@ -207,13 +167,14 @@ The key structural difference between FreeBSD's DTrace and Linux's eBPF is in th
 
 
 
-- `sys/cddl/dev/dtrace/` — DTrace framework implementation
-- `sys/cddl/contrib/opensolaris/uts/common/dtrace/` — DTrace core implementation
-- `sys/kern/` — Kernel core implementation
-- `sys/vm/` — Virtual memory subsystem
-- `sys/kern/README_process.md` — Process management
-- `sys/kern/README_locking.md` — Locking primitives
+- [`sys/cddl/dev/dtrace/dtrace_load.c`](dtrace_load.c) — Framework initialization and provider registration
+- [`sys/cddl/dev/dtrace/dtrace_ioctl.c`](dtrace_ioctl.c) — Userspace-kernel interface for DOF loading and aggregation management
+- [`sys/cddl/contrib/opensolaris/uts/common/dtrace/fasttrap.c`](../../contrib/opensolaris/uts/common/dtrace/fasttrap.c) — Userland trap-based tracing implementation
+- [`sys/cddl/contrib/opensolaris/uts/common/dtrace/dtrace.c`](../../contrib/opensolaris/uts/common/dtrace/dtrace.c) — Core DTrace framework and DIF interpreter
+- [`sys/cddl/dev/dtrace/dtrace_cddl.h`](dtrace_cddl.h) — Thread-local DTrace state structures
+- [`sys/cddl/dev/dtrace/dtrace_debug.c`](dtrace_debug.c) — Internal debug output mechanisms
+- [`cddl/contrib/opensolaris/cmd/dtrace/dtrace.1`](../../../../cddl/contrib/opensolaris/cmd/dtrace/dtrace.1) — Userspace [`dtrace(1)`](../../../../cddl/contrib/opensolaris/cmd/dtrace/dtrace.1) command documentation
 
 ---
 
-> _Generated by [DaemonDocs](https://github.com/ocochard/DaemonDocs) on 2026-05-01 04:39 UTC using model `Qwen3.6-35B-A3B-UD-Q4_K_XL` (llama.cpp build `b8985-27aef3dd9`). AI-generated content — verify against source before relying on it._
+> _Generated by [DaemonDocs](https://github.com/ocochard/DaemonDocs) on 2026-05-04 01:07 UTC using model `Qwen3.6-35B-A3B-UD-Q8_K_XL` (llama.cpp build `b8985-27aef3dd9`). AI-generated content — verify against source before relying on it._

@@ -16,7 +16,7 @@ The tree is divided into four broad categories by license and origin. The base s
 
 Beyond the major directories, several specialized trees serve distinct purposes. `stand/` contains the boot loader source, split between architecture-independent code and platform-specific loaders for UEFI, U-Boot, and traditional BIOS. `rescue/` builds a self-contained set of statically linked commands that survive a broken userland — useful for recovery when `/bin` or `/sbin` no longer function. `tests/` mirrors the source hierarchy to provide a comprehensive test suite driven by Kyua. `include/` holds the public header files installed to `/usr/include`, and `libexec/` contains commands designed to be executed by other programs rather than invoked directly by users, such as the dynamic linker `rtld-elf` and the init daemon `rc`.
 
-At the top level, a single `Makefile` defines build targets, and a `README.md` provides a quick-reference table of every directory. The kernel source tree has its own `README.md` under `sys/` with its own detailed documentation. The build system itself — including `Makefile.inc1`, the `share/mk/` rule library, and the `src.conf(5)` configuration framework — is documented in the Build System chapter; this chapter focuses solely on what lives where and why.
+At the top level, a single `Makefile` defines build targets, and a `README.md` provides a quick-reference table of every directory. The kernel source tree has its own `README.md` under `sys/` with its own detailed documentation. The build system itself — including `Makefile.inc1`, the `share/mk/` rule library, and the [`src.conf(5)`](share/man/man5/src.conf.5) configuration framework — is documented in the Build System chapter; this chapter focuses solely on what lives where and why.
 
 ## Architecture
 
@@ -75,7 +75,7 @@ The directory taxonomy breaks down as follows:
 
 **`kerberos5/`** and **`krb5/`** — Build systems for Kerberos 5 (Heimdal and MIT implementations, respectively). These directories contain build infrastructure but not raw source code; the actual Kerberos sources come from `crypto/heimdal/` and `crypto/krb5/`.
 
-The separation between base BSD code and third-party code is enforced at multiple levels. The `COPYRIGHT` file at the tree root declares the 2-clause BSD license for the FreeBSD Project's contributions. The `gnu/COPYING` and `gnu/COPYING.LIB` files contain the GPL and LGPL texts. The `cddl/` directory contains CDDL-licensed code with its own license headers. Each directory's `Makefile` includes only the components that the current build configuration enables, using `src.conf(5)` knobs such as `WITHOUT_GNU`, `WITHOUT_CDDL`, and `WITHOUT_TESTS`.
+The separation between base BSD code and third-party code is enforced at multiple levels. The `COPYRIGHT` file at the tree root declares the 2-clause BSD license for the FreeBSD Project's contributions. The `gnu/COPYING` and `gnu/COPYING.LIB` files contain the GPL and LGPL texts. The `cddl/` directory contains CDDL-licensed code with its own license headers. Each directory's `Makefile` includes only the components that the current build configuration enables, using [`src.conf(5)`](share/man/man5/src.conf.5) knobs such as `WITHOUT_GNU`, `WITHOUT_CDDL`, and `WITHOUT_TESTS`.
 
 Architecture-specific code under `sys/` follows a consistent pattern. Each supported architecture has a directory under `sys/` named after the architecture (e.g., `sys/amd64/`, `sys/arm64/`, `sys/riscv/`). Within each architecture directory, `locore.S` contains the assembly entry point, and `clock.c`, `pmap.c`, `vm_machdep.c`, and similar files contain architecture-specific implementations of kernel interfaces. The architecture-independent code lives in `sys/kern/`, `sys/vm/`, `sys/net/`, and other subsystem directories. The `sys/conf/` directory contains the kernel configuration framework, including the `newvers.sh` script that generates the version string.
 
@@ -159,7 +159,7 @@ The `rescue/` directory's use of `crunchgen` to produce a single statically link
 
 Under `sys/`, the architecture-specific code in `sys/<arch>/<arch>/locore.S` follows a strict convention: the entry point symbol (e.g., `btext` on x86_64) is the first instruction executed after the bootloader transfers control. This assembly code switches the CPU to the appropriate mode (long mode on x86_64, MMU enabled on ARM64), establishes a kernel stack, and calls the C entry point. The `sys/README.md` documents this sequence in detail.
 
-The `share/mk/` directory contains the Makefile rule library that defines how each component is built. This is the domain of the Build System chapter; the key point for this chapter is that `share/mk/README.md` exists and documents the build rules, including `bsd.prog.mk`, `bsd.kmod.mk`, `bsd.sys.mk`, and the `src.conf(5)` configuration framework. The top-level `Makefile` delegates to `Makefile.inc1`, which orchestrates the full build sequence.
+The `share/mk/` directory contains the Makefile rule library that defines how each component is built. This is the domain of the Build System chapter; the key point for this chapter is that `share/mk/README.md` exists and documents the build rules, including `bsd.prog.mk`, `bsd.kmod.mk`, `bsd.sys.mk`, and the [`src.conf(5)`](share/man/man5/src.conf.5) configuration framework. The top-level `Makefile` delegates to `Makefile.inc1`, which orchestrates the full build sequence.
 
 When navigating the source tree, keep in mind that some directories are build-system only and do not contain source code. `kerberos5/` and `krb5/` are build directories that invoke the actual Kerberos sources from `crypto/heimdal/` and `crypto/krb5/`. `release/` contains release engineering scripts, not runtime code. `targets/` is experimental infrastructure for the `DIRDEPS_BUILD` system. `tools/` contains development utilities that are not installed as part of the base system.
 
@@ -171,13 +171,11 @@ The `UPDATING` file at the tree root contains notes for developers about changes
 
 
 
-- `sys/README.md` — Kernel source structure and entry points
-- `share/mk/README.md` — Build system documentation (Makefile rules, build phases, src.conf(5))
-- `tests/README` — Test suite organization and usage
-- `rescue/README` — Rescue command build system
-- `crypto/README` — Export-controlled source separation
+- [`tests/README`](tests/README) — Test suite organization and usage
+- [`rescue/README`](rescue/README) — Rescue command build system
+- [`crypto/README`](crypto/README) — Export-controlled source separation
 - `COPYRIGHT` — BSD license text for the FreeBSD Project
-- `gnu/COPYING` — GPL license text for GNU-licensed code
+- [`gnu/COPYING`](gnu/COPYING) — GPL license text for GNU-licensed code
 - `UPDATING` — Developer update notes and build changes
 - [FreeBSD Handbook — Building from Source](https://docs.freebsd.org/en/books/handbook/cutting-edge/#makeworld) — User-facing build documentation
 - [FreeBSD Handbook — Kernel Configuration](https://docs.freebsd.org/en/books/handbook/kernelconfig/) — Kernel build documentation

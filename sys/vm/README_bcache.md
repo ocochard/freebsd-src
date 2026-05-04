@@ -143,11 +143,11 @@ macOS/XNU uses the `buf` structure but manages buffer lifecycles through the `bu
 
 
 
-- `sys/kern/vfs_bio.c`
-- `sys/kern/vfs_cluster.c`
-- `sys/sys/buf.h`
-- `sys/sys/bufobj.h`
-- `man buf(9)`
+- [`sys/kern/vfs_bio.c`](../kern/vfs_bio.c)
+- [`sys/kern/vfs_cluster.c`](../kern/vfs_cluster.c)
+- [`sys/sys/buf.h`](../sys/buf.h)
+- [`sys/sys/bufobj.h`](../sys/bufobj.h)
+- `man [buf(9)](../../share/man/man9/buf.9)`
 - `man bio(9)`
 
 ---

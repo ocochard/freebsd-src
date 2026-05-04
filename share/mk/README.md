@@ -9,18 +9,15 @@
 ---
 
 
-> ⚠ **UNVERIFIED DRAFT** — reviewer did not explicitly approve this draft. Treat claims as suspect until manually reviewed.
-
-
 ## Quick Summary
 
-FreeBSD uses a hierarchical Makefile-based build system that can compile the entire operating system — userland programs, libraries, kernel, and documentation — from a single source tree. The system is built around the `make(1)` command and a collection of `.mk` include files that define how to compile, link, and install each component. At the top level, a simple `Makefile` delegates to `Makefile.inc1`, which orchestrates the full build sequence through targets like `buildworld` and `buildkernel`.
+FreeBSD uses a hierarchical Makefile-based build system that compiles the entire operating system — userland programs, libraries, kernel, and documentation — from a single source tree. The system is built around the [`make(1)`](../../contrib/bmake/make.1) command and a collection of `.mk` include files that define how to compile, link, and install each component. At the top level, a simple `Makefile` delegates to `Makefile.inc1`, which orchestrates the full build sequence through targets like `buildworld` and `buildkernel`.
 
 The build system separates concerns into modular pieces. `bsd.prog.mk` handles building userland programs with compiler flags and linker options. `bsd.kmod.mk` handles kernel modules. `bsd.sys.mk` defines common compiler settings and warning levels. Each directory in the source tree has a `Makefile` that includes the appropriate `.mk` files and lists source files or subdirectories. The system supports out-of-tree builds where object files are placed in separate directories, keeping the source tree clean.
 
 Kernel builds work differently from userland builds. A kernel configuration file (like `GENERIC`) is processed by the `config` tool, which generates C source files for device drivers and syscall tables. These generated files are then compiled and linked into a single kernel binary. The build system tracks dependencies between source files and headers, and can rebuild only what is necessary when sources change.
 
-The build system also supports cross-compilation, allowing FreeBSD to be built for different architectures from a single host. The `universe` target builds all supported architectures and kernels simultaneously. Build options are controlled through `src.conf(5)`, which allows fine-grained control over what gets built and which features are enabled or disabled.
+The build system also supports cross-compilation, allowing FreeBSD to be built for different architectures from a single host. The `universe` target builds all supported architectures and kernels simultaneously. Build options are controlled through [`src.conf(5)`](../man/man5/src.conf.5), which allows fine-grained control over what gets built and which features are enabled or disabled.
 
 ## Architecture
 
@@ -39,7 +36,7 @@ The FreeBSD build system follows a layered architecture where each layer builds 
 `Makefile.inc1` at the source root is the central orchestrator. It defines the `buildworld` and `buildkernel` targets, sets up cross-compilation variables (`XCC`, `XCXX`, `XLD`, `XCPP`), and manages the build order. The file enforces that `TARGET` and `TARGET_ARCH` are defined before any build proceeds:
 
 ```makefile
-# From Makefile.inc1, lines 50-52
+# From Makefile.inc1, lines 51-53
 .if !defined(TARGET) || !defined(TARGET_ARCH)
 .error Both TARGET and TARGET_ARCH must be defined.
 .endif
@@ -50,318 +47,208 @@ The `.mk` files in `share/mk/` form the core library of build rules. Key files i
 - `bsd.sys.mk` — Defines compiler settings including C standards (`CSTD`, `CXXSTD`), warning levels (`WARNS`), and compiler-specific flags. The `WARNS` variable controls compiler warning severity from 1 to 6.
 - `bsd.prog.mk` — Handles building userland programs with support for ELF hardening features like RELRO (`-zrelro`), PIE (`-fPIE`/`-pie`), and retpoline (`-mretpoline`).
 - `bsd.kmod.mk` — Handles kernel module building, includes `bsd.sysdir.mk` and `sys/conf/kmod.mk`.
-- `bsd.dep.mk` — Manages dependency tracking between source files and headers.
-- `bsd.obj.mk` — Manages object directory creation for out-of-tree builds.
+- `bsd.own.mk` — Defines directory paths, ownership, and mode defaults for installed files.
+- `bsd.opts.mk` — Translates `WITH_FOO`/`WITHOUT_FOO` from [`src.conf(5)`](../man/man5/src.conf.5) into `MK_FOO=yes`/`MK_FOO=no` variables that build rules test.
 
-The `tools/build/make.py` script provides a Python wrapper that bootstraps a compatible version of `bmake` and infers required compiler variables, making it easier to build on non-FreeBSD systems.
+The build is organized into phases. `buildworld` first builds bootstrap tools (tiny utilities needed for the build itself), then cross-tools (compilers and related utilities for the target architecture), then build-tools (utilities needed for installation), then libraries, then includes, and finally userland programs. `buildkernel` runs the `config` tool on the kernel configuration file to generate driver and syscall source files, then compiles and links them into a kernel binary.
 
-### Makefile Include Chain
+Kernel configuration processing uses the `config` tool defined in `sys/conf/config`. When `buildkernel` is invoked, `config` reads a `.conf` file like `GENERIC` and generates:
+- `opt_global.h` — Kernel compile-time options
+- `opt_*.h` — Per-subsystem options
+- `*_if.h` — Bus method interface files
+- `*_if.c` — Bus method glue code
 
-The include chain in the build system follows a specific order to ensure proper variable initialization:
+These generated files are placed in the kernel build directory (typically `${KERNBUILDDIR}`), which is separate from the source tree to support out-of-tree builds. The `KERNBUILDDIR` variable tells the build system where to find these generated headers.
 
-1. `bsd.opts.mk` — Defines option lists (`__DEFAULT_YES_OPTIONS`, `__DEFAULT_NO_OPTIONS`, etc.) and includes `bsd.mkopt.mk` to process them
-2. `bsd.compiler.mk` — Detects compiler type (clang/gcc), version, and features
-3. `bsd.init.mk` — Includes `bsd.opts.mk`, `Makefile.inc`, and `bsd.own.mk`
-4. `bsd.obj.mk` — Sets up object directory handling
-5. `bsd.dep.mk` — Sets up dependency tracking
-6. `bsd.prog.mk` / `bsd.kmod.mk` — Final build rules
-
-This layered approach means that each `.mk` file only needs to know about the variables set by its predecessors, creating a clean separation of concerns.
-
-### Option Processing
-
-Build options are processed through a systematic mechanism. Users define `WITH_FOO` or `WITHOUT_FOO` in `/etc/src.conf` or on the command line. The `bsd.opts.mk` file defines the option lists (which options default to `yes` vs `no`), and then includes `bsd.mkopt.mk` which provides the generic mechanism to translate `WITH_`/`WITHOUT_` options into `MK_FOO={yes,no}` variables:
-
-```makefile
-# From bsd.mkopt.mk
-# For each option FOO in __DEFAULT_YES_OPTIONS, MK_FOO is set to
-# "yes", unless WITHOUT_FOO is defined, in which case it is set to "no".
-# For each option FOO in __DEFAULT_NO_OPTIONS, MK_FOO is set to "no",
-# unless WITH_FOO is defined, in which case it is set to "yes".
-```
-
-The `src.opts.mk` file defines FreeBSD-specific options like `ACPI`, `DTRACE`, `ZFS`, and `JAIL`. The `bsd.opts.mk` file defines build-system options like `WARNS`, `RELRO`, `SSP`, and `CTF`.
+Cross-compilation is handled through the `XCC`, `XCXX`, `XLD`, and `XCPP` variables. When `CROSS_TOOLCHAIN` is defined, the build system includes a toolchain-specific `.mk` file from `${LOCALBASE}/share/toolchains/`. For `universe` builds, cross-toolchains are built into `${HOST_OBJTOP}/tmp/usr/bin/` and referenced from there.
 
 ## Key Data Structures
 
-The FreeBSD build system manages complex state and relationships through several internal data structures, primarily governed by `make(1)` and the `.mk` include files. These structures govern how options are processed, how dependencies are tracked, and how the build environment is propagated.
+The build system does not use C structs in the traditional sense — it is a Makefile-based system. However, the kernel build generates data structures that are critical to the kernel's operation. The `spacectl_range` struct, for example, is defined in `tools/build/fcntl.h`:
 
-### The Makefile Variable Environment
+```c
+/* From tools/build/fcntl.h */
+struct spacectl_range {
+	off_t	r_offset;
+	off_t	r_len;
+};
+```
 
-At the core of the build system is the `make(1)` variable environment. Variables are defined hierarchically and cascade through the include chain. When a `.mk` file is included, it may define or override variables that affect subsequent files. The build system relies heavily on `MK_FOO` variables (e.g., `MK_ZFS`, `MK_CTF`) which are derived from `WITH_FOO`/`WITHOUT_FOO` options set by the user in `src.conf(5)`.
+This struct is used by the `fspacectl()` system call, which is implemented as a stub in `tools/build/fspacectl.c`. The build system includes these stub implementations in the libc-bootstrap phase to provide minimal headers needed during cross-compilation.
 
-The variable environment is also responsible for propagating compiler flags (`CFLAGS`, `CXXFLAGS`, `LDFLAGS`) and tool paths (`CC`, `CXX`, `LD`) across different build stages. Cross-compilation is achieved by setting `XCC`, `XCXX`, `XLD`, and `XCPP` variables, which override the default host compiler with the target-specific toolchain.
-
-### Dependency Graph (DIRDEPS_BUILD Mode)
-
-In standard build mode, dependencies are tracked at the file level using `.depend` files generated by `mkdep`. However, when `MK_DIRDEPS_BUILD` is enabled, the build system constructs a directed acyclic graph (DAG) of directory dependencies. This graph represents the build order at the directory level, ensuring that parent directories are built before child directories that depend on them.
-
-The dependency graph is calculated once at the beginning of the build (`.MAKE.LEVEL==0`) and is used to order build targets. This approach significantly reduces the overhead of file-level dependency checking for large source trees, as entire directories can be processed in parallel once their parent dependencies are satisfied.
-
-### Option Processing State (`bsd.opts.mk`)
-
-The option processing mechanism maintains a state that maps user-defined `WITH_`/`WITHOUT_` options to internal `MK_FOO` variables. This state is managed by `bsd.opts.mk` and `bsd.mkopt.mk`. The process involves:
-
-1. Defining default option lists (`__DEFAULT_YES_OPTIONS`, `__DEFAULT_NO_OPTIONS`) in `bsd.opts.mk`.
-2. Processing user overrides from `src.conf(5)` or the command line.
-3. Translating `WITH_FOO`/`WITHOUT_FOO` into `MK_FOO={yes,no}` variables.
-
-This state machine ensures that build options are consistently applied across all `.mk` files, allowing fine-grained control over which features are compiled into the system.
+The kernel module build uses the `KMOD` variable to name the module file (e.g., `${KMOD}.ko`). The `sys/conf/kmod.mk` file defines the compilation flags for kernel modules, including `-D_KERNEL` and `-DKLD_MODULE`. It also sets `NOSTDINC=-nostdinc` to prevent the compiler from using system headers, ensuring kernel modules only see kernel-defined types.
 
 ## Deep Dive
 
-### The buildworld Target
+Let us trace through what happens when a developer runs `make buildworld buildkernel` from the source tree root.
 
-The `buildworld` target orchestrates the full userland build. It follows a specific sequence:
+**Phase 1: Bootstrap Tools**
 
-1. **Bootstrap tools** — Build essential tools needed for the build process itself (like `mktemp`, `install`)
-2. **Cross-tools** — Build cross-compilation tools if building for a different architecture
-3. **Build tools** — Build tools used during the build process
-4. **Libraries** — Build system libraries
-5. **Programs** — Build userland programs
-6. **Install** — Install everything to `DESTDIR`
-
-The actual buildworld orchestration is implemented in `share/mk/src.tools.mk`, which defines tool targets such as `INSTALL_CMD`, `MTREE_CMD`, `PWD_MKDB_CMD`, and others. The `Makefile.inc1` file includes `share/mk/src.tools.mk` and sets up cross-compilation variables before including it:
+The build first constructs a minimal set of tools needed for the rest of the build. These are compiled against a bootstrap libc and do not depend on any FreeBSD-specific headers. The `tools/build` directory contains the source for these tools. The `bsd.prog.mk` file handles the compilation, using the `OBJ_EXT` variable to determine the object file extension. When PIE is enabled (default on most architectures), objects get the `.pieo` extension instead of `.o`:
 
 ```makefile
-# From Makefile.inc1, line 62
-.include "share/mk/src.tools.mk"
+# From share/mk/bsd.prog.mk
+.if ${MK_PIE} != "no" && (!defined(NO_SHARED) || ${NO_SHARED:tl} == "no")
+CFLAGS+= -fPIE
+CXXFLAGS+= -fPIE
+LDFLAGS+= -pie
+OBJ_EXT=pieo
+.else
+OBJ_EXT=o
+.endif
 ```
 
-The `src.tools.mk` file defines the tool commands used during `buildworld`:
+This distinction matters because PIE objects cannot be mixed with non-PIE objects in the same link.
+
+**Phase 2: Cross-Tools**
+
+If cross-compiling, the build constructs a full toolchain for the target architecture. The `XCC`, `XCXX`, `XLD`, and `XCPP` variables are set to point to these cross-tools. The `MK_CLANG_BOOTSTRAP` variable controls whether a bootstrap compiler is built; it is set to `no` when an external cross-compiler path is provided:
+
+```makefile
+# From Makefile.inc1, lines 97-98
+.if ${XCC:N${CCACHE_BIN}:M/*}
+MK_CLANG_BOOTSTRAP=	no
+```
+
+**Phase 3: Build-Tools**
+
+These are utilities needed for installation, such as `install`, `mtree`, `pwd_mkdb`, and `cap_mkdb`. The `share/mk/src.tools.mk` file defines the commands:
 
 ```makefile
 # From share/mk/src.tools.mk
-INSTALL_CMD?=   install
-MTREE_CMD?=     mtree
-PWD_MKDB_CMD?=  pwd_mkdb
-SERVICES_MKDB_CMD?=   services_mkdb
-CAP_MKDB_CMD?=  cap_mkdb
-TIC_CMD?=       tic
+INSTALL_CMD?=	install
+MTREE_CMD?=	mtree
+PWD_MKDB_CMD?=	pwd_mkdb
+SERVICES_MKDB_CMD?=	services_mkdb
+CAP_MKDB_CMD?=	cap_mkdb
+TIC_CMD?=	tic
 ```
 
-### The buildkernel Target
+**Phase 4: Libraries and Includes**
 
-The `buildkernel` target works differently from `buildworld`. It processes kernel configuration files and builds the kernel binary. The `KERNCONF` variable defaults to `GENERIC` and can be overridden on the command line (e.g., `make buildkernel KERNCONF=MYKERNEL`):
+Libraries are built next, followed by header installation. The `bsd.lib.mk` file (included from `bsd.prog.mk`) handles library building, supporting both static and shared libraries. The `NO_SHARED` variable can force static-only builds.
+
+**Phase 5: Userland Programs**
+
+Userland programs are built using `bsd.prog.mk`. Each program's `Makefile` lists its source files in `SRCS` and includes `bsd.prog.mk`. The build system automatically compiles each `.c` file to an object file and links them together. ELF hardening options are applied based on [`src.conf(5)`](../man/man5/src.conf.5) settings:
 
 ```makefile
-# From sys/conf/kern.pre.mk, lines 15-16
-.if exists(${SRCTOP}/src.conf)
-SRCCONF?=       ${SRCTOP}/src.conf
+# From share/mk/bsd.prog.mk
+.if ${MK_RELRO} == "no"
+LDFLAGS+= -Wl,-znorelro
 .else
-SRCCONF?=       /etc/src.conf
+LDFLAGS+= -Wl,-zrelro
 .endif
 ```
 
-The kernel build processes the configuration file (defaulting to `GENERIC` unless overridden with `KERNCONF=`) through the `config` tool. This generates C source files for device drivers and syscall tables, which are then compiled and linked. The generated files include `opt_global.h`, `opt_inet.h`, `opt_inet6.h`, and other `opt_*.h` files that encode kernel configuration options:
+**Kernel Build**
 
-```makefile
-# From sys/conf/config.mk
-opt_global.h:
-        touch ${.TARGET}
-        @echo "#define SMP 1" >> ${.TARGET}
-        @echo "#define MAC 1" >> ${.TARGET}
-        @echo "#define VIMAGE 1" >> ${.TARGET}
-        @awk '$$1 == "options" && $$2 !~ "GEOM_" { print "#define ", $$2, " 1"; }'              < ${SYSDIR}/${MACHINE}/conf/DEFAULTS                >>  ${.TARGET}
-```
-
-The kernel CFLAGS include the generated option headers:
-
-```makefile
-# From sys/conf/kern.pre.mk, line 81
-CFLAGS+= ${INCLUDES} -D_KERNEL -DHAVE_KERNEL_OPTION_HEADERS -include opt_global.h
-```
-
-### Kernel Module Building
-
-Kernel modules are built using `bsd.kmod.mk`, which includes `sys/conf/kmod.mk`. The key variables for building a kernel module include:
+`buildkernel` takes a different path. It first runs `config` on the kernel configuration file. The `config` tool parses the `.conf` file and generates C source files for device drivers, bus methods, and syscall tables. These generated files are placed in `${KERNBUILDDIR}`. The kernel is then compiled using flags from `sys/conf/kmod.mk`:
 
 ```makefile
 # From sys/conf/kmod.mk
-KMOD          The name of the kernel module to build.
-KMODDIR       Base path for kernel modules (see kld(4)). [/boot/kernel]
-SRCS          List of source files.
-KMODLOAD      Command to load a kernel module [/sbin/kldload]
-KMODUNLOAD    Command to unload a kernel module [/sbin/kldunload]
+CFLAGS+=	-D_KERNEL
+CFLAGS+=	-DKLD_MODULE
+NOSTDINC=	-nostdinc
+CFLAGS:=	${CFLAGS:N-I*} ${NOSTDINC} ${INCLMAGIC} ${CFLAGS:M-I*}
 ```
 
-The `bsd.kmod.mk` file sets up the compiler flags for kernel module compilation, including `-D_KERNEL` and `-DKLD_MODULE`:
+The `-nostdinc` flag prevents the compiler from finding system headers, ensuring kernel code only sees kernel-defined types. The generated `opt_global.h` is included via `-include ${KERNBUILDDIR}/opt_global.h` to provide compile-time options.
+
+**[src.conf(5)](../man/man5/src.conf.5) Options Handling**
+
+Build options are defined in `/etc/src.conf` using `WITH_FOO` and `WITHOUT_FOO` syntax. The `bsd.opts.mk` file translates these into `MK_FOO=yes`/`MK_FOO=no` variables. The translation happens through `bsd.mkopt.mk`, which is included by `bsd.opts.mk`:
 
 ```makefile
-# From sys/conf/kmod.mk
-CFLAGS+=      -D_KERNEL
-CFLAGS+=      -DKLD_MODULE
-.if defined(MODULE_TIED)
-CFLAGS+=      -DKLD_TIED
-.endif
+# From share/mk/bsd.opts.mk
+# Users define WITH_FOO and WITHOUT_FOO on the command line or in /etc/src.conf
+# and /etc/make.conf files. These translate in the build system to MK_FOO={yes,no}
+# with (usually) sensible defaults.
 ```
 
-### Dependency Tracking
+The default values are split into three categories: `__DEFAULT_YES_OPTIONS`, `__DEFAULT_NO_OPTIONS`, and `__DEFAULT_DEPENDENT_OPTIONS`. For example, `WARNS` defaults to `yes` (enabling warnings), while `ASAN` defaults to `no` (disabling AddressSanitizer).
 
-Dependency tracking is managed by `bsd.dep.mk`. The system uses `mkdep` to generate dependency files that track which headers each source file includes. These dependencies are stored in `${DEPENDFILE}` (typically `.depend`).
+**Out-of-Tree Builds**
 
-```makefile
-# From bsd.dep.mk
-.if ${MK_DIRDEPS_BUILD} == "no"
-.MAKE.DEPENDFILE= ${DEPENDFILE}
-.endif
-CLEANDEPENDFILES+=        ${DEPENDFILE} ${DEPENDFILE}.*
-```
+FreeBSD supports out-of-tree builds where object files are placed in a separate directory from the source tree. This is controlled by the `OBJTOP` and `HOST_OBJTOP` variables. When set, the build system creates a parallel directory structure under `OBJTOP` and places all object files there. This keeps the source tree clean and allows multiple builds for different configurations.
 
-The dependency tracking supports several modes:
-- **Standard mode** — Uses `.depend` files generated by `mkdep`
-- **META_MODE** — Uses the filemon kernel module to track file access at runtime
-- **DIRDEPS_BUILD** — Uses a directed acyclic graph of directory dependencies
-
-### Out-of-Tree Builds
-
-Out-of-tree builds are a key feature of the FreeBSD build system. Object files are placed in a separate directory tree, keeping the source tree clean. This is managed by `bsd.obj.mk`:
-
-```makefile
-# From bsd.obj.mk
-# The following directories are tried in order for ${.OBJDIR}:
-# 1.  ${MAKEOBJDIRPREFIX}/`pwd`
-# 2.  ${MAKEOBJDIR}
-# 3.  obj.${MACHINE}
-# 4.  obj
-# 5.  /usr/obj/`pwd`
-# 6.  ${.CURDIR}
-```
-
-Environment variables `MAKEOBJDIR` and `MAKEOBJDIRPREFIX` allow users to specify custom object directory locations. If neither is set, objects are placed in `/usr/obj/`pwd`` by default.
-
-### Cross-Compilation
-
-Cross-compilation is supported through the `TARGET` and `TARGET_ARCH` variables. The build system sets up cross-compilation variables (`XCC`, `XCXX`, `XLD`, `XCPP`) that point to the cross-compiler toolchain:
-
-```makefile
-# From Makefile.inc1
-.if defined(CROSS_TOOLCHAIN)
-.if exists(${LOCALBASE}/share/toolchains/${CROSS_TOOLCHAIN}.mk)
-.include "${LOCALBASE}/share/toolchains/${CROSS_TOOLCHAIN}.mk"
-.elif exists(${CROSS_TOOLCHAIN})
-.include "${CROSS_TOOLCHAIN}"
-.else
-.error CROSS_TOOLCHAIN ${CROSS_TOOLCHAIN} not found
-.endif
-CROSSENV+=CROSS_TOOLCHAIN="${CROSS_TOOLCHAIN}"
-.endif
-```
-
-The `tools/build/make.py` script provides a convenient wrapper for cross-compilation, allowing users to specify a cross toolchain path:
-
-```python
-# From tools/build/make.py
-# On Linux and MacOS you may need to explicitly indicate the cross toolchain
-# to use. You can do this by:
-# - setting XCC/XCXX/XLD/XCPP to the paths of each tool
-# - using --cross-bindir to specify the path to the cross-compiler bindir
-```
+The `DESTDIR` variable controls where installed files are placed, enabling staged installs. This is critical for `installworld` and `installkernel`, which install into `${DESTDIR}` rather than the running system.
 
 ## Flow / Diagram
 
 ```mermaid
 flowchart TD
-    A[User runs 'make buildworld'] --> B[Reads src/Makefile]
-    B --> C[Delegates to Makefile.inc1]
-    C --> D{TARGET/TARGET_ARCH defined?}
-    D -->|No| E[Error: must be defined]
-    D -->|Yes| F[Process src.opts.mk]
-    F --> G[Process bsd.opts.mk]
-    G --> H[WITH_/WITHOUT_ -> MK_FOO variables]
-    H --> I[Bootstrap tools]
-    I --> J[Cross-tools]
-    J --> K[Build tools]
-    K --> L[Libraries]
-    L --> M[Programs]
-    M --> N[Install to DESTDIR]
+    A[make buildworld buildkernel] --> B{TARGET/TARGET_ARCH defined?}
+    B -->|No| C[.error Both TARGET and TARGET_ARCH must be defined]
+    B -->|Yes| D[Makefile.inc1 orchestrates]
 
-    O[User runs 'make buildkernel'] --> P[Reads src/Makefile]
-    P --> Q[Delegates to Makefile.inc1]
-    Q --> R[Process KERNCONF=GENERIC]
-    R --> S[config tool processes .conf file]
-    S --> T[Generates opt_*.h files]
-    T --> U[Compile kernel objects with -D_KERNEL]
-    U --> V[Link kernel binary]
-    V --> W[Install to /boot/kernel]
+    D --> E[Phase 1: Bootstrap Tools]
+    E --> F[tools/build/ compiled with bootstrap libc]
 
-    Y[Kernel modules] --> Z[bsd.kmod.mk includes sys/conf/kmod.mk]
-    Z --> AA[Set -D_KERNEL -DKLD_MODULE flags]
-    AA --> AB[Compile module objects]
-    AB --> AC[Link .ko file]
-    AC --> AD[Install to KMODDIR]
+    D --> G[Phase 2: Cross-Tools]
+    G --> H[XCC/XCXX/XLD/XCPP set for target arch]
+
+    D --> I[Phase 3: Build-Tools]
+    I --> J[install mtree pwd_mkdb cap_mkdb]
+
+    D --> K[Phase 4: Libraries + Includes]
+    K --> L[bsd.lib.mk handles .a and .so]
+
+    D --> M[Phase 5: Userland Programs]
+    M --> N[bsd.prog.mk handles SRCS -> PROG]
+
+    D --> O[buildkernel]
+    O --> P[config tool processes .conf file]
+    P --> Q[Generates opt_global.h, *_if.h, *_if.c]
+    Q --> R[KERNBUILDDIR populated]
+    R --> S[KERNEL compiled with -D_KERNEL -nostdinc]
+    S --> T[Kernel binary linked]
+
+    subgraph OptionsLayer_grp ["src.conf(5) Options"]
+        U[WITH_FOO/WITHOUT_FOO] --> V[bsd.opts.mk]
+        V --> W[MK_FOO=yes/no]
+        W --> X[bsd.prog.mk / bsd.kmod.mk]
+    end
+
+    subgraph InstallPhase_grp ["installworld / installkernel"]
+        Y[DESTDIR staging area] --> Z[Files installed to DESTDIR]
+    end
+
+    M --> OptionsLayer
+    S --> OptionsLayer
+    N --> InstallPhase
+    T --> InstallPhase
 ```
 
 ## Advanced Notes
 
-### META_MODE and filemon
+**Debugging Build Failures**
 
-META_MODE is an advanced build mode that uses the filemon kernel module to track file access at runtime. This provides more accurate dependency tracking than traditional `.depend` files, as it captures files accessed during compilation (like include files found through compiler search paths) rather than just those explicitly mentioned in the source.
+When a build fails, the first step is to examine the `make` output for the specific target that failed. FreeBSD's build system uses recursive `make` invocations, so the error may be buried in sub-make output. Use `make -dB` to enable debugging output showing dependency resolution, or `make -n` to see what commands would be executed without running them. The `-j` flag for parallel builds can make output harder to read; use `-j1` for sequential builds when debugging.
 
-```makefile
-# From bsd.dep.mk
-.if ${MK_META_MODE} == "yes"
-CLEANDEPENDFILES+=        *.meta
-.endif
-```
+**Dependency Tracking**
 
-To use META_MODE effectively, load the filemon module before building:
+FreeBSD uses dependency files generated by the compiler (`-MMD` flag) to track header dependencies. When a header file changes, only the source files that include it are recompiled. The `bsd.dep.mk` file manages this process. In out-of-tree builds, dependency files are placed in the object directory alongside the object files.
 
-```sh
-kldload filemon
-```
+**Performance Considerations**
 
-### DIRDEPS_BUILD
+The `WARNS` variable controls compiler warning levels. Higher warning levels (up to 6) catch more potential bugs but can slow compilation due to additional compiler passes. The default `DEFAULTWARNS=6` is appropriate for source tree builds but may be too aggressive for third-party code. The `MK_WERROR` variable controls whether warnings are treated as errors; it defaults to `yes` for FreeBSD source but can be disabled for specific components.
 
-DIRDEPS_BUILD is an experimental build mode that uses a directed acyclic graph (DAG) of directory dependencies to optimize build ordering. This mode is controlled by the `MK_DIRDEPS_BUILD` variable:
+**Common Pitfalls**
 
-```makefile
-# From bsd.dep.mk
-.if ${MK_DIRDEPS_BUILD} == "no"
-.MAKE.DEPENDFILE= ${DEPENDFILE}
-.endif
-```
+1. **Stale object files**: When switching between configurations, old object files may persist and cause link errors. Run `make cleandir` to remove all object files before rebuilding.
 
-In DIRDEPS_BUILD mode, the dependency graph is calculated only at `.MAKE.LEVEL==0`, and build targets are ordered based on the graph rather than individual file dependencies. This can significantly speed up builds for large source trees.
+2. **Cross-compiler header conflicts**: When building with `CROSS_TOOLCHAIN`, ensure the cross-compiler's headers are compatible with the target kernel version. The `MK_CLANG_BOOTSTRAP=no` setting bypasses bootstrap compiler building when an external cross-compiler is used.
 
-### Performance Tuning
+3. **src.conf not taking effect**: Options in `/etc/src.conf` are only read when building from the source tree. They are not read by ports or packages. Use `make showconfig` to verify which options are active.
 
-Several variables can be used to tune build performance:
+4. **DESTDIR confusion**: `installworld` and `installkernel` install into `${DESTDIR}`, not the running system. To install to the running system, omit `DESTDIR` or set it to `/`. This is dangerous during upgrades — always use a separate `DESTDIR` for staged installs.
 
-- `MAKE_JOBS` — Number of parallel jobs (default is determined by the system)
-- `MAKE_JOBS_NUMBER` — Override the number of parallel jobs
-- `MK_CCACHE_BUILD` — Enable ccache for faster recompilation
-- `MK_AUTO_OBJ` — Enable automatic object directory creation
+**Connection to OS Theory**
 
-For example, to build with 8 parallel jobs and ccache:
+The FreeBSD build system's layered architecture mirrors the Unix philosophy of small, composable tools. Each `.mk` file is a module that can be included by any Makefile, similar to how kernel subsystems are modularized. The out-of-tree build support is analogous to build systems in other operating systems (Linux's `O=` option, NetBSD's `OBJDIR`), but FreeBSD's implementation is notable for its use of recursive `make` with explicit dependency ordering.
 
-```sh
-env MAKE_JOBS=8 MK_CCACHE_BUILD=yes make -j8 buildworld
-```
-
-### Common Pitfalls
-
-1. **Stale object directories** — If object directories become corrupted, clean them with `make cleandir` before rebuilding.
-
-2. **Compiler mismatch** — Ensure the compiler version matches what the source tree expects. The `bsd.compiler.mk` file detects compiler features automatically, but mismatched compilers can cause build failures.
-
-3. **Missing dependencies** — If a header file changes but the `.depend` file is not updated, the affected source files may not be recompiled. Run `make cleandepend` to regenerate dependency files.
-
-4. **DESTDIR confusion** — Remember that `buildworld` installs to `DESTDIR`, not to the live system. To install to the live system, use `make installworld DESTDIR=/`.
-
-5. **Cross-compilation environment** — When cross-compiling, ensure all toolchain variables (`XCC`, `XCXX`, `XLD`, `XCPP`) are correctly set, or use the `CROSS_TOOLCHAIN` mechanism.
-
-### Connection to OS Theory
-
-The FreeBSD build system exemplifies several concepts from operating system theory:
-
-- **Modularity** — The layered architecture of `.mk` files mirrors the principle of separation of concerns, where each layer has a single responsibility.
-
-- **Incremental builds** — Dependency tracking enables incremental builds, a fundamental concept in build systems that minimizes rebuild time by only recompiling changed components.
-
-- **Cross-compilation** — The ability to build for different architectures demonstrates the concept of toolchain isolation, where the build environment is independent of the target environment.
-
-- **Out-of-tree builds** — Separating build artifacts from source code is a best practice that enables multiple builds from the same source tree and simplifies cleanup.
+The kernel configuration processing through `config` is a classic example of code generation. The `config` tool is a domain-specific language processor that transforms a declarative configuration into imperative C code. This approach allows device drivers to be described in a high-level format while still achieving zero-cost abstractions — the generated code is as efficient as if it had been written by hand.
 
 ## See Also
 - [Boot Process — UEFI Bootloader to Kernel Handoff](../../stand/efi/loader/README.md)
@@ -369,23 +256,13 @@ The FreeBSD build system exemplifies several concepts from operating system theo
 
 
 
-Key source files to explore:
-- `src/Makefile` — Top-level makefile
-- `src/Makefile.inc1` — Central orchestrator
-- `share/mk/bsd.sys.mk` — Common compiler settings
-- `share/mk/bsd.prog.mk` — Userland program building
-- `share/mk/bsd.kmod.mk` — Kernel module building
-- `share/mk/bsd.obj.mk` — Object directory management
-- `share/mk/bsd.dep.mk` — Dependency tracking
-- `share/mk/bsd.opts.mk` — Option processing
-- `share/mk/bsd.mkopt.mk` — Option translation mechanism
-- `share/mk/src.opts.mk` — FreeBSD-specific options
-- `sys/conf/kmod.mk` — Kernel module compilation rules
-- `sys/conf/config.mk` — Kernel config processing
-- `sys/conf/kern.pre.mk` — Kernel build settings
-- `usr.sbin/config/config.h` — Config tool data structures
-- `tools/build/make.py` — Python wrapper for building
+- [`src.conf(5)`](../man/man5/src.conf.5) — Manual page for build options
+- [`config(8)`](../../usr.sbin/config/config.8) — Kernel configuration tool
+- [`make(1)`](../../contrib/bmake/make.1) — The build command
+- [`share/mk/bsd.prog.mk`](bsd.prog.mk) — Userland program build rules
+- [`share/mk/bsd.kmod.mk`](bsd.kmod.mk) — Kernel module build rules
+- [`sys/conf/kmod.mk`](../../sys/conf/kmod.mk) — Kernel-specific compilation flags
 
 ---
 
-> _Generated by [DaemonDocs](https://github.com/ocochard/DaemonDocs) on 2026-05-01 02:36 UTC using model `Qwen3.6-35B-A3B-UD-Q4_K_XL` (llama.cpp build `b8985-27aef3dd9`). AI-generated content — verify against source before relying on it._
+> _Generated by [DaemonDocs](https://github.com/ocochard/DaemonDocs) on 2026-05-02 22:18 UTC using model `Qwen3.6-35B-A3B-UD-Q8_K_XL` (llama.cpp build `b8985-27aef3dd9`). AI-generated content — verify against source before relying on it._

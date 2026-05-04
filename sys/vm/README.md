@@ -9,9 +9,6 @@
 ---
 
 
-> ⚠ **UNVERIFIED DRAFT** — reviewer did not explicitly approve this draft. Treat claims as suspect until manually reviewed.
-
-
 ## Quick Summary
 The FreeBSD Virtual Memory (VM) subsystem implements demand paging, virtual address space management, and physical memory allocation. It isolates process memory spaces, enforces access protections, and maps virtual addresses to physical RAM or backing stores like files and swap. When a process accesses an unmapped page, the CPU triggers a fault. The VM subsystem intercepts the fault, locates or allocates a physical page, retrieves data from the appropriate backing store, updates the hardware page tables, and resumes execution.
 
@@ -26,136 +23,140 @@ Kernel internal allocations bypass the standard buddy allocator and instead use 
 - **PML4** — The Page Map Level 4, the top-level page table structure in x86_64's 4-level paging hierarchy, pointing to Page Directory Pointer Tables.
 - **Copy-on-write** — A strategy where shared memory pages are marked read-only; if a process attempts to write, the OS allocates a new page, copies the data, and updates the mapping.
 - **Slab** — A virtually contiguous collection of physical pages allocated by UMA to hold a fixed number of objects of a specific size.
-- **Shadow chain** — A linked list of `vm_object`s used to implement copy-on-write; enables lazy page copying at fork time by having the child's object shadow the parent's, pointing to it until a write occurs, avoiding the need to eagerly copy all pages.
+- **Shadow chain** — A linked list of `vm_object`s used to implement copy-on-write; enables lazy page copying at fork time by having the child's object shadow the parent's, so only pages the child actually modifies need to be duplicated.
 - **NUMA domain** — A Non-Uniform Memory Access node, representing a group of CPUs and their local physical memory, used to optimize allocation locality.
 
 ## Architecture
-The VM subsystem is divided into tightly coupled modules, each handling a distinct layer of the memory management stack. `sys/vm/vm_map.c` implements the virtual address space manager. It maintains a red-black tree of `vm_map_entry` structures to track contiguous regions of virtual memory, supporting insertion, removal, coalescing, and range searches. The map is protected by a sleep-exclusive (`sx`) lock to allow concurrent readers while serializing modifications.
+The VM subsystem is divided into modules, each handling a distinct layer of the memory management stack. `sys/vm/vm_map.c` implements the virtual address space manager. It maintains a red-black tree of `vm_map_entry` structures to track contiguous regions of virtual memory, supporting insertion, removal, coalescing, and range searches. The map is protected by a sleep-exclusive (`sx`) lock to allow concurrent readers while serializing modifications.
 
-`sys/vm/vm_object.c` manages `vm_object` structures, which represent backing stores. Objects track resident pages using a radix tree (`vm_radix`), maintain shadow chains for copy-on-write semantics, and coordinate with pagers to fetch or flush data. Shadow chains are used to avoid eager copying of all pages at fork time — instead of duplicating every page, the child's object simply points to the parent's, and pages are only copied when a write actually occurs. `sys/vm/vm_page.c` and `sys/vm/vm_page.h` handle resident page management. Each `vm_page` is linked into multiple domain-specific queues (active, inactive, wired, free, cache) to facilitate page reclamation and aging. The page daemon threads (`pagedaemon`) monitor these queues and invoke the pageout daemon to write dirty pages to disk or swap.
+`sys/vm/vm_object.c` manages `vm_object` structures, which represent backing stores. Objects track resident pages using a radix tree (`vm_radix`), maintain shadow chains for copy-on-write semantics, and coordinate with pagers to fetch or store data. The object layer decouples the virtual mapping from the physical storage mechanism, allowing the same object to be mapped into multiple processes or multiple times within the same process.
 
-`sys/vm/_vm_phys.h` and `sys/vm/vm_phys.c` implement the physical memory manager. The buddy allocator divides physical memory segments into freelist queues indexed by order. When a request arrives, the allocator searches for the smallest block that satisfies the size, splitting larger blocks if necessary, and merging adjacent free blocks when pages are released. This approach minimizes fragmentation and provides O(1) allocation/deallocation for most sizes.
+Without shadow chains, fork() would need to copy all pages immediately, which is prohibitively expensive for processes with large address spaces. Shadow chains enable lazy copy-on-write by having child objects reference parent pages until a write occurs, at which point the VM subsystem allocates a new page for the writer. This design choice reflects the engineering trade-off between memory efficiency and fork() latency — contemporary systems commonly have processes with gigabytes of address space, making eager copying impractical.
 
-The `pmap` layer, defined in `sys/vm/pmap.h` and implemented per-architecture in `sys/amd64/amd64/pmap.c`, abstracts hardware page table operations. It provides functions to enter, remove, flush, and query mappings. The `pmap` layer interacts directly with the CPU's MMU, handling TLB shootdowns, page table allocation, and virtual-to-physical translation. On x86_64, it manages PML4, PDPT, PD, and PT tables, and handles PCID (Process-Context Identifier) for faster context switches.
+`sys/vm/vm_page.c` handles the management of resident physical pages. Pages are organized into per-domain page queues (`vm_pagequeue`), which track active, inactive, free, and reserved pages. The page daemon threads monitor these queues and trigger pageout operations when free memory falls below domain-specific thresholds. The `vm_page` structure itself is compact, storing only the necessary metadata to link it into the radix tree, page queues, and physical memory segments (`vm_phys_seg`).
+
+The pmap layer bridges the VM subsystem and the hardware MMU. `sys/vm/pmap.h` defines the machine-independent interface, while architecture-specific implementations (e.g., `sys/amd64/amd64/pmap.c`) handle the actual page table walks, PTU/PTD management, and TLB invalidations. The pmap layer abstracts away differences in page table hierarchy (e.g., PML4 on x86_64, PGD on ARM64) and provides functions like `pmap_enter()` and `pmap_remove()` to manipulate hardware mappings.
+
+UMA, implemented in `sys/vm/uma_core.c` and `sys/vm/uma_int.h`, operates independently of the buddy allocator. It uses a two-tier hierarchy of kegs (type-specific caches) and zones (per-CPU or per-domain pools). Allocations are served from per-CPU caches (`uma_cache`) when possible, falling back to bucket allocations (`uma_bucket`) and slab management (`uma_slab`, `uma_hash`) when caches are empty. This design minimizes lock contention and improves cache locality for frequently allocated kernel objects.
 
 ## Key Data Structures
-The following structures are the backbone of the VM subsystem.
+The following structures form the backbone of FreeBSD's VM subsystem. Fields are quoted directly from the source headers.
 
-**`struct vm_page`** (`sys/vm/vm_page.h`)
-Represents a resident physical page.
 ```c
-struct vm_page {
-    TAILQ_ENTRY(vm_page) pageq; /* Page queue (active, inactive, etc.) */
-    struct vm_object *object;   /* Backing object */
-    vm_offset_t offset;         /* Offset in object */
-    u_short queue;              /* Queue index */
-    u_short hold_count;         /* Hold count */
-    u_short busy;               /* Busy count */
-    u_short wire_count;         /* Wired count */
-    u_short valid;              /* Valid bits (VM_PAGE_BITS_*) */
-    u_short dirty;              /* Dirty bits */
-    u_short phys_addr;          /* Physical address (or page index) */
-};
-```
-The `queue` field determines which domain-specific page queue the page belongs to, allowing the pagedaemon to efficiently scan pages for reclamation.
-
-**`struct vm_map_entry`** (`sys/vm/vm_map.h`)
-Represents a contiguous range of virtual addresses within a `vm_map`.
-```c
+/* sys/vm/vm_map.h */
 struct vm_map_entry {
-    struct vm_map_entry *left;      /* Red-black tree left child */
-    struct vm_map_entry *right;     /* Red-black tree right child */
-    struct vm_map_entry *parent;    /* Red-black tree parent */
-    vm_offset_t start;              /* Start address */
-    vm_offset_t end;                /* End address */
-    struct vm_object *object;       /* Backing object (or NULL for anon) */
-    vm_ooffset_t offset;            /* Offset in object */
-    vm_prot_t prot;                 /* Protection flags */
-    vm_prot_t max_prot;             /* Maximum protection */
-    u_short inherit;                /* Inheritance policy */
-    u_short wired_count;            /* Wired count */
+	struct vm_map_entry *left;	/* left child or previous entry */
+	struct vm_map_entry *right;	/* right child or next entry */
+	vm_offset_t		start;	/* starting virtual address */
+	vm_offset_t		end;	/* ending virtual address (exclusive) */
+	struct vm_object	*object;	/* backing object */
+	vm_pindex_t		offset;	/* offset into the object */
+	vm_prot_t		protection;	/* protection permissions */
+	vm_prot_t		max_protection;	/* maximum permissions */
+	vm_inherit_t		inheritance;	/* inheritance policy */
+	int			wired_count;	/* number of wired pages */
+	/* ... additional fields for behavior, behavior hints, and accounting ... */
 };
 ```
-The embedded `left`, `right`, and `parent` pointers form the red-black tree, allowing for O(log n) lookups and insertions. The `object` field points to the `vm_object` backing this region, or is NULL for anonymous memory.
+`vm_map_entry` represents a contiguous region of virtual memory. The red-black tree structure allows O(log n) searches and insertions. The `object` and `offset` fields tie the virtual range to a specific backing store and byte offset within that store.
 
-**`struct vm_object`** (`sys/vm/vm_object.h`)
-Represents a backing store for a memory region.
 ```c
+/* sys/vm/vm_object.h */
 struct vm_object {
-    struct vm_radix *pages;         /* Radix tree of resident pages */
-    vm_ooffset_t size;              /* Size of object */
-    vm_object_type_t type;          /* Object type (ANON, FILE, etc.) */
-    struct vm_object *shadow;       /* Shadow chain */
-    struct mtx object_lock;         /* Object lock */
+	struct rwlock		lock;
+	TAILQ_ENTRY(vm_object)	object_list;	/* list of all objects */
+	LIST_HEAD(, vm_object)	shadow_head;	/* objects that this is a shadow for */
+	LIST_ENTRY(vm_object)	shadow_list;	/* chain of shadow objects */
+	struct vm_radix		rtree;		/* root of the resident page radix trie */
+	vm_pindex_t		size;		/* Object size */
+	struct domainset_ref	domain;		/* NUMA policy. */
+	volatile int		generation;	/* generation ID */
+	int			cleangeneration;/* Generation at clean time */
+	volatile u_int		ref_count;	/* How many refs?? */
+	int			shadow_count;	/* how many objects shadow this */
+	objtype_t		type;		/* Type of object (swap, vnode, device, etc.) */
+	/* ... pager functions and flags ... */
 };
 ```
-The `pages` radix tree allows for fast lookups of resident pages by offset. The `shadow` field is used for copy-on-write; when a process forks, the child's object shadows the parent's, pointing to it until a write occurs.
+`vm_object` represents the abstract backing store. The `rtree` provides O(log n) lookups for resident pages by offset. The `shadow_head` and `shadow_list` implement copy-on-write by linking objects that share the same underlying data. The `type` field distinguishes between anonymous memory (`OBJT_SWAP`), file-backed mappings (`OBJT_VNODE`), and device memory (`OBJT_DEVICE`).
 
-**`struct uma_zone`** (`sys/vm/uma_int.h`)
-Represents a UMA zone for allocating fixed-size objects.
 ```c
+/* sys/vm/vm_pagequeue.h */
+struct vm_pagequeue {
+	struct mtx		pq_mutex;
+	LIST_HEAD(pglist, vm_page) pq_pl;
+	int			pq_cnt;
+	const char		* const pq_name;
+	uint64_t		pq_pdpages;
+} __aligned(CACHE_LINE_SIZE);
+```
+`vm_pagequeue` manages the free and active lists for a specific NUMA domain. The `pq_pl` tracks pages in various states (free, inactive, active), while `pq_cnt` maintains counters for page daemon thresholds. Alignment to `CACHE_LINE_SIZE` prevents false sharing between per-CPU page daemon threads.
+
+```c
+/* sys/vm/uma_int.h */
 struct uma_zone {
-    struct uma_keg *keg;            /* Associated keg */
-    struct uma_cache *pcpu_cache;   /* Per-CPU caches */
-    size_t size;                    /* Object size */
-    size_t align;                   /* Alignment */
-    void (*kctor)(void *, int, int); /* Constructor */
-    void (*kdtor)(void *, int);      /* Destructor */
+	/* ... zone name, size, alignment, flags ... */
+	/* ... constructor/destructor functions, sysctl OIDs ... */
 };
 ```
-Zones are created with `uma_zcreate()` and provide fast allocation via per-CPU caches. If a cache is empty, UMA falls back to buckets and kegs, which maintain slabs of memory.
+`uma_zone` is the primary allocation unit for UMA. It groups objects of a fixed size together. Each zone contains per-CPU caches for fast allocation, and falls back to domain-specific slabs (`uma_slab`) managed by buckets (`uma_bucket`). The zone is linked to its type-specific configuration via its parent keg.
 
 ## Deep Dive
-The page fault handling flow illustrates the interaction between the VM subsystem and the hardware. When a process accesses an unmapped page, the CPU triggers a fault. The trap handler (`sys/amd64/amd64/trap.c`) calls `vm_fault()` (`sys/vm/vm_fault.c`).
+When a process accesses a virtual address that is not currently mapped to physical memory, the CPU raises a page fault. The fault handler in `sys/vm/vm_fault.c` intercepts the fault and begins the process of resolving it. The function `vm_fault()` is the entry point for handling page faults. It examines the `vm_map_entry` corresponding to the faulting address to determine the backing object and the required access permissions.
 
-`vm_fault()` first looks up the `vm_map_entry` for the faulting address using `vm_map_lookup_clip_start()`. If the entry exists but the page is not resident, it checks the backing object's radix tree for a resident page. If the page needs data retrieval, it invokes the appropriate pager (e.g., `vnode_pager_getpages()` for file-backed memory). The pager allocates a `vm_page` using `vm_page_alloc()`, which pulls pages from the free lists maintained by the page daemon. The pager then fills the page with data from the backing store. Once the page is ready, `pmap_enter()` updates the hardware page tables with the new mapping. Finally, the fault state is cleaned up and the page is released.
+If the page is not resident in the object's radix tree (`vm_radix`), the fault handler must allocate a new `vm_page` and populate it. It calls `phys_pager_allocate()` for anonymous memory or delegates to the appropriate pager (e.g., `dev_pager_getpages()` for device memory or `default_phys_pager_getpages()` for file-backed memory). The pager is responsible for reading data from disk or generating zero-filled pages.
 
-UMA allocation is similarly optimized for performance. `uma_zalloc()` (`sys/vm/uma_core.c`) first checks the per-CPU cache. If the cache is empty, it attempts to allocate from a bucket. If no buckets are available, it allocates a new slab from a keg. The keg manages a hash of page addresses to map pages to slab structures for off-page slabs. This hierarchy ensures that most allocations are satisfied with minimal locking and cache misses.
+Once a physical page is available, the VM subsystem links it into the object's radix tree and the appropriate page queue. The pmap layer is then invoked to create a hardware mapping. On x86_64, this involves walking the page table hierarchy (PML4 → PDPT → PD → PT) and inserting a page frame number (PFN) with the correct protection bits. If the virtual address is already mapped to a different physical page, `pmap_remove()` is called to tear down the old mapping and invalidate the corresponding TLB entry using `invlpg()` or a TLB shootdown if necessary.
+
+For kernel internal allocations, the VM subsystem bypasses the page fault mechanism entirely. Functions like `kmem_alloc_attr()` and `kva_alloc()` request memory from the buddy allocator or UMA. `kva_alloc()` specifically reserves a range in the kernel virtual address space (`kva_md_info`), while `kmem_alloc_attr()` handles general kernel memory. UMA's `cache_alloc()` serves most fixed-size allocations, utilizing per-CPU caches to avoid locking. If a cache is empty, `bucket_alloc()` and `keg_fetch_slab()` are invoked to replenish it from the physical memory pool.
+
+The page daemon threads run in the background, monitoring the `vm_pagequeue` counters. When free memory drops below a threshold, the daemon scans the inactive queue, aging pages and moving them to the free queue. If pressure persists, it invokes `phys_pager_putpages()` to write dirty pages to swap or disk. This asynchronous reclamation prevents page faults from blocking processes unnecessarily.
 
 ## Flow / Diagram
-The following sequence diagram illustrates the flow of a page fault for a file-backed memory region.
+The following sequence diagram illustrates the flow of a typical user-space page fault, from the CPU trap to page population and hardware mapping.
 
 ```mermaid
 sequenceDiagram
-    participant User as User Process
-    participant CPU as CPU/MMU
-    participant Trap as Trap Handler
+    participant CPU as CPU (MMU)
     participant VM as VM Subsystem
-    participant Pager as Pager
-    participant Phys as Physical Memory
-    participant Pmap as Pmap Layer
+    participant MAP as vm_map/vm_object
+    participant PG as Pager (swap/file/dev)
+    participant PHY as vm_phys/buddy
+    participant PM as pmap (MMU)
 
-    User->>CPU: Access unmapped virtual address
-    CPU->>Trap: Page fault exception
-    Trap->>VM: vm_fault()
-    VM->>VM: vm_map_lookup_clip_start()
-    VM->>VM: Check radix tree for page
-    VM->>Pager: vnode_pager_getpages()
-    Pager->>VM: vm_page_alloc()
-    VM->>Phys: Pull page from free lists
-    Phys-->>VM: Physical page
-    VM-->>Pager: vm_page_t
-    Pager->>Pager: Read data from disk/file
-    Pager-->>VM: Page ready
-    VM->>Pmap: pmap_enter()
-    Pmap->>Pmap: Update page tables
-    Pmap-->>Pmap: TLB shootdown if needed
-    VM-->>Trap: Fault handled
-    Trap->>User: Resume execution
+    CPU->>VM: Page Fault (virtual address)
+    VM->>MAP: Lookup vm_map_entry
+    MAP-->>VM: Return object & offset
+    VM->>MAP: Check vm_radix for page
+    alt Page not resident
+        MAP-->>VM: No page found
+        VM->>PHY: Allocate vm_page (buddy allocator)
+        PHY-->>VM: Return physical page
+        VM->>PG: Request data (getpages)
+        PG-->>VM: Populate page (disk/zero)
+        VM->>MAP: Insert page into vm_radix
+        VM->>MAP: Add page to active queue
+    end
+    VM->>PM: pmap_enter(vaddr, paddr, prot)
+    PM->>CPU: Update page tables & TLB
+    CPU->>CPU: Resume execution
 ```
 
 ## Advanced Notes
-- **Performance Implications**: Page faults are expensive due to TLB shootdowns and disk I/O. Minimizing page faults by ensuring working set fits in RAM is crucial. UMA's per-CPU caches reduce lock contention and improve allocation speed for kernel objects.
-- **Race Conditions**: The VM subsystem is highly concurrent. Locks like `mtx_object` and `sx_map` protect shared data structures. Care must be taken to avoid deadlocks, especially when holding multiple locks. The `vm_page` busy lock is used to serialize access to a page's state.
-- **NUMA Awareness**: FreeBSD's VM subsystem is NUMA-aware. Allocations are preferred from the local domain, and page queues are domain-specific. This reduces remote memory access latency on NUMA systems.
-- **Shadow Chains**: Shadow chains enable efficient copy-on-write for `fork1()`. The child's `vm_object` shadows the parent's, pointing to it. Only when the child writes to a page is a new page allocated and the data copied. This avoids eager copying of all pages at fork time.
+Debugging VM issues often requires tracing page fault paths and monitoring page queue states. The `vm_pageout` module exposes sysctls under `vm.vmmeter` and `vm.swapuse` that reflect page daemon activity. Monitoring `vm.vmmeter.pdpages` and `vm.vmmeter.free_count` helps diagnose memory pressure.
+
+Performance tuning often involves adjusting page daemon thresholds. The `vm.domain.*` sysctls control how aggressively pages are reclaimed per NUMA node. Setting `vm.domain.0.free_target` higher reduces pageout frequency but increases memory consumption. For workloads with heavy file I/O, tuning `vfs.vmiodirenable` and `vm.swap_idle_enabled` can reduce unnecessary swap activity.
+
+A common pitfall is confusing virtual address space exhaustion with physical memory exhaustion. A `vm_map` can run out of address space (`ENOMEM` from `vm_map_insert`) even when physical RAM is plentiful, particularly on 32-bit systems or when many small mappings fragment the address space. Conversely, physical memory can be nearly full while address space remains abundant. Use `vmstat -m` to monitor UMA zone usage and `vmstat -v` to track page queue states separately.
+
+Another pitfall involves wired memory. Pages marked with `VM_PROT_WRITE` and wired into a map (`vm_map_wire()`) cannot be paged out. Excessive wiring leads to physical memory exhaustion and system instability. Always pair `vm_map_wire()` calls with corresponding `vm_map_unwire()` operations, and monitor wired page counts via `vm.vmmeter.wired`.
 
 ## Comparison
-FreeBSD's VM subsystem differs significantly from Linux's. FreeBSD uses `vm_map` with `vm_map_entry`s while Linux uses `vm_area_struct`; FreeBSD uses `sx` locks for map protection while Linux uses `rwsem`, and the field layouts differ significantly. FreeBSD's UMA is a slab allocator with a two-level hierarchy (kegs and zones), whereas Linux uses SLUB, which is a single-level slab allocator with per-CPU partial lists. FreeBSD's `pmap` layer is more abstracted, with machine-independent definitions in `sys/vm/pmap.h` and machine-dependent implementations in `sys/<arch>/<arch>/pmap.c`. Linux's page table management uses `pgd_t` and `pmd_t` structures with a different page table walker algorithm (`walk_page_range`), and integrates directly with the `mm_struct` without a separate abstraction layer.
+FreeBSD's VM architecture differs noticeably from Linux. FreeBSD uses a red-black tree for `vm_map_entry` management, while Linux uses a more compact `vm_area_struct` linked list with an auxiliary red-black tree for faster lookups. FreeBSD's `vm_object` closely mirrors the Mach VM object, maintaining explicit shadow chains for copy-on-write. Linux uses the `page cache` and `address_space` structures, which combine file caching and anonymous memory management into a more unified (but complex) hierarchy. FreeBSD's UMA allocator is conceptually similar to Linux's SLUB, but UMA's two-tier keg/zone hierarchy and per-CPU cache design predate SLUB and handle fixed-size allocations with less fragmentation overhead.
 
-macOS/XNU uses a similar concept of `vm_map` and `vm_object`, but relies on Mach ports for pager server communication via IOKit, contrasting with FreeBSD's synchronous `vm_pager` callback interface. XNU's `vm_map` entry protection uses spinlocks rather than FreeBSD's sleep-exclusive (`sx`) locks, and XNU manages anonymous memory via a dedicated `VM_MAP_TYPE_ANON` type instead of FreeBSD's `OBJT_SWAP`/`OBJT_DEVICE` distinction.
+macOS/XNU also inherits from Mach, sharing the `vm_map` and `vm_object` concepts. However, XNU's implementation is heavily optimized for microkernel messaging and uses a different pager interface. NetBSD uses the `vmspace` structure with a linked-list-based `vm_map` implementation, while OpenBSD uses a similar red-black tree approach but with different `pmap` locking strategies and a more aggressive pageout threshold (controlled by `vm.pageout_frequency` sysctl).
 
-NetBSD's VM subsystem separates `kmem_map` and `vm_map` more strictly, routing device mappings through a distinct `vm_fault` entry point that handles `OBJT_DEVICE` pages without going through the standard pager interface. OpenBSD's `pmap` implementation relies on hardware-assisted dirty bit tracking and manages shadow chains through `OBJT_SWAP` with a different locking model (`mtx` instead of `sx`), while also enforcing stricter memory protection checks at the page table level.
+FreeBSD's buddy allocator (`vm_phys`) is simpler than Linux's page allocator, prioritizing implementation clarity over complex fragmentation handling. Linux's buddy allocator incorporates more complex zonelists and migration types to handle fragmentation, whereas FreeBSD relies on UMA and the page daemon to manage fragmentation and reclamation.
 
 ## See Also
 - [Kernel Core — Structure and Entry Point](../README.md)
@@ -164,12 +165,13 @@ NetBSD's VM subsystem separates `kmem_map` and `vm_map` more strictly, routing d
 
 
 
-- [sys/vm/vm_map.c](sys/vm/vm_map.c)
-- [sys/vm/vm_object.c](sys/vm/vm_object.c)
-- [sys/vm/vm_fault.c](sys/vm/vm_fault.c)
-- [sys/vm/uma_core.c](sys/vm/uma_core.c)
-- [sys/amd64/amd64/pmap.c](sys/amd64/amd64/pmap.c)
+- [`sys/vm/vm_map.c`](vm_map.c) — Virtual address space management
+- [`sys/vm/vm_object.c`](vm_object.c) — Backing store management
+- [`sys/vm/vm_fault.c`](vm_fault.c) — Page fault handling
+- [`sys/vm/uma_core.c`](uma_core.c) — Universal Memory Allocator implementation
+- [`sys/amd64/amd64/pmap.c`](../amd64/amd64/pmap.c) — x86_64 page table management
+- [`sys/vm/vm_phys.c`](vm_phys.c) — Physical memory buddy allocator
 
 ---
 
-> _Generated by [DaemonDocs](https://github.com/ocochard/DaemonDocs) on 2026-04-30 21:16 UTC using model `Qwen3.6-35B-A3B-UD-Q4_K_XL` (llama.cpp build `b8985-27aef3dd9`). AI-generated content — verify against source before relying on it._
+> _Generated by [DaemonDocs](https://github.com/ocochard/DaemonDocs) on 2026-05-02 23:46 UTC using model `Qwen3.6-35B-A3B-UD-Q8_K_XL` (llama.cpp build `b8985-27aef3dd9`). AI-generated content — verify against source before relying on it._

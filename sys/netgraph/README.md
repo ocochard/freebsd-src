@@ -8,19 +8,15 @@
   **All chapters:** [Source Tree — Layout and Conventions](../../README_internals.md) | [Boot Process — UEFI Bootloader to Kernel Handoff](../../stand/efi/loader/README.md) | [Kernel Core — Structure and Entry Point](../README.md) | [Build System — buildworld and buildkernel](../../share/mk/README.md) | [Virtual Memory Subsystem — vm_page, UMA, and Pagers](../vm/README.md) | [Process Management — Scheduling and Lifecycle](../kern/README_process.md) | [Locking Primitives — Mutexes, sx, rmlocks, and Atomics](../kern/README_locking.md) | [Buffer Cache — Block I/O Subsystem](../vm/README_bcache.md) ...
 ---
 
-
-> ⚠ **UNVERIFIED DRAFT** — reviewer did not explicitly approve this draft. Treat claims as suspect until manually reviewed.
-
-
 ## Quick Summary
 
 FreeBSD's netgraph framework provides a user-composable graph of typed nodes connected by named hooks, where data items (mbufs) and control messages flow along the edges. Unlike the fixed filtering hooks in the IP input/output path (pfil), netgraph lets administrators and applications build custom protocol stacks, tunnels, traffic shapers, and packet processors at runtime. The framework was originally developed at Whistle Communications in the mid-1990s and has been part of FreeBSD since 4.0, evolving through multiple ABI revisions while maintaining backward compatibility.
 
 At its core, a netgraph consists of nodes and hooks. Each node represents a processing stage — it has a type that determines its behavior, a set of named hooks through which it receives data and control messages, and callback functions that the framework invokes at key lifecycle points: construction, newhook attachment, data receipt, message receipt, disconnection, and shutdown. Nodes communicate by passing mbufs along hooks to connected nodes, and by sending control messages to configure or query node state.
 
-The typed-message system in `ng_parse.h` provides a layer of type safety and human readability for control messages. Rather than passing raw byte buffers, nodes declare the expected structure of their command arguments using `ng_parse_type` descriptors. The framework can then convert between binary and ASCII representations, enabling `ngctl(8)` to display and manipulate node state in a readable format. This system also supports inter-machine communication of control messages, since the ASCII form is machine-independent.
+The typed-message system in `ng_parse.h` provides a layer of type safety and human readability for control messages. Rather than passing raw byte buffers, nodes declare the expected structure of their command arguments using `ng_parse_type` descriptors. The framework can then convert between binary and ASCII representations, enabling [`ngctl(8)`](../../usr.sbin/ngctl/ngctl.8) to display and manipulate node state in a readable format. This system also supports inter-machine communication of control messages, since the ASCII form is machine-independent.
 
-Userland interacts with the kernel graph through the `ng_socket` interface, which exposes a character device `/dev/ng` and supports the `ngctl(8)` command-line tool and `libnetgraph` library. Operations such as creating nodes, attaching hooks, sending data, and querying topology are performed through socket I/O that the kernel bridges to the graph framework. This design allows a running graph to be introspected and reconfigured without stopping the system — a capability that makes netgraph particularly valuable for network monitoring, traffic shaping, and protocol experimentation.
+Userland interacts with the kernel graph through the `ng_socket` interface, which exposes a character device `/dev/ng` and supports the [`ngctl(8)`](../../usr.sbin/ngctl/ngctl.8) command-line tool and `libnetgraph` library. Operations such as creating nodes, attaching hooks, sending data, and querying topology are performed through socket I/O that the kernel bridges to the graph framework. This design allows a running graph to be introspected and reconfigured without stopping the system — a capability that makes netgraph particularly valuable for network monitoring, traffic shaping, and protocol experimentation.
 
 ## Architecture
 
@@ -32,289 +28,307 @@ The netgraph framework lives in `sys/netgraph/` and consists of several key file
 
 **`sys/netgraph/ng_message.h`** defines the message header structure `struct ng_mesg` and the command string size limits. Each control message carries a header with version, argument length, command identifier, flags, token (for matching requests to replies), and type cookie, followed by a variable-length data array.
 
-**`sys/netgraph/ng_parse.h`** and **`sys/netgraph/ng_parse.c`** implement the typed-message system. They define the `ng_parse_type` structure with function pointers for `getLength`, `getAlign`, `getDefault`, `parse`, and `unparse` methods. Predefined types cover integers (int8 through int64), IP addresses, strings, arrays, fixed arrays, byte arrays, and composite structures. Node types register parse type tables that describe the expected binary layout of their command arguments.
+**`sys/netgraph/ng_parse.h`** and **`sys/netgraph/ng_parse.c`** implement the typed-message system. They define the `ng_parse_type` structure with function pointers for `getLength`, `getAlign`, `getDefault`, `parse`, `unparse`, `getTypeName`, and `getElementType` methods. Pre-defined types handle integers (16/32/64-bit), strings (fixed, sized, variable-length), arrays, IP addresses, and composite structures.
 
-**`sys/netgraph/ng_socket.c`** (not in the verified symbol list but part of the framework) exposes the `/dev/ng` character device and implements the socket-based protocol for userland communication.
+The framework distinguishes between two kinds of message flow:
+- **Data messages** (mbufs) flow along hooks from node to node via `rcvdata` callbacks. These are the packet data path.
+- **Control messages** (struct ng_mesg) flow along hooks via `rcvmsg` callbacks. These carry configuration commands, statistics queries, and other out-of-band information.
 
-The framework uses epoch-based synchronization for safe concurrent access to node and hook structures, and the UMA memory allocator for efficient allocation of nodes, hooks, and data items. The topology lock (`rwlock`) serializes graph modifications while allowing concurrent reads for message routing.
+Node types are registered with `ng_newtype()` and unregistered with `ng_rmtype()`. Each node type definition includes a name, version cookie, and the six lifecycle method pointers. When a node of a given type is created, the framework calls its `constructor` function. When hooks are attached, `newhook` is invoked. Data and control messages arriving at a hook trigger `rcvdata` and `rcvmsg`, respectively. When hooks are removed, `disconnect` is called. When a node is destroyed, `shutdown` is invoked.
+
+The framework uses reference counting (`_ng_node_ref()`, `_ng_node_unref()`, `_ng_hook_ref()`, `_ng_hook_unref()`) to manage object lifetime. The topology lock (`ng_topo_lock`) is an rwlock that protects graph structure modifications — read locks for traversal and lookup, write locks for node/hook creation and destruction.
 
 ## Key Data Structures
 
 ### struct ng_node
 
-The node is the central entity in the graph. It represents a processing stage and contains the following fields (defined in `sys/netgraph/netgraph.h`):
+Each node in the graph represents a processing stage. The framework maintains global lists of all nodes and provides name-to-ID resolution. Nodes are reference-counted and can be looked up by name or ID.
 
 ```c
+/* From sys/netgraph/netgraph.h */
 struct ng_node {
-    u_int32_t id;                       /* unique node ID */
-    char name[NG_NODESIZ];              /* human-readable name */
-    struct ng_type *type;               /* node type descriptor */
-    struct hooklist hooks;              /* list of connected hooks */
-    void *private;                      /* node-type-specific data */
-    refcount_t refcount;                /* reference count */
-    /* ... internal fields for locking and state ... */
+    int                     nd_refcount;        /* reference count */
+    struct ng_type          *nd_type;           /* node type */
+    void                    *nd_private;        /* node-specific data */
+    struct hooklist         nd_hooks;           /* list of hooks */
+    SLIST_ENTRY(ng_node)    nd_items;           /* global node list */
+    /* ... additional fields for topology protection */
 };
 ```
 
-The `id` field provides a unique identifier for the node, used in path resolution and message routing. The `name` field allows human-readable identification (e.g., "ether1", "bridge0"). The `type` pointer references the `ng_type` descriptor that defines the node's behavior. The `hooks` list contains all hooks connected to this node. The `private` pointer is reserved for node-type-specific data — for example, `ng_bridge` uses it to store bridge configuration and host tables.
+The `nd_private` pointer is set by the node's `constructor` and provides per-node storage. The `nd_hooks` list contains all hooks attached to this node. The `nd_type` pointer references the node type definition, which provides the lifecycle callbacks.
 
 ### struct ng_hook
 
-A hook represents a connection point on a node through which data and messages flow. Hooks are named within a node, and each hook has a pointer to its peer hook on the connected node:
+Hooks are the edges of the graph. Each hook connects a node to exactly one peer node and has a name within its parent node. Hooks carry function pointers for receiving data and control messages, allowing the framework to dispatch incoming traffic to the correct callback.
 
 ```c
+/* From sys/netgraph/netgraph.h */
 struct ng_hook {
-    struct ng_node *node;               /* owning node */
-    struct ng_hook *peer;               /* peer hook on connected node */
-    char name[NG_HOOKSIZ];              /* hook name within node */
-    void *private;                      /* hook-type-specific data */
-    ng_rcvdata_fn *rcvdata;             /* data receive function */
-    ng_rcvmsg_fn *rcvmsg;               /* message receive function */
-    refcount_t refcount;                /* reference count */
-    /* ... internal fields ... */
+    char                    hk_name[MAXNAMELEN]; /* hook name */
+    struct ng_node          *hk_node;           /* parent node */
+    struct ng_node          *hk_peer;           /* peer node */
+    hook_p                  hk_peerhook;        /* peer hook on other node */
+    void                    *hk_private;        /* hook-specific data */
+    ng_rcvdata_fn           *hk_rcvdata;        /* data receive callback */
+    ng_rcvmsg_fn            *hk_rcvmsg;         /* message receive callback */
+    /* ... additional fields for topology protection */
 };
 ```
 
-The `peer` pointer enables bidirectional traversal of the graph. When a node sends data to a hook, the framework follows the peer pointer to deliver the data to the connected node's `rcvdata` function. The `rcvdata` and `rcvmsg` function pointers allow hooks to override the default receive handlers, enabling specialized behavior for specific hook connections.
-
-### struct ng_item
-
-Data items (mbufs) are wrapped in `struct ng_item` for queuing between nodes:
-
-```c
-struct ng_item {
-    item_p next;                        /* next item in queue */
-    mbuf_t m;                           /* mbuf chain */
-    hook_p hook;                        /* destination hook */
-    /* ... timing and priority fields ... */
-};
-```
-
-Each item carries a single mbuf chain destined for a specific hook. Items are queued on the destination hook when a node calls `ng_snd_item()`, and are processed asynchronously by the netgraph thread.
+The `hk_peer` and `hk_peerhook` fields form the bidirectional connection between two hooks. When data arrives on a hook, the framework calls `hk_rcvdata` with the mbuf. When a control message arrives, it calls `hk_rcvmsg`.
 
 ### struct ng_type
 
-The node type descriptor defines the behavior of all nodes of a given type:
+Node types define the behavior of nodes. Each type specifies its name, version cookie, and the six lifecycle method pointers. Types are registered globally and can be looked up by name.
 
 ```c
+/* From sys/netgraph/netgraph.h */
 struct ng_type {
-    char name[NG_TYPESIZ];              /* type name */
-    u_int32_t version;                  /* type version cookie */
-    ng_constructor_t *constructor;      /* create new node */
-    ng_close_t *close;                  /* destroy node */
-    ng_shutdown_t *shutdown;            /* shutdown node */
-    ng_newhook_t *newhook;             /* new hook added */
-    ng_rcvdata_fn *rcvdata;            /* default data handler */
-    ng_rcvmsg_fn *rcvmsg;              /* default message handler */
-    ng_disconnect_t *disconnect;        /* hook disconnected */
-    ng_findhook_t *findhook;           /* find hook by name */
-    LIST_ENTRY(ng_type) next;          /* next type in list */
+    char                    nt_name[MAXNAMELEN]; /* type name */
+    u_int                   nt_version;         /* version cookie */
+    ng_constructor_t        *nt_constructor;    /* node creation */
+    ng_close_t              *nt_close;          /* node deletion */
+    ng_shutdown_t           *nt_shutdown;       /* node shutdown */
+    ng_newhook_t            *nt_newhook;        /* hook attachment */
+    ng_rcvdata_fn           *nt_rcvdata;        /* data receive */
+    ng_rcvmsg_fn            *nt_rcvmsg;         /* message receive */
+    ng_disconnect_fn        *nt_disconnect;     /* hook disconnection */
+    /* ... additional fields */
 };
 ```
-
-Every node type registers its `ng_type` structure with the framework via `ng_newtype()`. The `version` field is a cookie that encodes the ABI version, allowing the framework to detect incompatible type combinations. The function pointers define the node's behavior — at minimum, a type must provide a `constructor` function pointer and `rcvdata`/`rcvmsg` handlers.
 
 ### struct ng_mesg
 
-Control messages use the header defined in `sys/netgraph/ng_message.h`:
+Control messages use this header structure. The framework packages messages for transmission and unpacks them on receipt.
 
 ```c
+/* From sys/netgraph/ng_message.h */
 struct ng_mesg {
-    struct {
-        u_char version;
-        u_char spare;
-        u_int16_t spare2;
-        u_int32_t arglen;
-        u_int32_t cmd;
-        u_int32_t flags;
-        u_int32_t token;
-        u_int32_t typecookie;
-        u_char cmdstr[NG_CMDSTRSIZ];
+    struct ng_msghdr {
+        u_char      version;            /* == NGM_VERSION */
+        u_char      spare;              /* pad to 4 bytes */
+        u_int16_t   spare2;
+        u_int32_t   arglen;             /* length of data */
+        u_int32_t   cmd;                /* command identifier */
+        u_int32_t   flags;              /* message status */
+        u_int32_t   token;              /* match with reply */
+        u_int32_t   typecookie;         /* node's type cookie */
+        u_char      cmdstr[NG_CMDSTRSIZ]; /* cmd string + \0 */
     } header;
-    char data[];
+    char    data[];                     /* placeholder for actual data */
 };
 ```
 
-The `cmd` field identifies the command, `arglen` specifies the size of the data payload, `token` is used to match requests with replies, and `typecookie` identifies the node type that should handle the message. The `cmdstr` field contains a human-readable command name for debugging and logging.
+### ng_parse_type
+
+The typed-message system uses this structure to describe data types for parsing and unparsing.
+
+```c
+/* From sys/netgraph/ng_parse.h */
+struct ng_parse_type {
+    int     (*getLength)(const void *value, u_int32_t *out_len);
+    int     (*getAlign)(const void *value, u_int32_t *out_align);
+    int     (*getDefault)(const void *value, void *out_default);
+    int     (*parse)(const char *in_str, void *out_value);
+    int     (*unparse)(const void *in_value, char *out_str);
+    char    *(*getTypeName)(const void *value);
+    const struct ng_parse_type *(*getElementType)(const void *value);
+};
+```
+
+Pre-defined types include `ng_parse_int16_type`, `ng_parse_int32_type`, `ng_parse_int64_type`, `ng_parse_string_type`, `ng_parse_ipaddr_type`, and composite types for structures and arrays.
 
 ## Deep Dive
 
 ### Node Lifecycle
 
-When a node type is registered, the framework stores its `ng_type` in a global list. To create a node of that type, userland sends an `ng_mkpeer` command through the socket interface, which invokes `ng_make_node_common()` in `ng_base.c`. This function:
+When a node type is created, the framework registers it via `ng_newtype()`. The type structure is added to a global list and can be looked up by name via `ng_findtype()`.
 
-1. Allocates a `struct ng_node` via the framework's node allocation mechanism.
-2. Calls the type's `type->constructor(node)` function pointer. If the constructor returns non-zero, the node is freed and the operation fails.
-3. Assigns a unique ID and name to the node.
-4. Adds the node to the global node list under the topology write lock.
+When a node is created (via `ng_mkpeer()` or `ng_make_node()`), the framework:
+1. Allocates a `struct ng_node` via `ng_alloc_node()`.
+2. Assigns a unique ID via `ng_node2ID()`.
+3. Registers the node name in the global name table (`ng_name_rehash()`).
+4. Calls the type's `constructor` callback, passing the node pointer. The constructor initializes `nd_private` and performs type-specific setup.
 
-```c
-/* Simplified flow from ng_make_node_common */
-node = ng_make_node_common(type);
-if (node == NULL)
-    return NULL;
-error = type->constructor(node);
-if (error) {
-    ng_unref_node(node);
-    return NULL;
-}
-ng_name_node(node, name);
-ng_name_rehash(node);
-```
+When a hook is attached (via `ng_add_hook()`), the framework:
+1. Allocates a `struct ng_hook` via `ng_alloc_hook()`.
+2. Assigns the hook a name within its parent node.
+3. If a peer node and hook name are specified, connects the hooks bidirectionally.
+4. Calls the parent node's `newhook` callback.
 
-The `constructor` function pointer is responsible for initializing the node's `private` data structure and any internal state. For example, the Ethernet node type allocates private data for interface tracking, while the bridge node type initializes its configuration and host table.
+When data arrives at a hook (an mbuf is sent via `ng_snd_item()`), the framework:
+1. Packages the mbuf into a `struct ng_item` via `ng_package_data()`.
+2. Enqueues the item on the hook's queue.
+3. Calls the hook's `rcvdata` callback with the mbuf.
 
-### Hook Management
+When a control message arrives at a hook, the framework:
+1. Packages the message into a `struct ng_item` via `ng_package_msg()`.
+2. Enqueues the item on the hook's queue.
+3. Calls the hook's `rcvmsg` callback with the message.
 
-When a hook is added to a node (via `ng_add_hook()`), the framework:
+When a hook is disconnected, the framework:
+1. Calls the node's `disconnect` callback, passing the hook being removed.
+2. Removes the bidirectional connection.
+3. Destroys the hook via `ng_destroy_hook()`.
 
-1. Allocates a `struct ng_hook` via the framework's hook allocation mechanism.
-2. Assigns the hook to its parent node and sets its name.
-3. Calls the node type's `type->newhook(node, hook, name)` function pointer.
-4. If the hook is being connected to another node (via `ng_con_part2()`), the framework calls the peer node's `newhook()` and then links the two hooks together by setting their `peer` pointers.
+When a node is destroyed (via `ng_rmnode()`), the framework:
+1. Calls the node's `shutdown` callback.
+2. Calls the node's `close` callback.
+3. Removes all hooks and unregisters the node.
+4. Frees the node structure.
 
-The `newhook` function pointer allows the node type to initialize hook-specific state. For example, the Ethernet node type registers the hook's rcvdata/rcvmsg functions and sets up the hook for packet delivery.
+### Data Flow Through the Graph
 
-### Data Forwarding
+The core data path begins when a node wants to send data to a connected node. There are two primary mechanisms for forwarding data: `NG_FWD_*` macros and the `NG_SEND_DATA` macro. Both ultimately invoke `ng_snd_item()`, but they differ in how they handle the hook lookup and whether the caller holds the topology lock.
 
-When a node needs to send data to a connected node, it has two options: it can call `ng_snd_item()` directly for asynchronous forwarding, or invoke the hook's `rcvdata` function pointer directly for synchronous delivery.
+**The `NG_FWD_*` macro family** (`NG_FWD_ITEM_HOOK`, `NG_FWD_ITEM_PEER`, etc.) is used when the caller already holds a reference to a specific hook or knows the peer hook. These macros:
+1. Validate that the hook is still connected (the peer is not in the process of being destroyed).
+2. Package the mbuf into a `struct ng_item` via `ng_package_data()`.
+3. Enqueue the item on the hook's queue.
+4. If the hook has a peer, invoke the peer's `rcvdata` callback directly.
 
-`ng_snd_item()` is defined in `sys/netgraph/ng_base.c` and performs the following steps:
+**The `NG_SEND_DATA` macro** is a higher-level wrapper that first looks up the hook by name within the node, then performs the same forwarding steps. It is used when the caller knows the hook name but not the hook pointer.
 
-1. **Item Allocation/Wrapping**: The mbuf chain is placed into a new `struct ng_item`, which wraps the mbuf and records the destination hook.
-2. **Queueing**: The item is inserted into the destination hook's input queue.
-3. **Scheduling**: `ng_callout()` is invoked to schedule the netgraph kernel thread (`ngthread`).
-4. **Processing**: `ngthread()` dequeues items and calls the peer hook's `rcvdata` function, delivering the mbuf to the next node in the graph.
+**Inside `ng_base.c`**, the forwarding path involves:
+1. **Item creation**: `ng_package_data()` wraps the mbuf in a `struct ng_item`, which holds the mbuf pointer and a reference to the source hook.
+2. **Queue management**: The item is added to the hook's internal queue (`ng_queue_rw()`). The queue batches items to amortize lock overhead.
+3. **Callback dispatch**: If the hook has a peer, the framework calls the peer node's `rcvdata` callback. This is the critical path where data actually flows from one node to the next.
+4. **Thread context**: For deferred processing, the framework uses `ng_callout()` to schedule work on `ngthread()`, the dedicated netgraph worker thread. This avoids sleeping in interrupt context.
 
-This asynchronous path is the primary data forwarding mechanism in netgraph. It ensures that data forwarding is thread-safe and decoupled from the calling context, allowing nodes to return quickly after handing off packets.
+The `ngthread()` function processes deferred work items, including queued data items that need to be dispatched to peer nodes. This design decouples the data receipt from the actual processing, allowing nodes to defer expensive operations.
 
-Alternatively, a node can invoke `hook->rcvdata` directly. This bypasses the queue and callout mechanism, delivering the mbuf immediately to the peer node's receive handler in the current execution context. This synchronous path is used by simple forwarding nodes that don't need asynchronous processing.
+For control messages, the flow is similar but uses `ng_package_msg()` to create the item and dispatches to `rcvmsg` instead.
 
-### Control Message Handling
+The framework uses callouts (`ng_callout()`) to defer work to a thread context, avoiding sleeping in interrupt context. The `ngthread()` function processes deferred work items.
 
-Control messages follow a similar path but carry structured arguments. When a node type registers its `ng_type`, it can also provide a parse type table describing the expected structure of its command arguments. The framework uses `ng_parse()` and `ng_unparse()` to convert between binary and ASCII representations.
+### Typed-Message System
 
-For example, if a node type expects a command with a `struct ng_car_hookconf` argument, it registers parse type descriptors for each field:
+The typed-message system in `ng_parse.c` provides type-safe conversion between binary and ASCII representations. Each node type can declare the expected structure of its command arguments.
 
-```c
-static const struct ng_parse_struct_field ng_car_hookconf_type_fields[] = {
-    NG_GENERIC_NG_MESG_INFO(&ng_car_hookconf_type),
-    { "bandwidth", &ng_parse_uint32_type },
-    { "burst", &ng_parse_uint32_type },
-    { NULL }
-};
-```
+When `ngctl` sends a command, it:
+1. Constructs the command argument in binary form.
+2. If the node type provides a parse type for the command, the framework validates the argument structure.
+3. The message is sent to the kernel via the `ng_socket` interface.
 
-When userland sends a command via `ngctl`, the framework:
+When the kernel receives the message:
+1. It unpacks the message header and extracts the command and argument.
+2. If a parse type is registered for the command, the framework can validate or convert the argument.
+3. The message is dispatched to the node's `rcvmsg` callback.
 
-1. Parses the ASCII argument string into binary using the registered parse type.
-2. Packages the binary data into an `ng_mesg` structure.
-3. Sends the message to the target node via `ng_send_fn()`.
-4. The node's `rcvmsg` function receives the message, processes the command, and optionally sends a reply back to userland.
+For replies and statistics queries, the framework can unparse binary structures to ASCII for display by `ngctl`.
 
-The `ng_parse` system provides type safety by ensuring that command arguments match the expected layout. It also enables human-readable configuration — `ngctl show` displays node state in ASCII form, and `ngctl msg` sends commands with human-readable arguments that are automatically converted to binary.
+The `ng_parse_composite()` function handles structure types by iterating over field descriptors (`ng_parse_struct_field`). Each field has a name, offset, and type pointer. The parser uses these to extract or set field values.
 
-### Message Routing
+### Userland Interaction
 
-The framework routes messages between nodes using the hook's `peer` pointer. When a node sends a message, the framework:
+Userland programs interact with the netgraph framework through the `ng_socket` interface. This interface exposes a character device `/dev/ng` and supports the following operations:
 
-1. Creates an `ng_mesg` structure with the appropriate header fields.
-2. Sets the `typecookie` to the target node's type cookie.
-3. Calls `ng_send_fn()` to deliver the message to the target hook.
-4. The target hook's `rcvmsg` function processes the command.
+- **Node creation**: `ng_mkpeer()` creates a new node of a specified type, attached to an existing node via a named hook.
+- **Hook management**: `ng_add_hook()` attaches a hook to a node; hook removal is handled by the framework when [`ngctl(8)`](../../usr.sbin/ngctl/ngctl.8) or `libnetgraph` issues a disconnect command, which triggers the node's disconnect callback.
+- **Data sending**: `ng_snd_item()` sends an mbuf along a hook.
+- **Control messages**: `ng_generic_msg()` sends a control message to a node or hook.
+- **Topology queries**: `ng_con_nodes()`, `ng_con_part2()`, `ng_con_part3()` return the graph topology for introspection.
 
-Messages can be sent to any node in the graph by specifying the target node's name or ID. The framework resolves the name/ID to a node reference, then follows the hook chain to deliver the message.
+The [`ngctl(8)`](../../usr.sbin/ngctl/ngctl.8) command-line tool uses these operations to build and manipulate graphs from the command line. The `libnetgraph` library provides a C API for programmatic access.
 
-### Userland Interface
-
-Userland interacts with the netgraph framework through the `ng_socket` interface. The `/dev/ng` character device provides:
-
-- `open()`: Creates a new socket connection to the framework.
-- `send()`: A standard POSIX socket function (not a netgraph-specific operation) used to transmit data or control messages over the socket.
-- `read()`: Receives replies and data from the graph.
-- `ioctl()`: Performs topology operations like listing nodes, hooks, and types.
-
-The `libnetgraph` library provides a C API for programmatic access, while `ngctl(8)` provides a command-line interface. Both use the same underlying socket protocol, which defines a set of message types for operations like:
-
-- `NGM_CONNECT`: Connect two hooks.
-- `NGM_MKPEER`: Create a new node and connect it.
-- `NGM_RMHOOK`: Remove a hook.
-- `NGM_NAME`: Get or set node/hook names.
-- `NGM_GENERIC_MSG`: Send a custom command to a node.
-
-The socket interface uses a binary protocol that mirrors the kernel's `ng_mesg` structure, with additional framing for multi-part messages and error reporting.
+The kernel bridges socket I/O to graph messages through the `ng_socket` module. When a process writes to `/dev/ng`, the framework interprets the data as a control message and dispatches it to the appropriate node. Replies are sent back through the same socket.
 
 ## Flow / Diagram
 
 ```mermaid
 flowchart TD
-    Userland["Userland (ngctl / libnetgraph)"] -->|Socket I/O| NgSocket["ng_socket /dev/ng"]
-    NgSocket -->|Messages| NgBase["ng_base.c: Message Router"]
-    NgBase -->|rcvmsg| Node1["Node Type A
-(ng_ether, ng_bridge, etc.)"]
-    NgBase -->|rcvmsg| Node2["Node Type B"]
-    Node1 -->|snd_item| Hook1["Hook 'to_bridge'"]
-    Hook1 -->|peer| Hook2["Hook 'ether'"]
-    Hook2 -->|rcvdata| Node2
-    Node2 -->|snd_item| Hook3["Hook 'to_output'"]
-    Hook3 -->|peer| Hook4["Hook 'to_ether'"]
-    Hook4 -->|rcvdata| Node1
-    Node1 -->|rcvdata from network| NgInput["Network Stack
-(ifnet input path)"]
-    Node2 -->|rcvdata to network| NgOutput["Network Stack
-(ifnet output path)"]
-
-    subgraph Kernel
-        NgSocket
-        NgBase
-        Node1
-        Node2
-        Hook1
-        Hook2
-        Hook3
-        Hook4
-        NgInput
-        NgOutput
+    subgraph UserlandGroup ["Userland"]
+        NGCTL[ngctl command-line tool]
+        LIBNG[libnetgraph library]
+        APP[Custom application]
     end
 
-    subgraph Userland_grp ["Userland"]
-        Userland
+    subgraph SocketLayer ["ng_socket Interface"]
+        DEVNG[/dev/ng character device/]
+        SOCKET[Socket I/O handler]
     end
+
+    subgraph Framework ["netgraph Framework (sys/netgraph/)"]
+        BASE[ng_base.c - Core framework]
+        PARSE[ng_parse.c - Typed messages]
+        MSG[ng_message.h - Message headers]
+        TOPO[ng_topo_lock - Topology protection]
+    end
+
+    subgraph Graph ["Graph Structure"]
+        NODE1[Node Type A]
+        NODE2[Node Type B]
+        NODE3[Node Type C]
+        HOOK1[Hook "input"]
+        HOOK2[Hook "output"]
+        HOOK3[Hook "peer"]
+    end
+
+    subgraph Nodes ["Node Lifecycle"]
+        CONS[constructor]
+        NEWHOOK[newhook]
+        RCDATA[rcvdata]
+        RCVMSG[rcvmsg]
+        DISC[disconnect]
+        SHUT[shutdown]
+    end
+
+    NGCTL --> SOCKET
+    LIBNG --> SOCKET
+    APP --> SOCKET
+    SOCKET --> DEVNG
+    DEVNG --> BASE
+    BASE --> TOPO
+    BASE --> PARSE
+    BASE --> MSG
+    BASE --> NODE1
+    BASE --> NODE2
+    BASE --> NODE3
+    NODE1 --> HOOK1
+    NODE2 --> HOOK2
+    NODE3 --> HOOK3
+    HOOK1 --> CONS
+    HOOK1 --> NEWHOOK
+    HOOK1 --> RCDATA
+    HOOK1 --> RCVMSG
+    HOOK1 --> DISC
+    HOOK1 --> SHUT
+    NODE1 -.-> NODE2
+    NODE2 -.-> NODE3
 ```
 
 ## Advanced Notes
 
+### Debugging with DTrace
+
+Netgraph provides several SDT probes for debugging. The `ng_socket` interface generates probes on message receipt and dispatch. Use `dtrace -n 'netgraph*:msg-receive { printf("msg cmd=%d token=%ld", arg0, arg1); }'` to trace control messages. The `ng_base.c` file includes KTR (kernel trace) points for node allocation, hook attachment, and message routing. Enable with `sysctl kern.trac=0x...` and view with `dmesg -a`.
+
 ### Performance Considerations
 
-Netgraph processes data items asynchronously via the `ngthread()` kernel thread. This design has several performance implications:
+The topology lock (`ng_topo_lock`) is an rwlock that can become a bottleneck under heavy graph modification. Read operations (message routing, topology queries) acquire a read lock; write operations (node/hook creation, destruction) acquire a write lock. Under read-heavy workloads, multiple readers can proceed concurrently. However, any graph modification blocks all readers until the write lock is released.
 
-1. **Single-threaded processing**: All queued items are processed by a single thread, which can become a bottleneck under high packet rates. For high-throughput applications, consider using `ng_bpf` for inline packet processing or moving logic to the network stack's `netisr` framework.
+For data-path performance, the item queue system batches mbufs and processes them in batches. The `ng_queue_rw()` function enqueues items, and the `ngthread()` worker processes them. This design avoids per-mbuf locking overhead but can introduce latency under high throughput.
 
-2. **Mbuf copying**: Each item in the queue owns a reference to the mbuf chain. When multiple hooks are connected to a node, the framework may need to duplicate mbufs for fan-out scenarios, increasing memory pressure.
+### Race Conditions and Pitfalls
 
-3. **Lock contention**: The topology lock serializes graph modifications, but message routing can proceed concurrently via read locks. However, the per-hook spin locks for queue access can contend under heavy load.
+The framework uses reference counting to manage node and hook lifetime. A common pitfall is dereferencing a hook or node without holding a reference. The `_ng_hook_ref()` and `_ng_node_ref()` functions increment the reference count; `_ng_hook_unref()` and `_ng_node_unref()` decrement it and free the object when the count reaches zero.
 
-4. **Callout overhead**: Items are scheduled via `ng_callout()`, which adds latency compared to synchronous processing. For latency-sensitive applications, consider using `ng_eiface` to create a virtual interface that processes packets synchronously.
+Another pitfall is calling framework functions without holding the topology lock. The `TOPOLOGY_RLOCK()` and `TOPOLOGY_WLOCK()` macros acquire read and write locks, respectively. Failure to hold the lock can lead to use-after-free bugs when another thread destroys a node or hook.
 
-### Common Pitfalls
+The `ng_rmnode_self()` function is particularly dangerous — it destroys the calling node, which may be in the middle of processing a message. Use `ng_rmnode()` from a different context, or ensure the node is not actively processing when `ng_rmnode_self()` is called.
 
-1. **Reference leaks**: Nodes and hooks maintain reference counts. Failing to call `ng_unref_node()` or `ng_unref_hook()` when done can prevent cleanup. The `NETGRAPH_DEBUG` build helps detect leaks by never freeing nodes/hooks.
+### Connection to pfil
 
-2. **Topology changes during message routing**: Modifying the graph (adding/removing nodes or hooks) while messages are in flight can cause use-after-free bugs. Always acquire the topology write lock before making changes, and use epoch-based synchronization for safe concurrent access.
+Netgraph and pfil_hooks (covered in chapters 16/17) coexist but solve different problems. Pfil provides a fixed sequence of filtering hooks at well-known points in the IP input/output path. These hooks are compiled into the kernel and cannot be modified at runtime. Netgraph, by contrast, lets administrators build custom graphs at runtime — inserting protocol handlers, traffic shapers, and packet processors anywhere in the data path.
 
-3. **Infinite loops**: Netgraph does not detect loops in the graph. A loop of nodes forwarding data to each other can cause infinite packet circulation. Use `ng_etf` (ethertype filter) or loop detection algorithms (as in `ng_bridge`) to prevent this.
+In practice, netgraph nodes often interact with pfil. The `ng_ether` node, for example, can attach to network interfaces and receive packets via the IP input path. The `ng_bpf` node can apply BPF filters to packet data. These nodes bridge the gap between the fixed pfil hooks and the user-composable netgraph framework.
 
-4. **Message size limits**: Control messages are limited to `NG_CMDSTRSIZ` (32 bytes) for the command string and a configurable argument length. Large arguments may need to be split across multiple messages or handled via `ng_async` for background processing.
+### Historical Context
 
-5. **ABI compatibility**: The `NG_ABI_VERSION` encodes compatibility information. Mixing debug and non-debug modules can cause crashes due to different internal structures. Ensure all modules are built with the same `NG_ABI_VERSION` configuration.
+Netgraph was originally developed at Whistle Communications in the mid-1990s as a commercial product for protocol development and testing. Whistle was acquired by Network Associates, and the code was contributed to FreeBSD. The framework has evolved through multiple ABI revisions (currently at version 12) while maintaining backward compatibility. The typed-message system was added to support human-readable configuration and inter-machine communication.
 
-### Connection to OS Theory
-
-Netgraph embodies the Unix philosophy of composability — small, well-defined components that can be connected in arbitrary configurations. Each node is a state machine with a clear interface (hooks), and the framework provides the plumbing to connect them. This design parallels the pipe-and-filter architecture pattern, where data flows through a series of processing stages.
-
-The framework's use of mbufs for data passing connects it to the broader FreeBSD networking stack. When a netgraph node receives an mbuf from the network stack, it processes the packet according to its type-specific logic, then either forwards the mbuf to another hook (continuing the processing pipeline) or returns it to the network stack for delivery. This integration allows netgraph to sit transparently in the packet path, acting as a programmable intermediate layer between the network interface and the IP stack.
-
-The typed-message system in `ng_parse` reflects a broader principle in systems programming: type safety at the interface boundary. By declaring the expected structure of control messages and providing automatic conversion between binary and ASCII forms, netgraph reduces the risk of configuration errors and enables tooling that can validate and display node state. This approach is analogous to protocol buffer systems in userland, but implemented entirely within the kernel for zero-copy operation.
+The framework's design reflects its origins as a protocol development tool. The node/hook abstraction maps naturally to protocol stack layers, and the control message system provides a flexible interface for configuration and monitoring. This design has made netgraph valuable for traffic shaping (e.g., `ng_car` for committed access rate), protocol experimentation (e.g., `ng_gif` for GRE tunnels), and network monitoring (e.g., `ng_tee` for packet mirroring).
 
 ## See Also
 - [Network Stack — Architecture and Packet Flow](../net/README.md)
@@ -322,19 +336,12 @@ The typed-message system in `ng_parse` reflects a broader principle in systems p
 
 
 
-- `sys/netgraph/ng_base.c` — Core framework implementation
-- `sys/netgraph/netgraph.h` — Kernel programming interface
-- `sys/netgraph/ng_message.h` — Message header definitions
-- `sys/netgraph/ng_parse.h` / `sys/netgraph/ng_parse.c` — Typed-message system
-- `sys/netgraph/ng_ether.c` — Ethernet node (example of network stack integration)
-- `sys/netgraph/ng_bridge.c` — Bridge node (example of loop detection)
-- `sys/netgraph/ng_bpf.c` — BPF node (example of inline packet processing)
-- `sys/netgraph/ng_etf.c` — Ethertype filter (example of packet filtering)
-- `man 4 ng_ether` — ng_ether(4) manual page
-- `man 8 ngctl` — ngctl(8) manual page
-- `sys/netinet/ip_input.c` — pfil hooks (comparison point for fixed vs. composable filtering)
-- `sys/net/netisr.c` — Netisr framework (alternative to netgraph for high-throughput processing)
+- [sys/netgraph/](../../sys/netgraph/) — Source directory for the netgraph framework.
+- [sys/netgraph/ng_base.c](../../sys/netgraph/ng_base.c) — Core framework implementation.
+- [sys/netgraph/netgraph.h](../../sys/netgraph/netgraph.h) — Kernel programming interface.
+- [sys/netgraph/ng_parse.c](../../sys/netgraph/ng_parse.c) — Typed-message system implementation.
+- [usr.sbin/ngctl/](../../usr.sbin/ngctl/) — ngctl command-line tool source.
 
 ---
 
-> _Generated by [DaemonDocs](https://github.com/ocochard/DaemonDocs) on 2026-05-01 00:33 UTC using model `Qwen3.6-35B-A3B-UD-Q4_K_XL` (llama.cpp build `b8985-27aef3dd9`). AI-generated content — verify against source before relying on it._
+> _Generated by [DaemonDocs](https://github.com/ocochard/DaemonDocs) on 2026-05-03 21:34 UTC using model `Qwen3.6-35B-A3B-UD-Q8_K_XL` (llama.cpp build `b8985-27aef3dd9`). AI-generated content — verify against source before relying on it._
