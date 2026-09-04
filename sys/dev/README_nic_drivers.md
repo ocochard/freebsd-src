@@ -5,654 +5,310 @@
 **Navigation:**
   **Up:** [Kernel Core — Structure and Entry Point](../README.md) ▸ [Source Tree — Layout and Conventions](../../README_internals.md)
   **Related:** [Network Stack — Architecture and Packet Flow](../net/README.md) | [Device Driver Framework — newbus and devclass](../kern/README_driver.md) | [Interrupt Handling — Threads, Filters, and Dispatch](../kern/README_intr.md)
-  **All chapters:** [Source Tree — Layout and Conventions](../../README_internals.md) | [Boot Process — UEFI Bootloader to Kernel Handoff](../../stand/efi/loader/README.md) | [Kernel Core — Structure and Entry Point](../README.md) | [Build System — buildworld and buildkernel](../../share/mk/README.md) | [Virtual Memory Subsystem — vm_page, UMA, and Pagers](../vm/README.md) | [Process Management — Scheduling and Lifecycle](../kern/README_process.md) | [Locking Primitives — Mutexes, sx, rmlocks, and Atomics](../kern/README_locking.md) | [Buffer Cache — Block I/O Subsystem](../vm/README_bcache.md) ...
+  **All chapters:** [Source Tree — Layout and Conventions](../../README_internals.md) | [Boot Process — UEFI Bootloader to Kernel Handoff](../../stand/efi/loader/README.md) | [Kernel Core — Structure and Entry Point](../README.md) | [Build System — buildworld and buildkernel](../../share/mk/README.md) | [System Calls and Image Activation — Entry, sysent, and exec](../kern/README_syscall.md) | [Kernel Modules and the Linker — KLD, SYSINIT, and linker sets](../kern/README_kld.md) | [Virtual Memory Subsystem — vm_page, UMA, and Pagers](../vm/README.md) | [Process Management — Scheduling and Lifecycle](../kern/README_process.md) ...
 ---
-
-
-> ⚠ **UNVERIFIED DRAFT** — revisions regressed; kept revision 1 (5/8 criteria) over revision 2 (3/8); reviewer did not explicitly approve this draft. Treat claims as suspect until manually reviewed.
 
 
 ## Quick Summary
 
-FreeBSD's network interface card (NIC) drivers have evolved considerably over the years, reflecting both changes in hardware complexity and FreeBSD's own efforts to reduce driver development overhead. At one end of the spectrum sits **if_vr**, the VIA Rhine driver written in 1997 — a complete, hand-written driver that manually manages descriptor rings, bus DMA mappings, interrupt handlers, watchdog timers, and MII PHY attachment. At the other end sits **if_cxgbe**, the Chelsio T4/T5/T6 driver, which is also non-iflib but for the opposite reason: the hardware's support for TOE (TCP Offload Engine), RDMA, crypto offload, and NVMe-over-Fabrics creates a partitioned multi-role design that iflib's simple queue/ring model cannot express.
+A network interface driver is the code that stands between the kernel's `ifnet(4)` layer and the silicon. It owns three things that no generic code can own on its behalf: the DMA descriptor rings the chip reads and writes, the interrupt or poll path that moves mbufs in and out of those rings, and the device-specific register programming that brings the chip up. Everything else — the `ifnet` structure, address families, the `ether_input()` path, the [`bus_dma(9)`](../../share/man/man9/bus_dma.9) allocator — is shared. The interesting question in any operating system is how much of the *ring and interrupt* machinery is written once in a framework versus re-written in every driver.
 
-In between these two extremes lies **if_em**, Intel's 1 Gbps Ethernet driver, which has been rewritten as an iflib consumer. By adopting iflib, the driver surrenders ownership of queue management, polling, NUMA buffer pools, multi-queue dispatch, and netmap integration to the framework. In exchange, the driver author writes only a small set of device-specific callbacks: `txd_encap` to prepare transmit descriptors, `rxd_pkt_get` to extract received packets, and a handful of bookkeeping functions. This trade-off — less code, less maintenance, but less control — is the central theme of this chapter.
+This chapter isolates that single variable by lining up four drivers at four points on the complexity spectrum. `if_vr` (VIA Rhine, a 100 Mbps Ethernet chip from VIA Technologies) is a complete, pre-iflib driver: it does every one of those jobs by hand, so it is the cleanest place to see what a NIC driver must actually do. `if_em` (Intel 1 Gbps) is from the same hardware generation but was rewritten as an *iflib consumer*; comparing it to `if_vr` shows exactly which mechanics iflib took away. `iflib` itself (`sys/net/iflib.c`) is the framework that absorbed those mechanics, and `if_cxgbe` (Chelsio T4/T5/T6) is a driver that is *not* an iflib consumer — not because iflib did not exist when it was written, but because the chip's design does not fit iflib's model.
 
-The heart of the iflib framework lives in **sys/net/iflib.c**, approximately 6000 lines of code that implements a unified abstraction over tx/rx queues, descriptor rings, interrupt handling (`IFLIB_INTR_RX` semantics), and DMA tag management. Understanding iflib's design requires understanding the problems it was created to solve: driver code duplication across dozens of NIC vendors, NUMA-aware buffer allocation, multi-queue scalability, and the increasing complexity of modern hardware offloads.
+The contrast is the point. `if_vr` is non-iflib because iflib had not been written yet. `if_cxgbe` is non-iflib because iflib is not enough: the Chelsio chip exposes a TCP offload engine, RDMA (Remote Direct Memory Access), crypto offload, and NVMe-over-fabrics on top of plain NIC mode, and it partitions its queues by role in a way that iflib's one-transmit-queue / one-receive-queue-per-queue-set abstraction cannot express. Reading the four together makes the iflib trade-off concrete: iflib pays a fixed cost in abstraction in order to delete a large amount of duplicated, error-prone ring and interrupt code from the ordinary NIC drivers.
 
-This chapter walks through all four points on the NIC-driver complexity spectrum, comparing how each handles the fundamental tasks of packet I/O. By examining if_vr's manual descriptor management, if_em's iflib-driven simplicity, iflib's own architecture, and if_cxgbe's necessary independence, we illuminate the trade-offs that shape FreeBSD's networking stack.
+## Glossary
+
+**descriptor ring** — a fixed circular array of small, fixed-size records in memory that the NIC's DMA engine walks; the driver and the chip each advance an index (producer/consumer) around it.
+
+**DMA tag** — the [`bus_dma(9)`](../../share/man/man9/bus_dma.9) handle that describes a region of memory to the bus DMA allocator; it produces bus addresses the chip can fetch and holds the mapping so the driver can free it later.
+
+**doorbell** — a single memory-mapped write the driver issues to tell the chip "there is new work in the ring"; good drivers batch many descriptors and ring it once.
+
+**TOE** — TCP Offload Engine; hardware that terminates TCP (sequence numbers, retransmits, checksums) so the host never sees the per-packet cost.
+
+**completion (CPL)** — a record a chip posts to a completion queue to report an asynchronous event (a received packet, a finished send, an error); the driver dispatches on the completion type.
+
+**queue set** — a group of queues bound to one CPU or one interrupt vector; iflib uses a queue set to map one transmit and one receive queue per CPU.
 
 ## Architecture
 
-### The Pre-iflib Era: if_vr (sys/dev/vr/if_vr.c)
+The four subjects live in four directories. `if_vr` is a single translation unit, `sys/dev/vr/if_vr.c`, with its register map in `sys/dev/vr/if_vrreg.h`. `if_em` is split across `sys/dev/e1000/if_em.c`, `sys/dev/e1000/em_txrx.c`, and the shared `e1000_*` library files under `sys/dev/e1000/`. `iflib` is `sys/net/iflib.c` with its public interface in `sys/net/iflib.h`. `if_cxgbe` is the largest: `sys/dev/cxgbe/t4_main.c` for [attach](../kern/README_driver.md#glossary)/detach, `sys/dev/cxgbe/adapter.h` for the data model, `sys/dev/cxgbe/t4_sge.c` for the queue engine, plus `t4_sched.c`, `t4_filter.c`, `t4_clip.c`, `t4_l2t.c`, and `t4_smt.c`, and subdirectories `tom/` ([TOE](#glossary)), `crypto/`, `nvmf/`, and `iw_cxgbe/` (the wireless/Wi-Fi side that reuses the same silicon).
 
-The VIA Rhine driver represents the classic FreeBSD NIC driver pattern that dominated from the mid-1990s through the early 2000s. Written by Bill Paul, it is approximately 2600 lines and implements every aspect of NIC operation manually:
+**if_vr — everything by hand.** The driver registers a [newbus](../kern/README_driver.md#glossary) (FreeBSD's bus/driver/device framework) driver, claims the PCI memory and interrupt resources in `vr_attach()`, and attaches a `miibus` child so the PHY is driven through `vr_miibus_readreg()`, `vr_miibus_writereg()`, and `vr_miibus_statchg()`. It allocates its two descriptor rings with [`bus_dma(9)`](../../share/man/man9/bus_dma.9) and keeps them in `struct vr_ring_data` (the `vr_rx_ring`/`vr_tx_ring` arrays plus their bus addresses `vr_rx_ring_paddr`/`vr_tx_ring_paddr`), with the per-descriptor DMA [state](../netpfil/pf/README.md#glossary) in `struct vr_chain_data`. Transmit is driven by `vr_start()`/`vr_tx_start()`, receive is drained in the interrupt path by `vr_rxeof()`, `vr_reset()` re-initializes the chip on a link change, and `vr_watchdog()` re-arms the transmit path if the ring appears stuck. The `ifnet` up/down, multicast CAM programming (`vr_cam_mask()`, `vr_cam_data()`, `vr_hash_maddr_cam()`), and the tally counters in `struct vr_statistics` are all written in this one file. There is no framework between the driver and the hardware; every line of ring arithmetic is the driver's own.
 
-**Device attachment and resource management.** The driver uses the newbus framework: `vr_attach()` allocates PCI memory and I/O regions via `bus_alloc_resource()`, sets up interrupt handlers with `bus_setup_intr()`, and creates the miibus child for PHY management. Each resource is tracked in `struct vr_softc`:
+**if_em — the same chip generation, rewritten as an iflib consumer.** `if_em` still owns the `e1000_hw` model (in `e1000_hw.h`) and the per-queue state, but the ring and interrupt plumbing is now iflib's. The driver's `struct e1000_softc` (in `if_em.h`) carries an `if_ctx_t ctx` and an `if_shared_ctx_t shared` in addition to the `e1000_hw hw` and the `tx_queues` array. The device-specific work is collapsed into a small vtable, `struct if_txrx`, with two instances in `em_txrx.c`: `em_txrx` and a legacy variant `lem_txrx`. `em_setup_interface()` and `em_setup_msix()` wire the queues and interrupt vectors, and `em_initialize_transmit_rings()`/`em_initialize_receive_unit()` size the rings; the per-packet behavior is in the `em_isc_*` callbacks. What `if_vr` did inline — refill a ring, ring a [doorbell](#glossary), [reclaim](../sys/README_mbuf.md#glossary) completed descriptors, dispatch an interrupt — is now a set of function pointers that iflib calls.
 
-```c
-struct vr_softc {
-    device_t vr_dev;
-    void *vr_res;           /* memory region handle */
-    int vr_res_id;
-    int vr_res_type;
-    void *vr_irq;           /* interrupt handle */
-    void *vr_intrhand;      /* intrhand for bus_teardown_intr */
-    struct resource *vr_miibus;
-    /* ... more fields */
-};
-```
+**iflib — the framework that absorbed the common code.** `sys/net/iflib.c` owns the queue lifecycle and the interrupt/poll dispatch. Its central object is `struct iflib_ctx` (one per interface), which holds the driver `softc`, the `device_t`, the `if_t`, the CPU set, and a pointer to the shared context. The shared context, `struct if_shared_ctx`, carries the hardware limits (`isc_tx_maxsize`, `isc_rx_maxsize`, `isc_rx_nsegments`, and the [TSO](../netinet/README_transport.md#glossary) equivalents) plus a pointer back to the driver's `if_txrx` vtable. Transmit and receive queues are `struct iflib_txq` and `struct iflib_rxq`, each backed by a free list `struct iflib_fl` that tracks `ifl_credits`, `ifl_cidx`, `ifl_pidx`, and the [mbuf](../sys/README_mbuf.md#glossary)/[cluster](../sys/README_mbuf.md#glossary) enqueue and dequeue counts. The `IFLIB_INTR_RX` path is the receive interrupt handler; it schedules the receive work onto a taskqueue (`_task_fn_rx`) rather than doing it all in interrupt context, and the transmit reclaim path is `_task_fn_tx`/`_iflib_completed_tx_reclaim`. [DMA tag](#glossary) management is centralized in `_iflib_dmamap_cb()`. This is the code that `if_vr` had to write itself and that `if_em` no longer writes.
 
-**Descriptor ring management.** The driver maintains separate TX and RX descriptor rings in `struct vr_ring_data`:
-
-```c
-struct vr_ring_data {
-    struct vr_desc *vr_rx_ring;
-    struct vr_desc *vr_tx_ring;
-    bus_addr_t vr_rx_ring_paddr;
-    bus_addr_t vr_tx_ring_paddr;
-};
-```
-
-Each descriptor (`struct vr_desc`) contains status, control, data address, and next-descriptor pointer fields. The driver manually allocates DMA-able memory with `bus_dma_tag_create()` and `bus_dmamap_load()`, tracks head/tail indices, and handles ring wrap-around.
-
-**Transmit path.** `vr_start()` is called when the ifnet transmit queue is non-empty. It chains mbufs into descriptors, sets up bus DMA mappings for each segment, writes the physical address to the descriptor, and advances the TX ring tail index. The driver must handle the "needalign" quirk of some Rhine chips by copying mbuf data to ensure longword alignment.
-
-**Receive path.** The driver allocates a pool of mbufs and chains them through the RX descriptor ring. When an interrupt fires, `vr_intr()` processes completed RX descriptors, extracts the mbuf, strips the descriptor, and passes the packet up via `ether_input()`.
-
-**Watchdog and error handling.** `vr_watchdog()` fires when the transmit queue is stuck, resetting the hardware. The driver also implements MII media status changes through `vr_miibus_statchg()`.
-
-### The iflib Era: if_em (sys/dev/e1000/if_em.c)
-
-Intel's 1 Gbps Ethernet driver (`if_em`) and its successor `igb` (for 82575/82576/I350 chips) have been rewritten as iflib consumers. The driver no longer manages descriptor rings, DMA tags, or interrupt handlers directly. Instead, it provides a small set of callbacks through `struct if_txrx`:
-
-```c
-struct if_txrx em_txrx = {
-    .ift_txd_encap = em_isc_txd_encap,
-    .ift_txd_flush = em_isc_txd_flush,
-    .ift_txd_credits_update = em_isc_txd_credits_update,
-    .ift_rxd_available = em_isc_rxd_available,
-    .ift_rxd_pkt_get = em_isc_rxd_pkt_get,
-    .ift_rxd_refill = em_isc_rxd_refill,
-    .ift_rxd_flush = em_isc_txd_flush,
-    .ift_legacy_intr = em_intr
-};
-```
-
-**What iflib owns.** The iflib framework manages:
-- Queue allocation and initialization
-- DMA tag creation and descriptor ring allocation
-- Interrupt allocation and handler registration
-- Polling mode (via `device_poll`)
-- NUMA-aware buffer pool management
-- Multi-queue dispatch (RSS hash to queue mapping)
-- Netmap integration
-- VLAN offload registration
-
-**What the driver owns.** The driver provides:
-- `txd_encap`: Takes an `if_pkt_info_t` and fills in the hardware descriptor ring with mbuf physical addresses, offload flags, and checksum settings
-- `rxd_pkt_get`: Extracts a received packet from the descriptor ring, populating `if_rxd_info_t` with packet metadata
-- `rxd_refill`: Replenishes the receive buffer pool
-- `rxd_available`: Reports how many descriptors are free for reception
-
-The driver's `struct e1000_softc` retains hardware-specific state: MAC type, PHY operations, firmware version, and per-queue structures like `struct em_tx_queue` and `struct tx_ring`. But the common plumbing — queue lifecycle, interrupt handling, polling — is entirely iflib's responsibility.
-
-### iflib Itself (sys/net/iflib.c)
-
-iflib is approximately 6000 lines of code in `sys/net/iflib.c` that implements a unified framework for NIC drivers. It was created by Matthew Macy starting in 2014 to eliminate the massive code duplication across FreeBSD's dozens of NIC drivers.
-
-**Core data structures.** iflib imposes a layered abstraction:
-
-```
-adapter (per-device)
-  └── if_shared_ctx (per-device, shared across all ifnets)
-        └── iflib_ctx (per-ifnet, one per interface)
-              ├── iflib_txq (per-queue, per-CPU)
-              │     └── descriptor ring + DMA tags
-              └── iflib_rxq (per-queue, per-CPU)
-                    ├── iflib_fl (free list for RX buffers)
-                    └── completion queue
-```
-
-The `struct iflib_ctx` represents a single ifnet:
-
-```c
-struct iflib_ctx {
-    void *ifc_softc;      /* driver-specific softc */
-    device_t ifc_dev;     /* pci device */
-    if_t ifc_ifp;         /* ifnet pointer */
-    struct if_shared_ctx *ifc_sctx;
-    struct sx ifc_ctx_sx; /* context lock */
-    cpuset_t ifc_cpus;    /* CPUs assigned to this context */
-};
-```
-
-The `struct if_shared_ctx` holds per-device shared state:
-
-```c
-struct if_shared_ctx {
-    uint32_t isc_magic;
-    const struct if_driver *isc_driver;
-    uint16_t isc_q_align;
-    uint16_t isc_tx_maxsize;
-    uint16_t isc_tx_maxsegsize;
-    uint16_t isc_tso_maxsize;
-    uint16_t isc_tso_maxsegsize;
-    uint16_t isc_rx_maxsize;
-    uint16_t isc_rx_maxsegsize;
-    uint8_t isc_rx_nsegments;
-};
-```
-
-**Queue management.** iflib creates one or more queue sets (qsets), each containing a TX queue and one or more RX queues. Each `struct iflib_txq` tracks:
-
-```c
-struct iflib_txq {
-    uint16_t ift_in_use;
-    uint16_t ift_cidx;         /* consumer index */
-    uint16_t ift_cidx_processed;
-    uint16_t ift_pidx;         /* producer index */
-    uint16_t ift_gen;
-    uint16_t ift_npending;
-    uint16_t ift_db_pending;
-};
-```
-
-The consumer index (`cidx`) tracks how many descriptors have been processed by the hardware; the producer index (`pidx`) tracks how many the driver has filled. The gap between them is the number of pending (in-flight) descriptors.
-
-**Transmit path.** When the stack calls `if_start()`, iflib invokes the driver's `txd_encap()` callback for each mbuf chain. The callback fills in the hardware descriptor ring with physical addresses, checksum flags, TSO parameters, and VLAN tags. iflib then:
-1. Updates the producer index
-2. Notifies the hardware (doorbell write)
-3. Registers a TX completion interrupt if needed
-
-**Receive path.** When packets arrive, the hardware writes descriptors to the RX ring. iflib's interrupt handler or poll function:
-1. Calls the driver's `rxd_pkt_get()` to extract packet metadata into `if_rxd_info_t`
-2. Replenishes the buffer pool via `rxd_refill()`
-3. Passes packets up via `ether_input()`
-
-**Interrupt semantics.** iflib supports multiple interrupt modes:
-- `IFLIB_INTR_RX`: Interrupt per RX queue (default)
-- `IFLIB_INTR_TX`: Interrupt per TX queue
-- Combined modes
-
-The framework handles interrupt coalescing, MSI/MSI-X vector allocation, and interrupt affinity (binding queues to specific CPUs).
-
-**NUMA and buffer pools.** iflib allocates RX buffer pools using UMA zones, with one pool per CPU to minimize contention. The `struct iflib_fl` (free list) tracks available buffers:
-
-```c
-struct iflib_fl {
-    uint16_t ifl_cidx;
-    uint16_t ifl_pidx;
-    uint16_t ifl_credits;
-    uint16_t ifl_gen;
-    uint16_t ifl_rxd_size;
-    uint64_t ifl_m_enqueued;
-    uint64_t ifl_m_dequeued;
-};
-```
-
-### The Non-iflib Necessity: if_cxgbe (sys/dev/cxgbe/)
-
-The Chelsio T4/T5/T6 driver (`if_cxgbe`) is a non-iflib driver by necessity, not by choice. While if_vr is pre-iflib (iflib didn't exist when it was written), if_cxgbe is post-iflib but deliberately does not use it because the hardware's capabilities exceed iflib's abstractions.
-
-**Hardware complexity.** Chelsio adapters expose far more than simple NIC functionality:
-- **TOE (TCP Offload Engine):** The hardware handles TCP segmentation, checksum offload, and even full TCP state machines
-- **RDMA (iWarp/RoCE):** Direct memory access for remote procedure calls
-- **Crypto offload:** AES, SHA, and other cryptographic operations
-- **NVMe-over-Fabrics:** Storage protocol offload
-- **Multiple virtual functions:** SR-IOV support with independent NIC/TOE/RDMA partitions per VF
-
-**Why iflib doesn't fit.** iflib's queue/ring model assumes a simple NIC: one or more TX queues, one or more RX queues, and optional VLAN offload. Chelsio's hardware has:
-- **Ingress queues (sge_iq):** Multiple types — firmware event queues, RX packet queues, offload request queues, each with different descriptor formats
-- **Egress queues (sge_wrq):** TX queues, offload response queues, management queues
-- **Flow tables:** L2T (Layer 2 Table), SMT (SMAC Table), CLIP (Compressed Local IPv6), TPT (Transport Protection Table)
-- **Connection tables:** TCB (TCB — TCP Control Block) for TOE, CCB for crypto
-
-The driver's `struct adapter` encapsulates this complexity:
-
-```c
-struct adapter {
-    device_t adp_dev;
-    struct port_info adp_port[MAXPORT];
-    struct sge adp_sge;         /* SGE (Scheduler and Gate Engine) state */
-    /* ... hundreds more fields */
-};
-```
-
-The `struct sge` (Scheduler and Gate Engine) manages all queue types:
-
-```c
-struct sge {
-    struct sge_qset qs[SGE_QSETS];
-    struct mtx reg_lock;
-};
-```
-
-**Upper Layer Drivers (ULDs).** if_cxgbe implements a ULD architecture where each offload service (NIC, TOE, iWarp, NVMeF, crypto) is a separate module that registers with the driver. The driver dispatches incoming CPL (Chelsio Protocol) messages to the appropriate ULD handler.
-
-This architecture is fundamentally incompatible with iflib's single-purpose NIC abstraction. iflib cannot express the concept of a "TCP connection table entry" or a "crypto session" — it only knows about packet queues.
-
+**if_cxgbe — non-iflib by necessity.** `t4_main.c` registers the `t4nex` bus driver (`driver_t t4_driver`, with `t4_methods`) and a `cxgbe` port driver. The data model in `adapter.h` is built around `struct adapter` and, inside it, `struct sge` — the "scatter-gather engine" — whose `qs[]` array holds `struct sge_qset`. A [queue set](#glossary) is not just one transmit and one receive queue: it is a `sge_txq` array, a `sge_fl` (free list) array, an LRO state, and a shared `sge_rspq` completion queue. On top of the plain NIC queues the driver allocates entirely separate queue *types*: `alloc_iq_fl()` for ingress queues (each tagged with a `qtype` in `struct sge_iq`), `alloc_ofld_rxq()`/`alloc_ofld_txq()` for the TOE/offload paths, `alloc_wrq()` for RDMA work-request queues, `alloc_nm_rxq()`/`alloc_nm_txq()` for netmap, and `alloc_ctrlq()`/`alloc_eq()`/`alloc_fwq()` for the firmware and event queues. The chip reports everything through completions dispatched by `t4_register_cpl_handler()`, `t4_register_an_handler()` (asynchronous notifications), and `t4_register_fw_msg_handler()`. Queue-to-CPU and queue-to-traffic-class mapping is done in `t4_sched.c` (`bind_txq_to_traffic_class()`), and the hardware TCAM (ternary content-addressable memory) filters are managed in `t4_filter.c`. This partitioned, multi-engine design is what iflib's queue model cannot express.
 ## Key Data Structures
 
-### struct vr_softc (sys/dev/vr/if_vrreg.h)
+**if_vr ring state** (`sys/dev/vr/if_vrreg.h`). The driver keeps one chain-data block per interface that owns both the descriptor arrays and their DMA tags. The load-bearing fields, by name:
 
-The VIA Rhine driver's main softc structure. Tracks all device state including resources, rings, and statistics.
-
-```c
-struct vr_softc {
-    device_t vr_dev;
-    void *vr_res;
-    int vr_res_id;
-    int vr_res_type;
-    void *vr_irq;
-    void *vr_intrhand;
-    struct resource *vr_miibus;
-    struct vr_ring_data vr_ring_data[VR_NFRINGS];
-    struct vr_statistics vr_statistics;
-    /* ... MII state, watchdog timer, ifnet wiring */
-};
+```
+struct vr_chain_data            /* sys/dev/vr/if_vrreg.h */
+  vr_parent_tag                 /* bus_dma tag for the whole block */
+  vr_tx_tag                     /* bus_dma tag for the tx descriptors */
+  vr_txdesc[VR_TX_RING_CNT]     /* transmit descriptors */
+  vr_rx_tag                     /* bus_dma tag for the rx descriptors */
+  vr_rxdesc[VR_RX_RING_CNT]     /* receive descriptors */
+  vr_tx_ring_tag / vr_tx_ring_map   /* bus addr of the tx ring */
+  vr_rx_ring_tag / vr_rx_ring_map   /* bus addr of the rx ring */
+  vr_rx_sparemap                /* spare rx buffer map */
 ```
 
-### struct vr_desc (sys/dev/vr/if_vrreg.h)
+Each transmit descriptor pairs an mbuf with its DMA map, and each receive descriptor pairs a buffer map with the hardware descriptor:
 
-The hardware descriptor format for both TX and RX rings. Each descriptor is 16 bytes.
-
-```c
-struct vr_desc {
-    uint32_t vr_status;
-    uint32_t vr_ctl;
-    uint32_t vr_data;      /* physical address of buffer */
-    uint32_t vr_nextphys;  /* physical address of next descriptor */
-};
+```
+struct vr_txdesc   {  tx_m, tx_dmamap }        /* mbuf + its bus_dma map */
+struct vr_rxdesc   {  rx_m, rx_dmamap, desc }  /* buffer, map, hw desc  */
+struct vr_ring_data { vr_rx_ring, vr_tx_ring,
+                      vr_rx_ring_paddr, vr_tx_ring_paddr }
 ```
 
-### struct iflib_ctx (sys/net/iflib.c)
+The register map in the same header is what the driver programs by hand: `VR_RXADDR`/`VR_TXADDR` hold the ring base addresses, `VR_CURRXDESC0`..`VR_NEXTRXDESC3` and `VR_CURTXDESC0`..`VR_NEXTTXDESC3` are the chip's current/next descriptor pointers, and `VR_ISR`/`VR_IMR` are the interrupt status and mask registers.
 
-Represents a single ifnet managed by iflib. Contains the driver's softc pointer and the ifnet itself.
-
-```c
-struct iflib_ctx {
-    void *ifc_softc;
-    device_t ifc_dev;
-    if_t ifc_ifp;
-    struct if_shared_ctx *ifc_sctx;
-    struct sx ifc_ctx_sx;
-    cpuset_t ifc_cpus;
-};
-```
-
-### struct if_shared_ctx (sys/net/iflib.h)
-
-Per-device shared state, common across all ifnets on the same device. Holds DMA parameters, queue alignment, and offload capabilities.
+**iflib public types** (`sys/net/iflib.h`). These are quoted verbatim from the header. The transmit path hands the driver an `if_pkt_info` describing the packet to encap; the receive path hands it an `if_rxd_info` to fill in:
 
 ```c
-struct if_shared_ctx {
-    uint32_t isc_magic;
-    const struct if_driver *isc_driver;
-    uint16_t isc_q_align;
-    uint16_t isc_tx_maxsize;
-    uint16_t isc_tx_maxsegsize;
-    uint16_t isc_tso_maxsize;
-    uint16_t isc_tso_maxsegsize;
-    uint16_t isc_rx_maxsize;
-    uint16_t isc_rx_maxsegsize;
-    uint8_t isc_rx_nsegments;
-};
+typedef struct if_pkt_info {
+	bus_dma_segment_t	*ipi_segs;	/* physical addresses */
+	uint32_t		ipi_len;	/* packet length */
+	uint16_t		ipi_qsidx;	/* queue set index */
+	qidx_t			ipi_nsegs;	/* number of segments */
+
+	qidx_t			ipi_ndescs;	/* number of descriptors used by encap */
+	uint16_t		ipi_flags;	/* iflib per-packet flags */
+	qidx_t			ipi_pidx;	/* start pidx for encap */
+	qidx_t			ipi_new_pidx;	/* next available pidx post-encap */
+	/* offload handling */
+	uint8_t			ipi_ehdrlen;	/* ether header length */
+	uint8_t			ipi_ip_hlen;	/* ip header length */
+} *if_pkt_info_t;
+
+typedef struct if_rxd_info {
+	/* set by iflib */
+	uint16_t iri_qsidx;		/* qset index */
+	uint16_t iri_vtag;		/* vlan tag - if flag set */
+	uint16_t iri_len;		/* packet length */
+	qidx_t iri_cidx;		/* consumer index of cq */
+	if_t iri_ifp;			/* driver may have >1 iface per softc */
+
+	/* updated by driver */
+	if_rxd_frag_t iri_frags;
+	uint32_t iri_flowid;		/* RSS hash for packet */
+	uint32_t iri_csum_flags;	/* m_pkthdr csum flags */
+	uint32_t iri_csum_data;		/* m_pkthdr csum data */
+	uint8_t iri_flags;		/* mbuf flags for packet */
+	uint8_t	 iri_nfrags;		/* number of fragments in packet */
+	uint8_t	 iri_rsstype;		/* RSS hash type */
+	uint8_t	 iri_pad;		/* any padding in the received data */
+} *if_rxd_info_t;
 ```
 
-### struct iflib_txq (sys/net/iflib.c)
+The `if_pkt_info` is the contract on the transmit side: iflib has already turned the mbuf chain into a flat array of `bus_dma_segment_t` physical addresses (`ipi_segs`) and a segment count, and it has computed the offload fields. The driver's `txd_encap` callback only has to write those segments into the hardware descriptors and report how many it used (`ipi_ndescs`). On the receive side, `if_rxd_info` is the opposite direction: iflib fills the queue-set, consumer-index, and length fields, and the driver's `rxd_pkt_get` callback fills the fragment list, the RSS hash, and the checksum flags so iflib can build the `mbuf`.
 
-Per-queue TX state. Tracks producer/consumer indices, pending packet count, and generation counters for lock-free access.
+The driver-facing vtable is `struct if_txrx` in `sys/net/iflib.h`. The exact member names are taken from the `em_txrx` instance in `sys/dev/e1000/em_txrx.c`:
 
-```c
-struct iflib_txq {
-    uint16_t ift_in_use;
-    uint16_t ift_cidx;
-    uint16_t ift_cidx_processed;
-    uint16_t ift_pidx;
-    uint16_t ift_gen;
-    uint16_t ift_npending;
-    uint16_t ift_db_pending;
-};
+```
+struct if_txrx                  /* sys/net/iflib.h, instance in em_txrx.c */
+  ift_txd_encap()               /* write if_pkt_info into tx descriptors */
+  ift_txd_flush()               /* ring the doorbell for a tx queue */
+  ift_txd_credits_update()      /* tell iflib how many tx credits remain */
+  ift_rxd_available()           /* ask the driver how many rx bufs are free */
+  ift_rxd_pkt_get()             /* driver fills if_rxd_info for one packet */
+  ift_rxd_refill()              /* driver posts new bufs to the rx ring */
+  ift_rxd_flush()               /* ring the rx doorbell */
+  ift_legacy_intr()             /* optional: driver-owned interrupt handler */
 ```
 
-### struct iflib_rxq (sys/net/iflib.c)
+**iflib queue state** (`sys/net/iflib.c`). The per-queue bookkeeping that iflib keeps on behalf of the driver:
 
-Per-queue RX state. References the associated free list and completion queue.
+```
+struct iflib_txq                /* sys/net/iflib.c */
+  ift_in_use                    /* queue is active */
+  ift_cidx                      /* consumer index (driver reclaim) */
+  ift_cidx_processed            /* how far iflib has processed */
+  ift_pidx                      /* producer index (driver encap) */
+  ift_gen                       /* generation counter for the ring */
+  ift_br_offset : 1             /* buf_ring offset bit */
+  ift_defer_mfree : 1           /* defer mbuf free bit */
+  ift_npending                  /* packets pending on the queue */
+  ift_db_pending                /* doorbell is pending */
 
-```c
-struct iflib_rxq {
-    struct iflib_ctx *ifr_ctx;
-    struct iflib_fl *ifr_fl;
-    struct pfil_head *pfil;
-    uint16_t ifr_cq_cidx;
-    uint16_t ifr_id;
-    uint8_t ifr_nfl;
-};
+struct iflib_fl                 /* the free list backing each queue */
+  ifl_cidx / ifl_pidx           /* free-list consumer / producer index */
+  ifl_credits                   /* buffers currently available */
+  ifl_gen                       /* generation counter */
+  ifl_rxd_size                  /* receive buffer size */
+  ifl_m_enqueued / ifl_m_dequeued   /* mbuf accounting */
+  ifl_cl_enqueued / ifl_cl_dequeued /* cluster accounting */
 ```
 
-### struct iflib_fl (sys/net/iflib.c)
-
-Receive buffer free list. Tracks available mbufs and their physical addresses for DMA.
-
-```c
-struct iflib_fl {
-    uint16_t ifl_cidx;
-    uint16_t ifl_pidx;
-    uint16_t ifl_credits;
-    uint16_t ifl_gen;
-    uint16_t ifl_rxd_size;
-    uint64_t ifl_m_enqueued;
-    uint64_t ifl_m_dequeued;
-};
-```
-
-### struct adapter (sys/dev/cxgbe/adapter.h)
-
-Chelsio's main adapter structure. Encompasses all hardware blocks: SGE queues, upper layer drivers, register access, and memory windows.
-
-```c
-struct adapter {
-    device_t adp_dev;
-    struct port_info adp_port[MAXPORT];
-    struct sge adp_sge;
-    /* ... hundreds more fields for TOE, RDMA, crypto, NVMe */
-};
-```
-
-### struct sge (sys/dev/cxgb/cxgb_adapter.h)
-
-The Scheduler and Gate Engine — Chelsio's internal packet engine that manages all ingress and egress queues.
-
-```c
-struct sge {
-    struct sge_qset qs[SGE_QSETS];
-    struct mtx reg_lock;
-};
-```
-
-### struct if_txrx (sys/net/iflib.h)
-
-The callback interface that iflib-based drivers implement. Each function pointer is called by iflib at the appropriate point in the TX or RX path.
-
-```c
-struct if_txrx {
-    int (*ift_txd_encap)(void *, if_pkt_info_t);
-    void (*ift_txd_flush)(void *, uint16_t, qidx_t);
-    int (*ift_txd_credits_update)(void *, uint16_t, bool);
-    int (*ift_rxd_available)(void *, uint16_t, qidx_t, qidx_t);
-    int (*ift_rxd_pkt_get)(void *, if_rxd_info_t);
-    void (*ift_rxd_refill)(void *, if_rxd_update_t);
-    void (*ift_rxd_flush)(void *, uint16_t, uint8_t, qidx_t);
-    int (*ift_legacy_intr)(void *);
-};
-```
-
+The `qidx_t` index type is a `uint16_t` (see the comment in `iflib.h` limiting descriptors to 65535), and `QIDX_INVALID` is `0xFFFF`. The free list is why iflib can own the buffer pool: it tracks exactly how many mbufs and clusters are in flight (`ifl_m_enqueued` vs `ifl_m_dequeued`) so it knows when to call the driver's `rxd_refill` and when it can safely hand a buffer back.
 ## Deep Dive
 
-### if_vr: The Manual Driver
+### The transmit path in if_vr
 
-Let's trace through how if_vr handles a transmit operation, step by step.
+In the pre-iflib world the transmit path is one long function the driver owns. `vr_start()` is the `if_transmit` entry point; it is called by `ether_output()` with an `mbuf` chain. It loops over the chain, and for each `mbuf` it takes a free transmit descriptor from the ring, calls `bus_dmamap_load()` against the descriptor's `tx_dmamap` to get a bus address, writes that address and the length into the hardware `vr_txdesc`, and advances the ring's producer index. When it has queued at least one descriptor it rings the doorbell — on the Rhine this is a write to `VR_CR0` (command register 0) — and returns `0` to tell the stack the packet was accepted. If the ring has no free descriptors it returns `EAGAIN` and the packet is retried.
 
-**Step 1: if_start is called.** When the network stack has packets to send, it calls `if_vr->if_start` (which is `vr_start`). The function checks if the interface is up and if there are packets in the ifnet queue.
+Two things in that flow are exactly what iflib later centralizes. First, the DMA mapping: `vr_start()` calls `bus_dmamap_load()` per segment and must remember the `bus_dmamap` in the descriptor so the interrupt path can `bus_dmamap_unload()` it. Second, the back-pressure: the driver must count free descriptors and decide when to return `EAGAIN`. In `if_vr` both are hand-rolled and both live in the same file as the register writes.
 
-**Step 2: Mbuf chaining.** vr_start chains mbufs into a single buffer if necessary (to handle the needalign quirk), then calls `vr_encap` to fill descriptors.
+### The transmit path in if_em, through iflib
 
-**Step 3: Descriptor filling.** `vr_encap` iterates over the mbuf chain, creating bus DMA mappings for each segment:
+`if_em` no longer has a `if_transmit` that walks the ring. Instead the `ifnet` transmit path lands in iflib. iflib turns the `mbuf` chain into an `if_pkt_info` (the `ipi_segs` array of physical addresses, `ipi_nsegs`, and the offload fields) and then calls the driver's `ift_txd_encap` callback. In `em_txrx.c` that callback is `em_isc_txd_encap()`, which writes the segments into the `e1000_tx_desc` descriptors for the queue and returns the number of descriptors it used. iflib then calls `ift_txd_flush()` (`em_isc_txd_flush()`) to ring the doorbell, and `ift_txd_credits_update()` (`em_isc_txd_credits_update()`) to learn how many transmit credits are left so it can apply back-pressure.
 
-```c
-error = bus_dmamap_load(vr->vr_dmat, vr->vr_dmamap, m->m_data,
-    m->m_len, vr_dmamap_cb, &dmamap_arg, 0);
-```
+The contrast is precise. The mbuf-to-segments conversion that `vr_start()` did inline is now iflib's; the doorbell is a callback; the credit accounting is a callback. The driver still knows the hardware descriptor layout (`e1000_tx_desc` in `e1000_hw.h`) and the offload bits — that is genuinely device-specific — but it no longer owns the ring indices, the DMA tag lifecycle, or the back-pressure policy.
 
-The DMA map callback (`vr_dmamap_cb`) records the physical addresses. vr_encap then writes the physical address into the descriptor's `vr_data` field and sets the control bits.
+### The receive path, interrupt to ether_input
 
-**Step 4: Ring update.** After filling descriptors, vr_start updates the TX ring tail index and writes it to the hardware register `VR_TXADDR`. This tells the NIC where the new descriptors are.
+In `if_vr` the interrupt handler reads `VR_ISR`, and for the received-packet bit it calls `vr_rxeof()`. `vr_rxeof()` walks the receive ring from the chip's current descriptor pointer, and for each completed descriptor it reads the status word to find the packet length and error bits, unmaps the descriptor's `rx_dmamap`, builds an `mbuf` around the received data, and hands it to `ether_input()`. It then advances the ring's consumer pointer and, if there are no more packets, exits. The driver must also refill the ring with fresh buffers so the chip has somewhere to DMA the next packet.
 
-**Step 5: Interrupt arm.** If the ring is full or the last packet has the interrupt flag set, vr_start enables the TX interrupt by writing to `VR_IMR`.
+In the iflib world the receive interrupt is the `IFLIB_INTR_RX` path. Rather than drain the whole ring in interrupt context, iflib schedules the work onto a taskqueue; `_task_fn_rx()` is the task that actually pulls packets. For each packet it calls the driver's `ift_rxd_pkt_get()` — `em_isc_rxd_pkt_get()` in `em_txrx.c` — passing an `if_rxd_info`. The driver fills in `iri_frags` (the fragment list), `iri_flowid` (the RSS hash), `iri_csum_flags`, and `iri_nfrags`. iflib then assembles the `mbuf` from the fragments and calls `ether_input()`. When the free list runs low, iflib calls `ift_rxd_refill()` (`em_isc_rxd_refill()`) to have the driver post new buffers, and `ift_rxd_flush()` to ring the receive doorbell. The `_rxq_refill_cb()` helper is the callback [trampoline](../../stand/efi/loader/README.md#glossary) that iflib uses to drive that refill.
 
-**Step 6: Receive path.** When a packet arrives, the NIC writes a descriptor to the RX ring and fires an interrupt. `vr_intr()` is called, which checks the interrupt status register `VR_ISR`. For RX completions, vr_intr:
-1. Reads descriptors from the RX ring
-2. Extracts the mbuf from the descriptor
-3. Calls `ether_input()` to pass the packet up the stack
-4. Allocates a new mbuf and writes it back to the descriptor
+So the receive path has been split into a small number of well-defined operations — *get one packet*, *refill*, *flush* — each owned by the driver, with the loop, the `mbuf` assembly, the buffer pool, and the taskqueue dispatch owned by iflib. That split is the unit of the abstraction.
 
-**Step 7: Watchdog.** If the TX queue is stuck (no completion after a timeout), `vr_watchdog()` fires. It resets the hardware by writing to the command register `VR_CR0` and reinitializes the descriptor rings.
+### Why if_cxgbe cannot use this model
 
-This is the complete picture: every aspect of NIC operation is hand-coded in vr. There is no framework, no abstractions, no shared code. Each new NIC driver duplicates this entire pattern.
+`if_cxgbe`'s `struct sge_qset` (in `adapter.h`) shows why. A queue set is not one transmit queue and one receive queue. It contains a `sge_txq` array (`txq[]`, sized `SGE_TXQ_PER_SET`), a `sge_fl` array (`fl[]`, sized `SGE_RXQ_PER_SET`), an LRO state, and a shared `sge_rspq` completion queue. The transmit and receive sides are decoupled: the chip does not post received packets into a per-queue ring the way the Intel or VIA chips do; it posts *completions* into the `sge_rspq`, and the driver dispatches on the completion type. `t4_sge.c` registers the dispatchers with `t4_register_cpl_handler()`, `t4_register_an_handler()`, and `t4_register_fw_msg_handler()`.
 
-### if_em: The iflib Consumer
+On top of the NIC queue sets, the driver allocates separate queue objects for each role the chip plays. `struct sge_iq` is an ingress queue with a `qtype` field that selects what kind of traffic it carries; `alloc_iq_fl()` creates the filter/ingress queues. `struct sge_ofld_rxq` and `struct sge_ofld_txq` are the TOE/offload queues — `sge_ofld_rxq` even carries iSCSI DDP counters (`rx_iscsi_ddp_setup_ok`, `rx_iscsi_ddp_pdus`, `rx_iscsi_ddp_octets`). `struct sge_wrq` is the RDMA work-request queue, `struct sge_nm_rxq`/`struct sge_nm_txq` are the netmap queues, and `struct sge_eq` is the event queue. Each of these has its own `cidx`/`pidx`/`gen` and its own doorbell, and the mapping of queues to CPUs and to traffic classes is done in `t4_sched.c` (`bind_txq_to_traffic_class()`).
 
-Now let's see how if_em handles the same operations through iflib.
-
-**Step 1: if_start is called.** The ifnet's `if_start` pointer is set by iflib to `iflib_start`. The driver never sees `if_start` directly.
-
-**Step 2: iflib_start calls txd_encap.** iflib iterates over the mbuf chain and calls the driver's `em_isc_txd_encap` callback. This function:
-1. Checks TSO (TCP Segmentation Offload) requirements
-2. Sets up checksum offload flags
-3. Writes physical addresses into the e1000 descriptor ring (`e1000_adv_data_desc`)
-4. Writes context descriptors (`e1000_adv_context_desc`) for TSO/VLAN
-
-**Step 3: iflib handles the rest.** After `txd_encap` returns, iflib:
-1. Updates the producer index
-2. Writes the doorbell register to notify the hardware
-3. Registers for TX completion interrupts if needed
-
-**Step 4: Receive path.** When packets arrive, iflib's interrupt handler or poll function:
-1. Calls `em_isc_rxd_pkt_get` to extract packet metadata
-2. The driver reads the e1000 RX descriptor (`e1000_rx_desc`) and populates `if_rxd_info_t` with packet length, VLAN tag, checksum flags, and RSS hash
-3. iflib calls `em_isc_rxd_refill` to replenish the buffer pool
-4. iflib passes the packet up via `ether_input()`
-
-The driver's job is reduced to filling in hardware-specific descriptors and extracting packet metadata. All queue management, DMA handling, interrupt setup, and polling are iflib's responsibility.
-
-### iflib: The Framework
-
-Let's examine how iflib manages a TX queue from allocation to completion.
-
-**Queue allocation.** During driver attach, iflib's `iflib_init_ctx` function:
-1. Creates a DMA tag for descriptor rings: `bus_dma_tag_create()`
-2. Allocates coherent memory for the ring: `bus_dmamem_alloc()` with `BUS_DMA_COHERENT`
-3. Initializes the `iflib_txq` structure with zeroed indices
-4. Registers the queue with the interrupt subsystem
-
-**TX path.** When `iflib_start` is called:
-1. Iterates over mbuf chains in the ifnet queue
-2. Calls `txd_encap` for each packet
-3. If the ring is full, returns and waits for the next interrupt/poll
-4. If interrupts are enabled, arms the TX interrupt
-
-**TX completion.** When the hardware finishes a packet:
-1. The NIC writes a status descriptor to the ring
-2. iflib's interrupt handler (or poll function) reads the completion queue
-3. Updates `ift_cidx` to mark descriptors as processed
-4. Calls `m_freem()` on completed mbufs
-5. If the ifnet queue was stopped (ring full), calls `if_start()` again
-
-**RX path.** When a packet arrives:
-1. The NIC writes a descriptor to the RX ring
-2. iflib's interrupt handler reads the descriptor
-3. Calls `rxd_pkt_get` to extract metadata
-4. Calls `rxd_refill` to replenish buffers
-5. Passes the packet up via `ether_input()`
-
-**Interrupt handling.** iflib supports multiple interrupt modes:
-- Per-queue interrupts: Each RX queue has its own MSI-X vector
-- Combined interrupts: One vector for multiple queues
-- Legacy interrupts: Shared INTx
-
-The framework handles interrupt coalescing, vector allocation, and CPU affinity.
-
-### if_cxgbe: The Complex Driver
-
-The Chelsio driver's architecture is fundamentally different from both if_vr and if_em. Let's trace through a TX operation.
-
-**Step 1: if_start is called.** if_cxgbe's `if_start` is `cxgbe_if_start`. It calls `t4_txq_start` to process the ifnet queue.
-
-**Step 2: WR (Work Request) construction.** Unlike iflib's simple descriptor ring, if_cxgbe constructs "work requests" — variable-length sequences of descriptors that can encode complex operations:
-- Simple TX: one descriptor with buffer address
-- TSO: context descriptor + data descriptors
-- Offload: connection table lookup + data descriptors
-- Netmap: direct ring access
-
-**Step 3: WR submission.** The driver writes the WR to a write queue (`sge_wrq`), which is a circular buffer of 64-byte entries. Each entry can contain multiple descriptor chunks.
-
-**Step 4: Hardware processing.** The SGE (Scheduler and Gate Engine) reads WRs from the TX queue, fetches data from memory via DMA, and transmits packets. The SGE also handles flow control, scheduling, and traffic shaping.
-
-**Step 5: Completion.** When a packet is transmitted, the SGE writes a completion descriptor to a completion queue. The driver's interrupt handler reads completions and frees mbufs.
-
-**Step 6: Offload processing.** For TOE connections, the flow is different:
-1. User space sends a CPL (Chelsio Protocol) message to create a connection
-2. The driver allocates a TCB (TCB entry) and sends the request to the firmware
-3. The firmware programs the hardware and returns a completion
-4. Subsequent packets are handled entirely by the hardware — the driver is not involved
-
-This is why iflib cannot serve if_cxgbe: iflib knows nothing about TCBs, CPL messages, or firmware interaction. The hardware's capabilities are simply outside iflib's abstraction.
-
+iflib's model assumes a fixed shape: a set of queue sets, each with one transmit and one receive queue, driven by a small `if_txrx` vtable. The Chelsio chip has a different shape — many queue *types*, a completion-driven receive path, and a hardware scheduler that the driver must program. Forcing the Chelsio design into `if_txrx` would mean either hiding the TOE/RDMA/NVMe roles behind the NIC vtable (losing the hardware's partitioning) or writing a private iflib that is not iflib. The driver therefore manages its own rings, its own completions, and its own DMA tags, the way `if_vr` does — the difference being that `if_vr` does it because there was no alternative, and `if_cxgbe` does it because the alternative is too small.
 ## Flow / Diagram
+
+The diagram groups the four subjects into three "worlds" and shows how the iflib core sits between the if_em driver and the hardware. `if_vr` owns its rings directly; `if_em` delegates to `if_txrx` vtable callbacks owned by iflib; `if_cxgbe` owns a partitioned, multi-role queue tree of its own.
 
 ```mermaid
 classDiagram
-    class vr_softc {
-        device_t vr_dev
-        void *vr_res
-        void *vr_irq
-        struct vr_ring_data vr_ring_data
-        struct vr_statistics vr_statistics
-    }
-    class vr_ring_data {
-        struct vr_desc *vr_rx_ring
-        struct vr_desc *vr_tx_ring
-        bus_addr_t vr_rx_ring_paddr
-        bus_addr_t vr_tx_ring_paddr
-    }
-    class vr_desc {
-        uint32_t vr_status
-        uint32_t vr_ctl
-        uint32_t vr_data
-        uint32_t vr_nextphys
-    }
-    class iflib_ctx {
-        void *ifc_softc
-        device_t ifc_dev
-        if_t ifc_ifp
-        struct if_shared_ctx *ifc_sctx
-        cpuset_t ifc_cpus
-    }
-    class if_shared_ctx {
-        uint32_t isc_magic
-        const struct if_driver *isc_driver
-        uint16_t isc_tx_maxsize
-        uint16_t isc_rx_maxsize
-        uint8_t isc_rx_nsegments
-    }
-    class iflib_txq {
-        uint16_t ift_cidx
-        uint16_t ift_pidx
-        uint16_t ift_npending
-    }
-    class iflib_rxq {
-        struct iflib_fl *ifr_fl
-        uint16_t ifr_cq_cidx
-    }
-    class iflib_fl {
-        uint16_t ifl_cidx
-        uint16_t ifl_pidx
-        uint16_t ifl_credits
-    }
-    class if_txrx {
-        int (*ift_txd_encap)(void *, if_pkt_info_t)
-        int (*ift_rxd_pkt_get)(void *, if_rxd_info_t)
-        void (*ift_rxd_refill)(void *, if_rxd_update_t)
-    }
-    class adapter {
-        device_t adp_dev
-        struct sge adp_sge
-        struct uld_info adp_uld
-        struct t4_reg adp_reg
-    }
-    class sge {
-        struct sge_eq sge_ctrl_eq
-        struct sge_wrq sge_txq
-        struct sge_rxq sge_rxq
-        struct sge_iq sge_iq
-        struct sge_fl sge_fl
-    }
-    class e1000_softc {
-        struct e1000_hw hw
-        struct em_tx_queue tx_queues
-        struct if_txrx em_txrx
-    }
-    vr_softc --> vr_ring_data : contains
-    vr_ring_data --> vr_desc : contains
-    iflib_ctx --> if_shared_ctx : contains
-    iflib_ctx --> iflib_txq : contains
-    iflib_ctx --> iflib_rxq : contains
-    iflib_rxq --> iflib_fl : contains
-    iflib_ctx --> if_txrx : uses
-    adapter --> sge : contains
-    adapter --> uld_info : contains
-    e1000_softc --> if_txrx : implements
-    e1000_softc --> iflib_ctx : embeds
+  class vr_softc {
+    +vr_dev device
+    +vr_res resource
+    +vr_miibus miibus
+    +vr_irq resource
+  }
+  class vr_ring_data {
+    +vr_rx_ring vr_rxdesc
+    +vr_tx_ring vr_txdesc
+    +vr_rx_ring_paddr bus_addr
+    +vr_tx_ring_paddr bus_addr
+  }
+  class vr_txdesc {
+    +tx_m mbuf
+    +tx_dmamap bus_dmamap
+  }
+  class vr_rxdesc {
+    +rx_m mbuf
+    +rx_dmamap bus_dmamap
+    +desc hw_desc
+  }
+  class e1000_softc {
+    +hw e1000_hw
+    +shared if_shared_ctx
+    +ctx iflib_ctx
+    +tx_queues em_tx_queue
+  }
+  class if_txrx {
+    +ift_txd_encap()
+    +ift_txd_flush()
+    +ift_txd_credits_update()
+    +ift_rxd_available()
+    +ift_rxd_pkt_get()
+    +ift_rxd_refill()
+    +ift_rxd_flush()
+    +ift_legacy_intr()
+  }
+  class iflib_ctx {
+    +ifc_softc softc
+    +ifc_dev device
+    +ifc_ifp ifnet
+    +ifc_sctx if_shared_ctx
+  }
+  class if_shared_ctx {
+    +isc_driver if_txrx
+    +isc_tx_maxsize uint32
+    +isc_rx_maxsize uint32
+    +isc_rx_nsegments uint32
+  }
+  class iflib_txq {
+    +ift_in_use int
+    +ift_cidx qidx
+    +ift_pidx qidx
+    +ift_gen uint16
+    +ift_npending qidx
+    +ift_db_pending int
+  }
+  class iflib_rxq {
+    +ifr_ctx iflib_ctx
+    +ifr_fl iflib_fl
+    +ifr_cq_cidx qidx
+    +ifr_id uint16
+  }
+  class iflib_fl {
+    +ifl_cidx qidx
+    +ifl_pidx qidx
+    +ifl_credits qidx
+    +ifl_gen uint16
+    +ifl_rxd_size uint16
+  }
+  class adapter {
+    +dev device
+    +sge sge
+  }
+  class sge {
+    +qs sge_qset
+    +reg_lock sx
+  }
+  class sge_qset {
+    +txq sge_txq
+    +fl sge_fl
+    +rspq sge_rspq
+    +lro lro_state
+  }
+  class sge_txq {
+    +in_use int
+    +cidx int
+    +pidx int
+    +gen uint16
+    +unacked int
+  }
+  class sge_iq {
+    +flags uint32
+    +qtype int
+    +state int
+    +adapter adapter
+  }
+  class sge_ofld_rxq {
+    +rx_iscsi_ddp_pdus uint64
+    +rx_iscsi_ddp_octets uint64
+  }
+  vr_softc --> vr_ring_data
+  vr_ring_data --> vr_txdesc
+  vr_ring_data --> vr_rxdesc
+  e1000_softc --> iflib_ctx
+  e1000_softc --> if_shared_ctx
+  if_shared_ctx --> if_txrx
+  iflib_ctx --> if_shared_ctx
+  iflib_txq --> iflib_fl
+  iflib_rxq --> iflib_fl
+  adapter --> sge
+  sge --> sge_qset
+  sge_qset --> sge_txq
+  sge_qset --> sge_iq
+  sge_qset --> sge_ofld_rxq
 ```
 
+Reading the diagram left to right is the chapter's argument in picture form. The left cluster (`vr_softc` → `vr_ring_data` → `vr_txdesc`/`vr_rxdesc`) is a self-contained ring: the [softc](../kern/README_driver.md#glossary) points at its own ring data, which points at its own descriptors, and each descriptor carries its own `bus_dmamap`. There is nothing in the middle. The middle cluster is the iflib seam: `e1000_softc` points at an `iflib_ctx` and an `if_shared_ctx`, and the shared context points back at the driver's `if_txrx` vtable. The `iflib_txq`/`iflib_rxq`/`iflib_fl` trio is the queue machinery iflib owns. The right cluster (`adapter` → `sge` → `sge_qset` → `sge_txq`/`sge_iq`/`sge_ofld_rxq`) is a fan-out: one queue set branches into a transmit queue, a free list, a completion queue, and separate role-specific queues, which is the shape iflib does not model.
 ## Advanced Notes
 
-### Debugging with DTrace
+**Performance.** The single most important cost in a NIC driver is the doorbell. `struct iflib_txq` carries an `ift_db_pending` bit precisely so iflib can batch many `txd_encap` calls and ring the doorbell once (`ift_txd_flush`) instead of once per packet. The same idea appears in `if_vr`, where the driver must remember it has queued a descriptor and only write `VR_CR0` when it has something to send. On the receive side, iflib deliberately moves the ring drain out of interrupt context and onto a taskqueue (`_task_fn_rx`), so the interrupt handler returns quickly and the expensive `mbuf` assembly and `ether_input()` happen at [thread](../kern/README_process.md#glossary) priority. The `ift_defer_mfree` bit on `struct iflib_txq` lets iflib defer freeing a completed transmit mbuf, which matters when the reclaim path is running on a different CPU than the one that allocated it. Finally, the `iflib_fl` free list with its per-domain buffer accounting is how iflib keeps receive buffers in the [NUMA domain](../vm/README.md#glossary) of the CPU that will process them, avoiding cross-socket fetches at line rate.
 
-FreeBSD's DTrace provides powerful tools for NIC driver debugging:
+**Debugging.** The first stop for any of these drivers is the per-interface counters: `netstat -I em0` (or `ifconfig em0 statistics`) shows the `if_data` and, for `if_em`, the `e1000_hw_stats` tallies (crcerrs, algnerrc, rxerrc, and the collision counters). For ring state, `if_em` ships `em_dump_rs()` in `em_txrx.c`, which walks `sc->tx_queues` and prints the `tx_rs_cidx`/`tx_rs_pidx` and per-descriptor status — a [DDB](../kern/README_kdb.md#glossary)-friendly way to see whether the ring is stuck. For tracing the hot paths without recompiling, the DTrace `pid` provider works on the function names directly, e.g. `pid$pid::em_isc_rxd_pkt_get:return` or `pid$pid::vr_start:return`, and the stock `net:ifnet` [probe](../kern/README_driver.md#glossary) family around `if_transmit`/`if_input` brackets the whole path regardless of which driver is in use. `if_cxgbe` additionally has a [`ktr(4)`](../../share/man/man4/ktr.4) channel — `adapter.h` defines `KTR_CXGBE` (mapped to `KTR_SPARE3`) — and a `M_CXGBE` malloc tag, both of which are useful for following its completion and queue allocation paths.
 
-**Packet counting.** The `dtrace` probes in `sys/net/if.c` fire on every packet:
-```
-dtrace -n 'netbsd:net:if:input { printf("ifp=%s count=%d", copyinstr(arg0), arg1); }'
-```
+**Pitfalls.** Three classes of bug recur in this code. First, the 16-bit index: `qidx_t` is a `uint16_t` and `QIDX_INVALID` is `0xFFFF`, so every ring in iflib is capped at 65535 descriptors and every index comparison must use the generation counter (`ift_gen`/`ifl_gen`) rather than a plain `<` — a driver that compares indices without the generation check will misbehave exactly once per wrap. Second, DMA map leaks: in `if_vr` the transmit path calls `bus_dmamap_load()` per segment and the interrupt path must `bus_dmamap_unload()` the same map; if a descriptor is reclaimed without its map being unmapped, the tag's segment count grows until the next `bus_dmamap_load()` fails. iflib centralizes this in `_iflib_dmamap_cb()` so the driver cannot forget it. Third, lock ordering: the transmit path runs with the `ifnet` lock held in some configurations and without it in others, and the receive taskqueue path runs unlocked; a callback that reaches into driver state protected by a different lock can deadlock or trip `witness`. The `em_isc_txd_credits_update()` return value is the driver's contract to iflib about how many more packets it will accept, so a driver that lies there either starves the link or overflows the ring.
 
-**Interrupt timing.** The `iflib` driver exports SDT probes for interrupt handling:
-```
-dtrace -n 'sdt:iflib:intr:* { @latency[probefunc] = quantize(arg0); }'
-```
-
-**DMA mapping errors.** Bus DMA failures can be traced with:
-```
-dtrace -n 'syscall::bus_dmamap_load:entry { printf("dev=%s", copyinstr(arg1)); }'
-```
-
-### Performance Implications
-
-**iflib's overhead.** iflib adds a layer of indirection between the driver and hardware. For high-throughput workloads, this overhead can be measurable:
-- Function pointer calls for `txd_encap` and `rxd_pkt_get`
-- Additional index management (cidx, pidx, gen)
-- Lock contention on shared structures
-
-However, iflib's NUMA-aware buffer allocation and multi-queue dispatch typically more than compensate for this overhead on modern hardware.
-
-**if_vr's limitations.** The VIA Rhine driver's single-queue design and lack of hardware offloads make it unsuitable for modern workloads. The needalign quirk forces memory copies for every TX packet, further degrading performance.
-
-**if_cxgbe's complexity cost.** The Chelsio driver's ULD architecture and firmware interaction add latency to connection setup. However, once connections are established, the hardware handles packets entirely in silicon, achieving line rate at 100 Gbps.
-
-### Race Conditions and Pitfalls
-
-**TX ring full.** Both if_vr and iflib must handle the case where the TX ring is full and the ifnet queue must be stopped. The race is between:
-1. `if_start` filling the ring and calling `if_qstop`
-2. The interrupt handler processing completions and calling `if_qstart`
-
-iflib handles this with the `ifc_ifp->if_flags & IFF_OACTIVE` check and the `ift_npending` counter.
-
-**RX buffer exhaustion.** If the driver cannot allocate mbufs fast enough, the RX ring fills up and packets are dropped. iflib mitigates this with pre-allocated buffer pools and NUMA-local allocation.
-
-**Interrupt coalescing.** Both if_vr and iflib must balance interrupt frequency against CPU usage. Too many interrupts waste cycles; too few increase latency. iflib exposes tunables for interrupt coalescing parameters.
-
-### Connection to OS Theory
-
-NIC drivers illustrate several operating system concepts:
-
-**Buffer management.** The RX free list (`iflib_fl`) is a classic resource pool pattern. Mbufs are allocated in advance and recycled, avoiding allocation latency during packet processing. This is analogous to the kernel's mbuf pool but specialized for DMA-able memory.
-
-**Producer-consumer rings.** The TX and RX descriptor rings are producer-consumer queues with circular buffers. The producer (driver or hardware) writes descriptors; the consumer reads them. The gap between producer and consumer indices determines how many descriptors are in flight.
-
-**Interrupt-driven I/O.** NIC drivers are the canonical example of interrupt-driven I/O. The hardware fires an interrupt when packets arrive; the driver processes them and arms the next interrupt. This pattern appears throughout systems programming.
-
-**Hardware offload.** if_cxgbe illustrates the concept of offloading — moving work from the CPU to specialized hardware. TOE moves TCP processing to the NIC; RDMA moves memory copies to the NIC; crypto offload moves encryption to the NIC. Each offload reduces CPU usage but increases driver complexity.
+**Connecting to OS theory.** This is the device-independent I/O layer that Tanenbaum and Bos describe in their OS textbook: the goal is to make every device "look more or less the same" so that a new device does not force a rewrite of the kernel's I/O core. `iflib` is exactly that layer for Ethernet — it is the "uniform interfacing for device drivers" made concrete, with the `if_txrx` vtable playing the role of the per-device operations table. The *Operating System Concepts* discussion of STREAMS makes the same point from the other direction: a modular, incremental framework lets many devices share one set of buffer and dispatch routines. `if_vr` shows what the world looked like before that framework, `if_em` shows the framework doing its job, and `if_cxgbe` shows its boundary — the point at which a device is so unlike the common case that the framework's fixed shape becomes a constraint rather than a help.
 
 ## See Also
 - [Device Driver Framework — newbus and devclass](../kern/README_driver.md)
@@ -661,13 +317,18 @@ NIC drivers illustrate several operating system concepts:
 
 
 
-- [`sys/dev/vr/`](vr) — VIA Rhine driver source
-- [`sys/dev/e1000/`](e1000) — Intel E1000 driver source
-- [`sys/net/iflib.c`](../net/iflib.c) — iflib framework implementation
-- [`sys/net/iflib.h`](../net/iflib.h) — iflib public interface
-- [`sys/dev/cxgbe/`](cxgbe) — Chelsio driver source
-- [`sys/dev/cxgbe/common/`](cxgbe/common) — Chelsio common code
+- [`sys/dev/vr/if_vr.c`](vr/if_vr.c) and [`sys/dev/vr/if_vrreg.h`](vr/if_vrreg.h) — the complete pre-iflib driver used as the baseline.
+- [`sys/dev/e1000/if_em.c`](e1000/if_em.c), [`sys/dev/e1000/em_txrx.c`](e1000/em_txrx.c), and [`sys/dev/e1000/e1000_hw.h`](e1000/e1000_hw.h) — the iflib consumer and its `em_isc_*` callbacks.
+- [`sys/net/iflib.c`](../net/iflib.c) and [`sys/net/iflib.h`](../net/iflib.h) — the framework itself; see the [`iflibdi(9)`](../../share/man/man9/iflibdi.9) man page for the `if_ctx_t` and queue contract.
+- [`sys/dev/cxgbe/t4_main.c`](cxgbe/t4_main.c), [`sys/dev/cxgbe/adapter.h`](cxgbe/adapter.h), and [`sys/dev/cxgbe/t4_sge.c`](cxgbe/t4_sge.c) — the non-iflib, multi-role driver; `t4_sched.c` for the hardware scheduler and `t4_filter.c` for the TCAM filters.
+- [`bus_dma(9)`](../../share/man/man9/bus_dma.9) — the DMA tag and mapping API that all four subjects use.
+- `ifnet(4)` — the interface structure and the `if_transmit`/`if_input` entry points.
+- `ether_input(9)` — the receive-side entry into the protocol stack.
+- [`miibus(4)`](../../share/man/man4/miibus.4) — the MII PHY abstraction used by `if_vr`.
+- [`mbuf(9)`](../../share/man/man9/mbuf.9) — the packet buffer that every path ultimately produces or consumes.
+- [`taskqueue(9)`](../../share/man/man9/taskqueue.9) — the mechanism iflib uses to move the ring drain out of interrupt context.
+- [`ktr(4)`](../../share/man/man4/ktr.4) and `witness` — the tracing and lock-ordering tools referenced in the Advanced Notes.
 
 ---
 
-> _Generated by [DaemonDocs](https://github.com/ocochard/DaemonDocs) on 2026-05-03 13:02 UTC using model `Qwen3.6-35B-A3B-UD-Q8_K_XL` (llama.cpp build `b8985-27aef3dd9`). AI-generated content — verify against source before relying on it._
+> _Generated by [DaemonDocs](https://github.com/ocochard/DaemonDocs) on 2026-09-02 08:25 UTC using model `Qwen3.8-27B-Q8_0` (llama.cpp build `b10553-cd26896c1`). AI-generated content — verify against source before relying on it._

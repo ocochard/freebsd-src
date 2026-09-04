@@ -5,400 +5,541 @@
 **Navigation:**
   **Up:** [Kernel Core — Structure and Entry Point](../../README.md) ▸ [Source Tree — Layout and Conventions](../../../README_internals.md)
   **Related:** [Virtual Memory Subsystem — vm_page, UMA, and Pagers](../../vm/README.md) | [GEOM — Storage Framework](../../geom/README.md) | [VFS — Virtual File System Layer](../../fs/README.md)
-  **All chapters:** [Source Tree — Layout and Conventions](../../../README_internals.md) | [Boot Process — UEFI Bootloader to Kernel Handoff](../../../stand/efi/loader/README.md) | [Kernel Core — Structure and Entry Point](../../README.md) | [Build System — buildworld and buildkernel](../../../share/mk/README.md) | [Virtual Memory Subsystem — vm_page, UMA, and Pagers](../../vm/README.md) | [Process Management — Scheduling and Lifecycle](../../kern/README_process.md) | [Locking Primitives — Mutexes, sx, rmlocks, and Atomics](../../kern/README_locking.md) | [Buffer Cache — Block I/O Subsystem](../../vm/README_bcache.md) ...
+  **All chapters:** [Source Tree — Layout and Conventions](../../../README_internals.md) | [Boot Process — UEFI Bootloader to Kernel Handoff](../../../stand/efi/loader/README.md) | [Kernel Core — Structure and Entry Point](../../README.md) | [Build System — buildworld and buildkernel](../../../share/mk/README.md) | [System Calls and Image Activation — Entry, sysent, and exec](../../kern/README_syscall.md) | [Kernel Modules and the Linker — KLD, SYSINIT, and linker sets](../../kern/README_kld.md) | [Virtual Memory Subsystem — vm_page, UMA, and Pagers](../../vm/README.md) | [Process Management — Scheduling and Lifecycle](../../kern/README_process.md) ...
 ---
-
-
-> ⚠ **UNVERIFIED DRAFT** — reviewer did not explicitly approve this draft. Treat claims as suspect until manually reviewed.
 
 
 ## Quick Summary
 
-ZFS (Zettabyte File System), shipped in FreeBSD as OpenZFS, is a combined file system and volume manager that fundamentally rethinks how storage is organized. Rather than treating disk devices as fixed-size containers requiring manual partitioning, ZFS introduces the concept of a *storage pool* — an abstract aggregate of one or more physical devices (called vdevs) that provides a contiguous namespace. On top of this pool, ZFS implements a copy-on-write (COW) file system where every write allocates new blocks and updates metadata atomically through transaction groups, eliminating the need for traditional file system journaling while providing snapshot and clone capabilities at the core.
+ZFS is a filesystem and volume manager combined into a single layer. Unlike a
+traditional stack where a block device (or RAID controller) sits under a
+filesystem, ZFS owns the raw disks itself: it groups them into *pools*,
+manages redundancy, allocates space, and then presents POSIX files on top. In
+FreeBSD this arrives as the OpenZFS tree under
+`sys/contrib/openzfs/`, built as kernel modules. The design goal, stated in the
+project's own history, is to solve the problems of older storage software —
+data corruption from silent bit rot, the inability to safely grow volumes, and
+the fragility of separate volume-management and filesystem layers.
 
-The architecture is deeply layered. At the top sits the ZFS POSIX Layer (ZPL), which bridges VFS operations into the DMU (Data Management Unit) — a transactional object layer that views all data as typed objects with variable-sized blocks. Below the DMU lies the DSL (Dataset/Snapshot Layer), which manages dataset creation, snapshots, and send/receive operations. The ZIL (Intent Log) provides synchronous write durability by recording transaction records to a dedicated log before they are committed to the pool. The ZIO (I/O Pipeline) decomposes high-level operations into parallel I/O requests, while the ARC (Adaptive Replacement Cache) serves as ZFS's own buffer cache, bypassing the FreeBSD buffer cache entirely by caching data in its own LRU-based structure.
+The code is organized as a set of named layers, each of which is a directory of
+`.c` files in `sys/contrib/openzfs/module/zfs/`. From the top: the **ZPL**
+(POSIX layer, `zfs_vnops.c`) translates vnode operations into **DMU** calls.
+The **DMU** (Data Management Unit, `dmu.c`, `dmu_objset.c`) is a transactional
+object store that hands out fixed-size blocks. Below it the **[ARC](#glossary)**
+(Adaptive Replacement Cache, `arc.c`) caches those blocks in memory, and the
+**ZIO** (ZFS Input/Output) pipeline (`zio.c`) moves data between the ARC and
+the **[vdev](#glossary)** layer (`vdev.c`), which implements RAID (Redundant Array of
+Independent Disks) variants such as RAID-Z, as well as mirroring and striping.
+The **SPA** (`spa.c`) ties it together: it allocates space, owns the
+uberblock, and drives the periodic *transaction group* (`txg`) sync that makes
+all pending writes durable at once.
 
-ZFS's design choices reflect a deliberate departure from traditional Unix file systems. By caching exclusively in the ARC rather than the FreeBSD buffer cache, ZFS gains full control over block replacement policies and can implement features like deduplication, compression, and encryption without fighting the kernel's page cache. Transaction groups batch writes into atomic units that sync periodically, and the copy-on-write semantics mean that every update — including metadata — is written to new blocks, with the old blocks freed only after the transaction commits. This approach simplifies crash recovery (the pool is always in a consistent state) but requires careful management of space reclamation.
+Two ideas make ZFS different from a classical filesystem, and both are visible
+in the source. First, **copy-on-write**: nothing is ever modified in place. A
+write allocates a new block, writes the data there, and only then — atomically,
+at the end of a transaction group — points the metadata at the new block. The
+old block becomes garbage. This is what makes snapshots, cloning, and
+self-healing possible, and it is why the allocator (SPA) and the transaction
+mechanism (DMU + [txg](#glossary)) are inseparable. Second, **the ARC instead of the buffer
+cache**: ZFS does not use FreeBSD's [`buf(9)`](../../../share/man/man9/buf.9) [buffer cache](../../vm/README_bcache.md#glossary) for its data. It
+keeps its own cache, the ARC, because a copy-on-write filesystem needs to
+cache by *block pointer* (which includes a checksum and a birth transaction),
+not by the (device, block-number) pair that the buffer cache is keyed on.
+
+This chapter walks those layers from a [`read(2)`](../../../lib/libsys/read.2) down to the disk, explains how
+a transaction group batches and commits writes, why the ARC bypasses the buffer
+cache, and when the [ZIL](#glossary) (ZFS Intent Log, `zil.c`) actually touches the disk.
+
+## Glossary
+
+**vdev** — a "virtual device": the unit of storage virtualization. A vdev can
+be a single disk, a mirror of several disks, a RAID-Z group, or a nested
+combination; the SPA is a tree of vdevs.
+
+**DVA** — Data Virtual Address. A `dva_t` is a (vdev, offset, size) triple that
+locates one physical copy of a block; a block can have up to three DVAs for
+replication.
+
+**DSL** — Data Structure Layer; the on-disk and in-memory layer that manages
+the pool's metadata objects, free-space maps, and the scan that reclaims freed
+blocks.
+
+**blkptr** — a `blkptr_t` is the on-disk pointer to a block: its DVAs, size,
+checksum, compression, and the transaction group in which it was born.
+
+**objset** — the in-memory and on-disk container of one dataset's objects; it
+is the DMU's unit of address space and the anchor for a dataset's ZIL.
+
+**dnode** — the per-object metadata (a 512-byte to 16-KB structure) holding an
+object's block pointers, its size, and a "bonus" area for filesystem
+attributes.
+
+**txg** — transaction group. A numbered, time- or space-bounded batch of
+changes; all writes in a txg become durable together when it syncs.
+
+**ARC** — Adaptive Replacement Cache. ZFS's in-memory block cache, keyed by
+DVA, that replaces the buffer cache for ZFS data.
+
+**ZIL** — ZFS Intent Log. A per-dataset, write-ahead log of transaction
+records, written to disk only for synchronous operations so they survive a
+crash.
+
+**slog** — a dedicated, fast "log device" (a vdev) from which ZIL blocks are
+preferentially allocated; without one, ZIL blocks come from a reserved
+metaslab in the data vdevs.
+
+**itx** — an "intent transaction": the in-memory record of one change, the
+thing the ZIL serializes and the DMU transaction applies.
 
 ## Architecture
 
-The ZFS architecture in FreeBSD follows a strict layering model, each with well-defined responsibilities and interfaces.
+The on-disk and in-memory structure is a strict stack. The top of the stack is
+the **ZPL**, the POSIX layer. On FreeBSD it is wired into the VFS through the
+vnode operations in `sys/contrib/openzfs/module/zfs/zfs_vnops.c`; the
+FreeBSD-specific glue (how a `znode` maps onto a `vnode`, and how pages are
+shuttled to and from the VM) lives in
+`sys/contrib/openzfs/include/os/freebsd/zfs/sys/zfs_znode_impl.h` and
+`.../zfs_vnops_os.h`. The ZPL turns a [`read(2)`](../../../lib/libsys/read.2)/[`write(2)`](../../../lib/libsys/write.2) into DMU calls on a
+specific *object* and *offset*.
 
-### VDEV Layer — Storage Virtualization
+The **DMU** is the object layer. `sys/contrib/openzfs/module/zfs/dmu.c`
+implements `dmu_read`/`dmu_write`; `dmu_objset.c` implements the [objset](#glossary);
+`dmu_tx.c` implements the transaction object (`dmu_tx_t`) that every mutation
+flows through. The DMU never touches a disk; it reads and writes *blocks*
+through the ARC, and it records every change as a `dmu_tx_hold_t` that is
+applied when the transaction commits. The DMU sits on top of the **ARC**,
+`arc.c`, which is the cache: `arc_read()`/`arc_write()` are the two entry
+points the DMU uses. The ARC in turn issues **ZIO**s (`zio.c`) to move blocks
+to and from the **vdev** layer (`vdev.c`). The **SPA** (`spa.c`) is the
+allocator and the sync engine: it owns the uberblock, allocates space from the
+vdev space maps, and runs `spa_sync()` which is what actually flushes a
+transaction group to stable storage.
 
-The vdev layer (`sys/contrib/openzfs/module/zfs/vdev.c`, `sys/contrib/openzfs/module/os/freebsd/zfs/vdev_geom.c`) abstracts physical storage devices into virtual devices. FreeBSD integrates with ZFS through GEOM, the kernel's storage framework. The `vdev_geom.c` file implements the GEOM provider for ZFS vdevs, translating ZFS I/O requests into GEOM bio operations. Vdevs can be organized into top-level vdevs (TLVs), which can be mirrors, RAID-Z configurations, or single disks. Each vdev contains metaslabs — logical partitions that manage space allocation independently, enabling parallel allocation across devices.
+The reason for this particular split is to separate *what* changes (the DMU,
+which knows about objects, attributes, and POSIX semantics) from *where* data
+lives (the SPA/vdev, which knows about disks, parity, and space). The ZIO
+pipeline is the seam between them: a `zio_t` carries a `blkptr_t`, a data
+pointer, and a callback, and it is the object that gets compressed,
+checksummed, encrypted, and finally written — or read back, checksummed, and
+handed to the ARC.
 
-```c
-// From sys/contrib/openzfs/include/sys/vdev.h
-typedef struct vdev {
-    uint64_t vdev_id;
-    uint64_t vdev_guid;
-    struct vdev *vdev_parent;
-    struct vdev **vdev_children;
-    uint_t vdev_nchildren;
-    struct metaslab *vdev_ms;
-    // ... many more fields
-} vdev_t;
-```
-
-The vdev hierarchy forms a tree rooted at the pool's top-level vdevs. Each leaf vdev (a physical disk or partition) exposes a byte-addressable storage space, while intermediate vdevs (mirrors, RAID-Z) distribute I/O across their children according to their redundancy strategy.
-
-### SPA — Storage Pool Allocator
-
-The SPA layer (`sys/contrib/openzfs/module/zfs/spa.c`) manages the pool's global state, including space allocation, configuration persistence, and the uberblock — a single on-disk structure that records the pool's checkpoint state. The `struct spa` structure (defined in `sys/contrib/openzfs/include/sys/spa_impl.h`) is the central data structure for a pool, containing references to all vdevs, metaslabs, and the DMU state.
-
-The SPA handles pool creation, import, export, and destruction. It reads the pool configuration from disk (stored as a packed nvlist in the vdev labels) and reconstructs the in-memory representation. The uberblock, written at the beginning of each vdev, allows the pool to survive partial failures — if one vdev is damaged, the uberblock can be recovered from another.
-
-### DMU — Data Management Unit
-
-The DMU (`sys/contrib/openzfs/module/zfs/dmu.c`) is ZFS's object layer. All data — user files, directories, metadata — is stored as typed objects within the DMU. Each object has a type (defined by `dmu_object_type_t` in `sys/contrib/openzfs/include/sys/dmu.h`), a block size, and a number of blocks. The DMU provides transactional semantics: writes are associated with a transaction (`dmu_tx_t`), and all changes in a transaction are either committed together or rolled back.
-
-```c
-// From sys/contrib/openzfs/include/sys/dmu_tx.h
-typedef struct dmu_tx {
-    list_t tx_holds;
-    objset_t *tx_objset;
-    struct dsl_dir *tx_dir;
-    struct dsl_pool *tx_pool;
-    uint64_t tx_txg;
-    // ... transaction state
-} dmu_tx_t;
-```
-
-The DMU operates on objects identified by object numbers within an objset. An objset (`sys/contrib/openzfs/include/sys/dmu_objset.h`) represents a dataset (filesystem or volume) and contains a collection of objects. The DMU's block pointer structure (`blkptr_t`) encodes the location of each block on disk using DVA (Data Virtual Address) tuples, supporting mirroring and RAID-Z through multiple DVAs per block.
-
-### DSL — Dataset/Snapshot Layer
-
-The DSL (`sys/contrib/openzfs/module/zfs/dsl/`) manages datasets, snapshots, and clones. It sits above the DMU and provides the namespace hierarchy. Each dataset has a unique object number and is represented by a `struct dsl_dir` structure. Snapshots are implemented by freezing an objset's state at a transaction group boundary — the snapshot's root block pointer is recorded, and all subsequent writes go to new blocks while the snapshot's blocks remain unchanged.
-
-The DSL also handles ZFS send/receive operations, which stream dataset changes between pools. The `dmu_send.c` and `dmu_recv.c` files implement the protocol for sending incremental or full dataset streams, with support for compression, deduplication, and encryption.
-
-### ZIL — Intent Log
-
-The ZIL (`sys/contrib/openzfs/module/zfs/zil.c`) provides synchronous write durability. When an application issues a synchronous write (via `fsync()`, `O_SYNC`, or `O_DSYNC`), the ZIL records a transaction record (itx) that contains enough information to replay the operation after a crash. These records are written to the on-disk ZIL before the data blocks are committed to the pool.
-
-```c
-// From sys/contrib/openzfs/include/sys/zil.h
-typedef struct zilog {
-    spa_t *zl_spa;
-    objset_t *zl_os;
-    uint64_t zl_logobj;
-    uint64_t zl_replay_seq;
-    // ... ZIL state
-} zilog_t;
-```
-
-The ZIL can be backed by dedicated log vdevs (slogs), embedded slog metaslabs within normal vdevs, or the pool's normal space. Dedicated log vdevs provide the best performance for synchronous workloads by isolating log writes from data I/O.
-
-### ZIO — I/O Pipeline
-
-The ZIO layer (`sys/contrib/openzfs/module/zfs/zio.c`) is the I/O abstraction that decomposes high-level operations into parallel I/O requests. A `struct zio` structure represents an I/O operation and contains a tree of child zios that are executed in parallel where possible. The ZIO pipeline includes stages for checksumming, compression, encryption, and RAID-Z computation.
-
-```c
-// From sys/contrib/openzfs/include/sys/zio.h
-typedef struct zio {
-    spa_t *io_spa;
-    const blkptr_t *io_bp;
-    abd_t *io_abd;
-    uint64_t io_size;
-    uint64_t io_offset;
-    vdev_t *io_vd;
-    void *io_vsd;
-    int io_error;
-    // ... I/O state and callbacks
-} zio_t;
-```
-
-The ZIO pipeline is event-driven: each stage registers a completion callback that is invoked when the stage finishes. This allows the pipeline to process multiple I/Os concurrently while maintaining the correct ordering of operations.
-
-### ARC — Adaptive Replacement Cache
-
-The ARC (`sys/contrib/openzfs/module/zfs/arc.c`) is ZFS's own buffer cache, implemented entirely in kernel space. Unlike the FreeBSD buffer cache, which caches file data in vm_pages, the ARC caches ZFS blocks in its own structures (`arc_buf_hdr_t` in `sys/contrib/openzfs/include/sys/arc_impl.h`). This design gives ZFS full control over replacement policies and enables features like block-level deduplication and compression without fighting the kernel's page cache.
-
-The ARC implements the MRU/MFU (Most Recently Used / Most Frequently Used) replacement algorithm from the Megiddo and Modha FAST 2003 paper. It maintains four lists: MRU ghost, MRU, MFU ghost, and MFU. When a block is accessed, it is added to the MRU list. If it is accessed again while in the MRU list, it moves to the MFU list. Eviction preferentially removes blocks from the ghost lists, which track recently evicted blocks to prevent thrashing.
-
-```c
-// From sys/contrib/openzfs/include/sys/arc.h
-struct arc_prune {
-    arc_prune_func_t *p_pfunc;
-    void *p_private;
-    uint64_t p_adjust;
-    list_node_t p_node;
-    zfs_refcount_t p_refcnt;
-};
-```
-
-The ARC size is dynamically adjusted based on system memory pressure. When the system experiences memory pressure, the ARC shrinks by evicting blocks from its lists. When memory is available, the ARC grows to cache more data. This self-tuning behavior eliminates the need for manual cache size configuration.
-
-### ZPL — ZFS POSIX Layer
-
-The ZPL (`sys/contrib/openzfs/module/os/freebsd/zfs/zfs_vnops_os.c`) bridges VFS operations into the DMU. It implements the FreeBSD VFS operations vector, translating `open()`, `read()`, `write()`, `ioctl()`, and other VFS calls into DMU operations. The ZPL also implements ZFS-specific features like ACLs (`zfs_acl.c`), extended attributes, and the `.zfs` control directory for snapshot access.
+The FreeBSD-specific bridge is worth calling out because it is where "ZFS
+bypasses the buffer cache" becomes concrete. FreeBSD's VFS normally moves data
+through `vm_page`s and the [`buf(9)`](../../../share/man/man9/buf.9) cache. OpenZFS on FreeBSD instead provides
+`dmu_read_pages()` and `dmu_write_pages()` (declared in
+`.../os/freebsd/zfs/sys/zfs_vnops_os.h`), which pull and push `vm_page`s
+directly into the ARC. The pages are mapped into the user's address space via
+the normal `vm_object` for a mounted file, but the *persistent* copy is owned
+by the ARC, not the buffer cache. The `zfs_znode_impl.h` header documents the
+range-locking contract (`RL_WRITER` for writes and truncation, `RL_READER` for
+reads) that makes this safe against concurrent [`write(2)`](../../../lib/libsys/write.2)s.
 
 ## Key Data Structures
 
-### `blkptr_t` — Block Pointer
-
-The `blkptr_t` type (defined in `sys/contrib/openzfs/include/sys/spa.h`) describes a single data block on disk. It encodes the block's location using DVA (Data Virtual Address) tuples, birth timestamp, checksum, and compression information. Each block can have up to 3 DVAs (for mirroring or RAID-Z). The `blk_prop` field encodes multiple bitfields: checksum algorithm, compression type, number of copies, and whether the block is embedded (data stored directly in the block pointer for small blocks).
-
-### `struct arc_buf_hdr` — ARC Header
-
-Defined in `sys/contrib/openzfs/include/sys/arc_impl.h`, the `arc_buf_hdr_t` is the ARC's primary data structure. It tracks a cached block's metadata, including its DVA, state, and reference counts.
+The transaction object is the heart of the DMU. It is defined in
+`sys/contrib/openzfs/include/sys/dmu_tx.h`:
 
 ```c
-// From sys/contrib/openzfs/include/sys/arc_impl.h
-struct arc_buf_hdr {
-    dva_t b_dva;                /* DVA of the cached block */
-    uint64_t b_birth;           /* Transaction group when block was created */
-    uint64_t b_type;            /* DMU object type */
-    uint8_t b_complevel;        /* Compression level */
-    arc_buf_hdr_t *b_hash_next; /* Hash chain link */
-    uint64_t b_flags;           /* ARC flags */
-    // ... state management fields
+struct dmu_tx {
+	list_t tx_holds; /* list of dmu_tx_hold_t */
+	objset_t *tx_objset;
+	struct dsl_dir *tx_dir;
+	struct dsl_pool *tx_pool;
+	uint64_t tx_txg;
+	uint64_t tx_lastsnap_txg;
+	uint64_t tx_lasttried_txg;
+	txg_handle_t tx_txgh;
+	void *tx_tempreserve_cookie;
+	struct dmu_tx_hold *tx_needassign_txh;
+
+	/* list of dmu_tx_callback_t on this dmu_tx */
+	list_t tx_callbacks;
+
+	/* placeholder for syncing context, doesn't need specific holds */
+	boolean_t tx_anyobj;
+
+	/* transaction is marked as being a "net free" of space */
+	boolean_t tx_netfree;
+
+	/* time this transaction was created */
+	hrtime_t tx_start;
+
+	/* need to wait for sufficient dirty space */
+	boolean_t tx_wait_dirty;
+
+	/* has this transaction already been delayed? */
+	boolean_t tx_dirty_delayed;
+
+	/* whether dmu_tx_wait() should return on suspend */
+	boolean_t tx_break_on_suspend;
+
+	int tx_err;
 };
 ```
 
-The ARC uses a hash table keyed by DVA to quickly locate cached blocks. Each header is also placed on one of the four ARC lists (MRU/MFU ghost/data) based on its access pattern.
-
-### `dbuf_dirty_record` — Dirty Record Tracking
-
-Defined in `sys/contrib/openzfs/include/sys/dbuf.h`, the `dbuf_dirty_record` structure tracks which data blocks have been modified but not yet synced. It sits within the DMU's buffer cache and provides block-level caching with dirty record tracking for copy-on-write updates.
+Each mutation a [thread](../../kern/README_process.md#glossary) makes is recorded as a *hold* on the transaction, also
+in `dmu_tx.h`. The hold remembers which [dnode](#glossary) it touched and how much space it
+will need, so that `dmu_tx_assign()` can decide which transaction group the
+change belongs to and reserve space before the change is made:
 
 ```c
-// From sys/contrib/openzfs/include/sys/dbuf.h
+typedef struct dmu_tx_hold {
+	dmu_tx_t *txh_tx;
+	list_node_t txh_node;
+	struct dnode *txh_dnode;
+	zfs_refcount_t txh_space_towrite;
+	zfs_refcount_t txh_memory_tohold;
+	enum dmu_tx_hold_type txh_type;
+	uint64_t txh_arg1;
+	uint64_t txh_arg2;
+} dmu_tx_hold_t;
+```
+
+The transaction groups themselves are tracked per-pool by a small ring of
+lists, in `sys/contrib/openzfs/include/sys/txg.h`. There are always three
+concurrent states (open, quiescing, syncing), so the ring is sized to the next
+power of two:
+
+```c
+#define	TXG_CONCURRENT_STATES	3	/* open, quiescing, syncing	*/
+#define	TXG_SIZE		4		/* next power of 2	*/
+#define	TXG_MASK		(TXG_SIZE - 1)	/* mask for size	*/
+
+typedef struct txg_node {
+	struct txg_node	*tn_next[TXG_SIZE];
+	uint8_t		tn_member[TXG_SIZE];
+} txg_node_t;
+
+typedef struct txg_list {
+	kmutex_t	tl_lock;
+	size_t		tl_offset;
+	spa_t		*tl_spa;
+	txg_node_t	*tl_head[TXG_SIZE];
+} txg_list_t;
+```
+
+Dirty blocks are linked into these lists through a *dirty record*, defined in
+`sys/contrib/openzfs/include/sys/dbuf.h`. A dirty record is the unit the sync
+walks: it knows which transaction group it belongs to and which `zio_t` is
+writing it:
+
+```c
 typedef struct dbuf_dirty_record {
-    list_node_t dr_dirty_node;      /* Link on parent's dirty list */
-    uint64_t dr_txg;                /* Transaction group for sync */
-    zio_t *dr_zio;                  /* Outstanding write I/O */
-    struct dmu_buf_impl *dr_dbuf;   /* Back pointer to dbuf */
-    dnode_t *dr_dnode;              /* Associated dnode */
-    blkptr_t dr_bp_copy;            /* Copy of the block pointer */
-    // ... dirty record state
+	/* link on our parents dirty list */
+	list_node_t dr_dirty_node;
+
+	/* transaction group this data will sync in */
+	uint64_t dr_txg;
+
+	/* zio of outstanding write IO */
+	zio_t *dr_zio;
+
+	/* pointer back to our dbuf */
+	struct dmu_buf_impl *dr_dbuf;
+
+	/* list link for dbuf dirty records */
+	list_node_t dr_dbuf_node;
+
+	dnode_t *dr_dnode;
+
+	/* pointer to parent dirty record */
+	struct dbuf_dirty_record *dr_parent;
+
+	/* How much space was changed to dsl_pool_dirty_space() for this? */
+	unsigned int dr_accounted;
+
+	/* A copy of the bp that points to us */
+	blkptr_t dr_bp_copy;
+	...
 } dbuf_dirty_record_t;
 ```
 
-Dirty records track which blocks have been modified but not yet synced. When a transaction group syncs, the DMU walks the dirty records and issues ZIO writes for each modified block.
-
-### `struct zio` — I/O Operation
-
-Defined in `sys/contrib/openzfs/include/sys/zio.h`, the `struct zio` structure represents a single I/O operation in the ZIO pipeline. ZIOs form a tree structure, with parent zios spawning child zios for parallel execution.
+The ZIL's on-disk header is the smallest of the important structures and is
+defined in `sys/contrib/openzfs/include/sys/zil.h`. It points at the head of a
+chain of log blocks:
 
 ```c
-// From sys/contrib/openzfs/include/sys/zio.h
-typedef struct zio {
-    spa_t *io_spa;                /* Associated pool */
-    const blkptr_t *io_bp;        /* Block pointer (for writes) */
-    abd_t *io_abd;                /* Data buffer */
-    uint64_t io_size;             /* I/O size */
-    uint64_t io_offset;           /* Offset within the block */
-    vdev_t *io_vd;                /* Target vdev */
-    void *io_vsd;                 /* Vdev-specific data */
-    int io_error;                 /* I/O error code */
-    // ... I/O state, callbacks, and child zios
-} zio_t;
+typedef struct zil_header {
+	uint64_t zh_claim_txg;	/* txg in which log blocks were claimed */
+	uint64_t zh_replay_seq;	/* highest replayed sequence number */
+	blkptr_t zh_log;	/* log chain */
+	uint64_t zh_claim_blk_seq; /* highest claimed block sequence number */
+	uint64_t zh_flags;	/* header flags */
+	uint64_t zh_claim_lr_seq; /* highest claimed lr sequence number */
+	uint64_t zh_pad[3];
+} zil_header_t;
 ```
 
-The ZIO pipeline processes I/Os through multiple stages: checksum computation, compression, encryption, RAID-Z parity calculation, and finally submission to the vdev layer. Each stage can be executed in parallel for different child zios.
+Finally, the ZIO carries its per-block properties in a packed `zio_prop_t`
+(`sys/contrib/openzfs/include/sys/zio.h`). Its fields — `zp_complevel`,
+`zp_level`, `zp_copies`, `zp_gang_copies`, and a set of bit flags
+(`zp_type`, `zp_storage_type`, `zp_dedup`, `zp_dedup_verify`, `zp_nopwrite`,
+`zp_brtwrite`) — are what tell the pipeline how to treat a block: its level in
+the B-tree, its checksum and compression, and whether it is a candidate for
+dedup or the birth-time reftree.
 
 ## Deep Dive
 
-### Transaction Groups and Copy-on-Write
-
-ZFS's transaction group (txg) mechanism is the foundation of its copy-on-write semantics. All writes are associated with a transaction group, which is a monotonically increasing counter that batches changes together. When a transaction group syncs, all modifications are written atomically to disk.
-
-```c
-// From sys/contrib/openzfs/module/zfs/dmu.c
-// dmu_write() associates data with a transaction group
-dmu_write(dmu_obj_t *os, uint64_t object, uint64_t offset, uint64_t size,
-          const void *buf, dmu_tx_t *tx)
-{
-    // 1. Allocate space in the transaction group
-    // 2. Copy data into the ARC (creating dirty records)
-    // 3. The dirty records will be written when the txg syncs
-}
-```
-
-The txg sync process (`spa_sync()` in `sys/contrib/openzfs/module/zfs/spa.c`) performs multiple passes:
-
-1. **Pass 1**: Sync dirty metaslabs and log blocks
-2. **Pass 2**: Sync dirty objsets and datasets
-3. **Pass 3**: Sync free space accounting
-4. **Pass 4+**: Sync deferred frees (blocks that were freed in previous txgs but whose space hasn't been reclaimed yet)
-
-The deferred free mechanism is crucial for copy-on-write file systems. When a block is overwritten, the old block is not immediately freed — it is added to a free list and reclaimed in a later transaction group. This ensures that snapshots referencing the old block remain valid.
-
-### The ARC vs FreeBSD Buffer Cache
-
-ZFS deliberately bypasses the FreeBSD buffer cache by implementing its own cache (the ARC). This design choice has several implications:
-
-1. **No double-caching**: Data is not cached in both the ARC and FreeBSD's vm_page cache. The ARC manages its own memory allocations and does not use vm_pages for data storage.
-
-2. **Full control over replacement**: The ARC implements the MRU/MFU algorithm independently, without being affected by the kernel's page daemon. This allows ZFS to optimize for block-level access patterns rather than page-level patterns.
-
-3. **Direct I/O integration**: ZFS's direct I/O path (`dmu_direct.c`) bypasses the ARC entirely, reading/writing directly to/from user buffers. This is important for applications that manage their own caching.
+**A synchronous write, end to end.** Start in the ZPL. `zfs_fsync()` in
+`sys/contrib/openzfs/module/zfs/zfs_vnops.c` is the simplest synchronous
+entry point:
 
 ```c
-// From sys/contrib/openzfs/module/zfs/arc.c
-// ARC eviction is triggered by memory pressure or explicit cache management
-arc_evict_state(arc_state_t *state, uint64_t space_needed, uint64_t *evicted)
+int
+zfs_fsync(znode_t *zp, int syncflag, cred_t *cr)
 {
-    // Evict evictable blocks from the state's list
-    // Blocks are only evictable when b_refcnt == 0
-    // The ghost lists track recently evicted blocks to prevent thrashing
-}
+	int error = 0;
+	zfsvfs_t *zfsvfs = ZTOZSB(zp);
+
+	if (zfsvfs->z_os->os_sync != ZFS_SYNC_DISABLED) {
+		if ((error = zfs_enter_verify_zp(zfsvfs, zp, FTAG)) != 0)
+			return (error);
+		error = zil_commit(zfsvfs->z
 ```
 
-### ZIL and Synchronous Writes
-
-The ZIL provides durability for synchronous writes by recording transaction records before the data blocks are committed. The flow for a synchronous write is:
-
-1. Application calls `write()` with `O_SYNC` or `fsync()`
-2. ZIL records a transaction record (itx) containing the write operation
-3. The itx is written to the on-disk ZIL (either on a dedicated log vdev or embedded slog)
-4. Once the ZIL write completes, the application's write is considered complete
-5. The data blocks are written to the pool in the next txg sync
+A data write follows the same shape minus the ZIL commit. The ZPL calls into
+the DMU, which first creates a transaction with `dmu_tx_create()` (in
+`dmu_tx.c`) and then records the change with a hold. `dmu_tx_hold_dnode_impl()`
+in `dmu_tx.c` is representative of how a hold pins a dnode to the transaction:
 
 ```c
-// From sys/contrib/openzfs/module/zfs/zil.c
-// zil_commit() is called for synchronous writes
-zil_commit(zilog_t *zilog, uint64_t txg)
+static dmu_tx_hold_t *
+dmu_tx_hold_dnode_impl(dmu_tx_t *tx, dnode_t *dn, enum dmu_tx_hold_type type,
+    uint64_t arg1, uint64_t arg2)
 {
-    // 1. Record the transaction in the in-memory ZIL
-    // 2. If the ZIL block is full or timeout reached, write it to disk
-    // 3. Wait for the ZIL write to complete (for sync writes)
-}
+	dmu_tx_hold_t *txh;
+
+	if (dn != NULL) {
+		(void) zfs_refcount_add(&dn->dn_holds, tx);
+		if (tx->tx_txg != 0) {
+			mutex_enter(&dn->dn_mtx);
+			ASSERT0(dn->dn_assigned_txg);
+			dn->dn_assigned_txg = tx->tx_txg;
+			(void) zfs_refcount_add(&dn->dn_tx_holds, tx);
+			mutex_exit(&dn->dn_mtx);
+		}
+	}
+
+	txh = kmem_zalloc(sizeof (dmu_tx_hold_t), KM_SLEEP);
+	txh->txh_tx = tx;
+	txh->txh_dnode = dn;
+	...
 ```
 
-The ZIL can be backed by dedicated log vdevs (slogs), which provide the best performance by isolating log writes from data I/O. If no dedicated log is available, ZFS uses embedded slog metaslabs within normal vdevs. As a last resort, log blocks are allocated from the pool's normal space.
+The change is not visible to other threads and not on disk yet. The data block
+itself is marked dirty through `dbuf_dirty()` (in `dbuf.c`), which attaches a
+`dbuf_dirty_record_t` to the dnode's dirty list for the transaction group the
+write was assigned to. The new block's contents live in an *anonymous* ARC
+buffer — the `arc.c` header comment explains that anonymous buffers "hold dirty
+block copies before they are written to stable storage" and "will acquire a
+[DVA](#glossary) as they are written and migrate onto the arc_mru list."
 
-### ZIO Pipeline Parallelism
+**How a transaction group batches and commits.** `dmu_tx_assign()` (in
+`dmu_tx.c`) is the gate. It walks the holds, computes the total space the
+transaction needs, and picks a target transaction group. If the current open
+group is full or the change is large, the assignment is deferred to a later
+group (the `tx_wait_dirty` and `tx_dirty_delayed` flags in `dmu_tx_t` track
+this throttling). Once assigned, `dmu_tx_commit()` applies the holds: for a
+write, it updates the dnode's block pointer to point at the new block. Because
+ZFS is copy-on-write, the *old* block is not freed immediately; it is added to
+the pool's free list and reclaimed asynchronously by the [DSL](#glossary) (Data Structure
+Layer) scan.
 
-The ZIO pipeline decomposes high-level operations into parallel I/O requests. For example, a RAID-Z write is decomposed into multiple child zios — one for each data block and one for each parity block. These child zios are executed in parallel, maximizing I/O throughput.
+The commit is still only in memory. The actual flush happens when the
+transaction group *syncs*. The `txg.h` interface exposes `txg_sync_start()` and
+`txg_sync_stop()`, and `txg_wait_synced()` for a caller (like `fsync`) that
+must block until the group is durable. The sync itself is driven by the SPA:
+`spa_sync()` in `spa.c` walks the dirty records for the quiescing group, issues
+`zio_write()` for each, and only when all of them complete does it write a new
+uberblock that advances the pool's "most recent transaction group" number. That
+uberblock write is the atomic commit point: before it, the old [state](../../netpfil/pf/README.md#glossary) is what a
+reader sees; after it, the whole group is durable. This is the mechanism that
+turns a pile of independent writes into one atomic, crash-consistent step.
 
-```c
-// From sys/contrib/openzfs/module/zfs/zio.c
-// zio_wait() blocks until all child zios complete
-zio_wait(zio_t *zio)
-{
-    // Wait for all child zios to complete
-    // Propagate errors up the zio tree
-    // Invoke the completion callback
-}
-```
+**A read, and why it goes through the ARC.** A [`read(2)`](../../../lib/libsys/read.2) lands in the ZPL,
+which calls `dmu_read()`, which calls `dbuf_read()` (in `dbuf.c`), which calls
+`arc_read()` (in `arc.c`). `arc_read()` looks the block up in the ARC by its
+DVA. On a hit it hands the buffer to the callback and returns; on a miss it
+issues a `zio_read()` down the ZIO pipeline to the vdev. The block, once read,
+is inserted into the ARC and, on a second reference, promoted from the
+`mru` (most-recently-used) state to the `mfu` (most-frequently-used) state —
+the two-list mechanism described in the `arc.c` header comment, derived from
+Megiddo and Modha's FAST 2003 paper. The ARC keeps separate lists for
+metadata and for data so that a flood of cold data cannot evict the hot
+indirect blocks and dnodes the pool needs to function.
 
-The ZIO pipeline also handles error recovery. If a child zio fails, the parent zio can attempt recovery (e.g., reading from a mirror copy) before reporting the error to the DMU layer.
+**Why not the buffer cache.** FreeBSD's [`buf(9)`](../../../share/man/man9/buf.9) buffer cache is keyed by
+(device, block number) and is managed by the VM. A ZFS block is not identified
+by a stable (device, block number): with copy-on-write, the same logical
+offset can live at a different physical location after every write, and a
+block's identity includes its checksum and birth transaction group. The ARC is
+keyed by the DVA and carries the `blkptr_t`, so it can validate a block against
+its checksum on read and know exactly which transaction group created it.
+Reusing the buffer cache would mean either losing that identity or maintaining
+a second, redundant cache. The FreeBSD integration therefore moves `vm_page`s
+straight into the ARC via `dmu_read_pages()`/`dmu_write_pages()`, and the
+`vm_object` for a mounted file is backed by ARC-backed pages rather than by the
+buffer cache. (Direct I/O, controlled by `zfs_dio_enabled` in `zfs_vnops.c`,
+is disabled by default on FreeBSD pending a range-locking fix, so the normal
+path is the ARC.)
+
+**When the ZIL actually writes.** The `zil.c` header comment states the two
+conditions under which an in-memory intent transaction is committed to disk:
+either it is "committed to the pool by the DMU transaction group (txg), at
+which point they can be discarded," or it is "committed to the on-disk ZIL for
+the dataset being modified (e.g. due to an fsync, O_DSYNC, or other
+synchronous requirement)." In other words, the ZIL is *not* a write-ahead log
+in the database sense for every write. Asynchronous writes rely on the
+transaction group's uberblock commit for durability and never touch the ZIL.
+Only operations that must survive a crash *before* the next txg sync —
+[`fsync(2)`](../../../lib/libsys/fsync.2), `O_DSYNC`/`O_SYNC` writes, and a few metadata operations — are
+serialized into the per-dataset ZIL. `zil_commit()` (called from `zfs_fsync()`
+above) is what does that: it gathers the pending intent transactions, writes
+them into a chain of log blocks (the `zil_chain_t` linked from
+`zil_header_t.zh_log`), and waits for the write to complete. Those log blocks
+are allocated preferentially from a dedicated log vdev (the "slog"); the
+`vdev.c` header comment describes the three sources tried in order — dedicated
+log vdevs, "embedded slog metaslabs," and finally normal metaslabs. On a clean
+mount, each dataset's on-disk ZIL is replayed to recover the small window of
+synchronous operations that had not yet been folded into a transaction group.
 
 ## Flow / Diagram
 
 ```mermaid
 classDiagram
-    class spa_t {
-        +vdev_t *spa_root_vdev
-        +dsl_pool_t *spa_dsl_pool
-        +uint64_t spa_txg
-        +uberblock_t spa_uberblock
-        +metaslab_class_t spa_normal_class
-        +metaslab_class_t spa_log_class
-    }
+  class znode {
+    +sa_handle_t z_sa_hdl
+    +zattr_table z_attr_table
+    +uint64_t z_pflags
+    +zfsvfs_t z_zfsvfs
+    +vnode_t z_vnode
+  }
+  class objset {
+    +dsl_dataset_t os_dsl_dataset
+    +spa_t os_spa
+    +objset_phys_t os_phys
+  }
+  class dnode {
+    +objset_t dn_objset
+    +uint64_t dn_object
+    +dmu_buf_impl_t dn_dbuf
+    +dnode_handle_t dn_handle
+  }
+  class dmu_tx {
+    +objset_t tx_objset
+    +dsl_pool_t tx_pool
+    +uint64_t tx_txg
+    +list_t tx_holds
+  }
+  class dmu_tx_hold {
+    +dmu_tx_t txh_tx
+    +dnode_t txh_dnode
+    +uint64_t txh_arg1
+    +uint64_t txh_arg2
+  }
+  class dbuf_dirty_record {
+    +uint64_t dr_txg
+    +zio_t dr_zio
+    +dmu_buf_impl_t dr_dbuf
+    +dnode_t dr_dnode
+    +dbuf_dirty_record_t dr_parent
+  }
+  class arc_buf_hdr {
+    +dva_t b_dva
+    +uint64_t b_birth
+    +uint8_t b_type
+    +arc_buf_hdr_state_t b_state
+    +arc_buf_t b_buf
+  }
+  class zio {
+    +spa_t io_spa
+    +blkptr_t io_bp
+    +void io_data
+    +uint64_t io_size
+    +uint64_t io_offset
+    +vdev_t io_vd
+  }
+  class vdev {
+    +vdev_ops_t vdev_ops
+    +vdev_queue_t vdev_queue
+    +vdev_state_chan_t vdev_state_chan
+  }
+  class txg_list {
+    +kmutex_t tl_lock
+    +spa_t tl_spa
+    +txg_node_t tl_head
+  }
+  class zil_header {
+    +uint64_t zh_claim_txg
+    +uint64_t zh_replay_seq
+    +blkptr_t zh_log
+  }
 
-    class vdev_t {
-        +uint64_t vdev_id
-        +vdev_t **vdev_children
-        +metaslab_t *vdev_ms
-        +uint_t vdev_nchildren
-    }
-
-    class objset {
-        +struct dsl_dir *os_dsl_dir
-        +spa_t *os_spa
-        +dnode_t **os_dnodes
-        +zilog_t *os_zil
-    }
-
-    class dmu_tx_t {
-        +list_t tx_holds
-        +objset_t *tx_objset
-        +struct dsl_dir *tx_dir
-        +struct dsl_pool *tx_pool
-        +uint64_t tx_txg
-    }
-
-    class arc_buf_hdr {
-        +dva_t b_dva
-        +uint64_t b_birth
-        +uint64_t b_type
-        +arc_buf_hdr_t *b_hash_next
-        +uint64_t b_flags
-    }
-
-    class zio_t {
-        +spa_t *io_spa
-        +const blkptr_t *io_bp
-        +abd_t *io_abd
-        +uint64_t io_size
-        +uint64_t io_offset
-        +vdev_t *io_vd
-        +void *io_vsd
-        +int io_error
-    }
-
-    class dbuf_t {
-        +dnode_t *db_dnode
-        +dbuf_dirty_record_t *db_dirty_records
-        +arc_buf_t *db_data
-        +dbuf_states_t db_state
-    }
-
-    class zilog_t {
-        +spa_t *zl_spa
-        +objset_t *zl_os
-        +uint64_t zl_logobj
-        +uint64_t zl_replay_seq
-    }
-
-    spa_t *-- vdev_t : contains
-    spa_t *-- objset : manages
-    spa_t *-- dsl_pool_t : contains
-    objset *-- dmu_tx_t : uses
-    objset *-- zilog_t : contains
-    dbuf_t *-- arc_buf_hdr : caches in
-    zio_t *-- vdev_t : targets
-    zio_t *-- spa_t : belongs to
+  znode --> objset : z_os
+  objset --> dnode : holds
+  dmu_tx --> dmu_tx_hold : tx_holds
+  dmu_tx_hold --> dnode : txh_dnode
+  dnode --> dbuf_dirty_record : dirty list
+  dbuf_dirty_record --> zio : dr_zio
+  zio --> arc_buf_hdr : caches block
+  zio --> vdev : io_vd
+  objset --> txg_list : per pool
+  objset --> zil_header : ZIL
+  txg_list --> vdev : spa
 ```
 
 ## Advanced Notes
 
-### Debugging with DTrace
+**Debugging with DTrace.** OpenZFS ships an SDT [probe](../../kern/README_driver.md#glossary) set; the FreeBSD header
+`sys/contrib/openzfs/include/os/freebsd/zfs/sys/trace_zfs.h` declares the
+probes (e.g. around `dmu_tx_assign`, `arc_read`, and the ZIL commit path). The
+kstat surfaces are the cheapest first stop: `dmu_tx_stats` (defined in
+`dmu_tx.c`, with counters like `dmu_tx_assigned`, `dmu_tx_delay`, and
+`dmu_tx_dirty_throttle`) tells you whether writers are being held back by the
+dirty-space throttle, and the ZIL's `zil_stats` (in `zil.c`, with
+`zil_commit_count`, `zil_commit_stall_count`, and `zil_commit_waiter_count`)
+tells you whether synchronous commits are stalling. A high `dmu_tx_dirty_delay`
+with a low ARC hit rate is the classic signature of a pool that cannot sync
+fast enough for its write load.
 
-FreeBSD's DTrace integration with ZFS provides probes for debugging and performance analysis. ZFS exports DTrace SDT probes that can be used to trace ZFS behavior in real-time without modifying kernel code. These probes are available through the DTrace framework and can be enabled using the `dtrace` command-line tool.
+**Performance and the sync pass.** The ZIO pipeline is where most of the
+tunable surface lives. `zio.c` documents a set of `zfs_sync_pass_*` tunables
+that control, per sync pass, when deferred frees and compression kick in; the
+comment warns that changing them "may introduce subtle performance pathologies
+and should only be done in the context of performance analysis." The ARC's
+size (`zfs_arc_max`, bounded below by `MIN_ARC_MAX` in `arc.h`) and the
+metadata/data split are the two knobs that matter most for latency. Because
+metadata is kept in its own ARC lists, a metadata-heavy workload (many small
+files) is far more sensitive to ARC size than a sequential-data workload.
 
-### Performance Considerations
+**Pitfalls.** Three things trip people up. First, the ZIL is not a general
+write-ahead log: assuming that `O_DSYNC` is the only thing that uses it, and
+then being surprised that an `fsync` on a dataset without a [slog](#glossary) is slow, is a
+common mistake — the `vdev.c` comment makes clear that without a dedicated log
+vdev the ZIL shares space with the data vdevs. Second, copy-on-write means a
+"free" is not immediate: freed blocks are queued (the `bptree.c` header
+describes the pool's queue of root block pointers from destroyed datasets,
+freed asynchronously by the DSL scan), so `zfs` used-space does not drop the
+moment you `rm` a file. Third, the FreeBSD page-cache bridge is the one place
+the generic OpenZFS code diverges: the range-locking rules in
+`zfs_znode_impl.h` (whole-file `RL_WRITER` for truncation, ranged `RL_WRITER`
+for writes, `RL_READER` for reads) are what keep `dmu_write_pages()` from
+corrupting a file under concurrent [`write(2)`](../../../lib/libsys/write.2), and they are why Direct I/O is
+off by default on this platform.
 
-1. **TXG sync timing**: The default txg timeout is 5 seconds, but can be tuned via `zfs_sync_delay_sec`. Shorter timeouts reduce data loss risk on power failure but increase write amplification.
-
-2. **ARC size management**: The ARC automatically adjusts its size based on system memory pressure. The `zfs_arc_max` sysctl sets the maximum ARC size (default is 50% of RAM). On systems with large RAM, consider increasing `zfs_arc_max` to cache more data.
-
-3. **Log vdev utilization**: Dedicated log vdevs (slogs) provide significant performance improvements for synchronous workloads. The embedded slog feature (available since OpenZFS 0.8) provides a reasonable fallback when dedicated logs are not available.
-
-4. **Deferred frees**: The deferred free mechanism can cause apparent space exhaustion if many blocks are freed in a short period. The `zfs_free_min_time_diff` sysctl controls the minimum time between free reclaims.
-
-### Common Pitfalls
-
-1. **ARC memory pressure**: If the ARC grows too large, it can cause system-wide memory pressure. Monitor `zfs_arc_c` (current ARC size) and `zfs_arc_mru`/`zfs_arc_mfu` (MRU/MFU list sizes) via `sysctl vfs.zfs.arc.*`.
-
-2. **TXG congestion**: Under heavy write load, the txg can become congested, causing writes to stall. The `zfs_txg_timeout` and `zfs_congested` tunables control this behavior.
-
-3. **ZIL write amplification**: Frequent small synchronous writes can cause excessive ZIL writes. Consider using larger write sizes or batching operations to reduce ZIL overhead.
-
-4. **Pool import failures**: If the uberblock is corrupted, the pool may fail to import. Use `zpool import -F` to attempt recovery from the last known good checkpoint.
-
-### Connection to OS Theory
-
-ZFS's design reflects several fundamental operating system concepts:
-
-- **Transaction groups** implement the ACID properties (Atomicity, Consistency, Isolation, Durability) at the file system level, similar to database transactions.
-- **Copy-on-write** eliminates the need for traditional journaling by ensuring that the file system is always in a consistent state — if a crash occurs during a write, the old data remains intact and the new data is simply not yet referenced.
-- **The ARC's MRU/MFU algorithm** is an application of the working set theory from operating system textbooks, where frequently accessed pages are retained in the cache while rarely accessed pages are evicted.
-- **ZIO parallelism** demonstrates the principle of task decomposition, where a high-level operation is broken into independent sub-operations that can be executed in parallel to maximize throughput.
+**Connection to OS theory.** The ARC is a direct, if heavily adapted,
+instantiation of the second-chance / two-list replacement idea found in
+standard textbooks: the `mru`/`mfu` split approximates the frequency-vs.-
+recency trade-off that a plain LRU gets wrong on scan-like workloads, and the
+"ghost" lists (`mru_ghost`, `mfu_ghost`) are the bookkeeping that lets a
+one-time reference be distinguished from a repeated one. The transaction
+group is the filesystem analogue of a database commit: the holds in
+`dmu_tx_t` are the read-set/write-set, `dmu_tx_assign()` is the decision of
+which commit point a change joins, and the uberblock write in `spa_sync()` is
+the durable commit record. The ZIL, used only for synchronous operations, is
+the write-ahead log that fills the gap between a user's `fsync` and the next
+group's commit — exactly the role a WAL plays when a transaction must be
+durable before the checkpoint.
 
 ## See Also
 - [VFS — Virtual File System Layer](../../fs/README.md)
@@ -407,13 +548,17 @@ ZFS's design reflects several fundamental operating system concepts:
 
 
 
-- [`sys/contrib/openzfs/module/zfs/`](module/zfs) — Core ZFS module files
-- [`sys/contrib/openzfs/module/os/freebsd/zfs/`](module/os/freebsd/zfs) — FreeBSD-specific ZFS integration
-- [`sys/contrib/openzfs/include/sys/`](include/sys) — ZFS header files
-- `vm/README.md` — FreeBSD Virtual Memory Subsystem (for comparison with ARC)
-- `geom/README.md` — GEOM storage framework (FreeBSD's storage abstraction layer)
-- `kern/README_process.md` — Process Management (for understanding DTrace integration)
+- [`sys/contrib/openzfs/module/zfs/`](module/zfs) — the DMU, ARC, ZIO, SPA, vdev, and ZIL
+  implementation files read in this chapter.
+- [`sys/contrib/openzfs/include/sys/`](include/sys) — the core headers: `dmu_tx.h`, `txg.h`,
+  `dbuf.h`, `arc.h`, `zio.h`, `vdev_impl.h`, `zil.h`, `dnode.h`,
+  `dmu_objset.h`.
+- [`sys/contrib/openzfs/include/os/freebsd/zfs/sys/`](include/os/freebsd/zfs/sys) — the FreeBSD-specific
+  bridge: `zfs_znode_impl.h`, `zfs_vnops_os.h`, `trace_zfs.h`.
+- The VFS and vnode layer that the ZPL plugs into, and the `vm_page`/VM
+  machinery that `dmu_read_pages()`/`dmu_write_pages()` move data through.
+- Man pages: [`zfs(8)`](man/man8/zfs.8), [`zpool(8)`](man/man8/zpool.8), [`buf(9)`](../../../share/man/man9/buf.9), [`vnode(9)`](../../../share/man/man9/vnode.9).
 
 ---
 
-> _Generated by [DaemonDocs](https://github.com/ocochard/DaemonDocs) on 2026-05-04 05:57 UTC using model `Qwen3.6-35B-A3B-UD-Q8_K_XL` (llama.cpp build `b8985-27aef3dd9`). AI-generated content — verify against source before relying on it._
+> _Generated by [DaemonDocs](https://github.com/ocochard/DaemonDocs) on 2026-09-04 00:02 UTC using model `Qwen3.8-27B-Q8_0` (llama.cpp build `b10788-e107984bc`). AI-generated content — verify against source before relying on it._

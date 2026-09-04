@@ -5,61 +5,81 @@
 **Navigation:**
   **Up:** [Kernel Core — Structure and Entry Point](../README.md) ▸ [Source Tree — Layout and Conventions](../../README_internals.md)
   **Related:** [Process Management — Scheduling and Lifecycle](README_process.md) | [VFS — Virtual File System Layer](../fs/README.md) | [Jails — OS-level Isolation](README_jail.md)
-  **All chapters:** [Source Tree — Layout and Conventions](../../README_internals.md) | [Boot Process — UEFI Bootloader to Kernel Handoff](../../stand/efi/loader/README.md) | [Kernel Core — Structure and Entry Point](../README.md) | [Build System — buildworld and buildkernel](../../share/mk/README.md) | [Virtual Memory Subsystem — vm_page, UMA, and Pagers](../vm/README.md) | [Process Management — Scheduling and Lifecycle](README_process.md) | [Locking Primitives — Mutexes, sx, rmlocks, and Atomics](README_locking.md) | [Buffer Cache — Block I/O Subsystem](../vm/README_bcache.md) ...
+  **All chapters:** [Source Tree — Layout and Conventions](../../README_internals.md) | [Boot Process — UEFI Bootloader to Kernel Handoff](../../stand/efi/loader/README.md) | [Kernel Core — Structure and Entry Point](../README.md) | [Build System — buildworld and buildkernel](../../share/mk/README.md) | [System Calls and Image Activation — Entry, sysent, and exec](README_syscall.md) | [Kernel Modules and the Linker — KLD, SYSINIT, and linker sets](README_kld.md) | [Virtual Memory Subsystem — vm_page, UMA, and Pagers](../vm/README.md) | [Process Management — Scheduling and Lifecycle](README_process.md) ...
 ---
 
 
 ## Quick Summary
 
-Capsicum is FreeBSD's capability-based security framework, implemented as two complementary mechanisms working together: capability mode and capability rights. Capability mode allows a process to enter a restricted execution state via the [`cap_enter(2)`](../../lib/libsys/cap_enter.2) system call, at which point it loses the ability to open new files, create new file descriptors that reference global namespace objects, and perform most other operations that could grant access to new resources. Capability rights provide fine-grained per-file-descriptor restrictions, where each open file descriptor carries a bitmask of allowed operations — read, write, mmap, ioctl, and so on. Together, these mechanisms enable a "capability-style" sandbox in which a process can operate using only the resources explicitly delegated to it.
+Capsicum is FreeBSD's capability-based security framework. It gives a process a way to hand back, to the kernel, the ability to reach anything it has not explicitly been given. Two mechanisms work together. The first is *[capability mode](README_cred.md#glossary)*: a process calls [`cap_enter(2)`](../../lib/libsys/cap_enter.2) and from that point on it can no longer open new paths, create new descriptors that name global objects, or make most system calls that could grant it fresh access to resources. The second is *capability rights*: every open file descriptor carries a small bitmask describing exactly which operations — read, write, seek, mmap, ioctl, fcntl — are allowed on that particular descriptor. A process that wants to be sandboxed opens the files it needs, trims each descriptor down to the rights it truly requires, and then calls [`cap_enter(2)`](../../lib/libsys/cap_enter.2). After that, the kernel enforces both restrictions on every system call.
 
-The framework was designed by Robert Watson and Jonathan Anderson at the University of Cambridge Computer Laboratory and the FreeBSD Foundation, with support from Google. It draws inspiration from the historic Capability-based security model, but adapts it to the Unix file descriptor paradigm: instead of replacing the entire process credential model, Capsicum wraps existing file descriptors with additional rights constraints. This approach means that existing programs can be incrementally adapted to run in capability mode — a process opens its needed files, calls `cap_rights_limit()` to restrict each descriptor, calls `cap_enter()` to enter the sandbox, and then proceeds with its work under the enforced restrictions.
+The design is deliberately built on top of the ordinary Unix file-descriptor model rather than replacing it. A file descriptor is already a token that names an open object; Capsicum attaches an authorization to that token. This lets existing programs move toward capability mode gradually: they keep their normal startup, and once their resources are in place they lock the door behind them. Because the rights live on the descriptor and not on the process, one program can hold a read-only log file, a read-write socket, and a read-only configuration file at the same time, each with its own independent limit.
 
-Capsicum operates at the syscall entry layer in the kernel. Every system call that operates on a file descriptor checks the descriptor's rights mask against the operation being performed. If the process is in capability mode, additional restrictions apply: the process cannot open new files, cannot use most directory-related operations, and is limited to a carefully audited subset of system calls. The framework is orthogonal to jails — jails partition the system across multiple processes using the traditional Unix credential model, while Capsicum sandboxes individual processes using capability-based delegation. It is also distinct from MAC (Mandatory Access Control), which operates on the credential and label model; Capsicum operates on per-file-descriptor rights that are set by the process itself.
+The enforcement happens in two places in the kernel. At the system-call entry point, a process in capability mode is only allowed to make the calls that were explicitly marked as safe when the call table was generated; anything else fails with `ECAPMODE`. Inside a call that operates on a descriptor, the descriptor's rights mask is tested against the operation being attempted; if the right is missing the call fails with `ENOTCAPABLE`. Capsicum is orthogonal to jails: a jail partitions the whole system across many processes using the traditional credential model, while Capsicum sandboxes a single process using per-descriptor [delegation](../fs/nfs/README.md#glossary). A process may sit inside a jail and also run in capability mode, and the two checks apply independently.
 
-The practical impact of Capsicum is visible in several FreeBSD userland components. The DHCP client (`dhclient`), the packet capture tool (`tcpdump`), and the terminal emulator (`xterm`) have all been adapted to run in capability mode. These programs typically restructure their initialization into two distinct phases. In the first phase, before capability mode is enabled, the program performs standard Unix initialization: it sets up signal handlers, opens configuration files, binds to network interfaces, and prepares the resources it will need. In the second phase, it restricts each file descriptor to only the operations it actually requires, enters capability mode, and continues execution with the guarantee that even if an attacker exploits a bug in the running code, the damage is bounded by the capability rights.
+In practice a handful of FreeBSD userland programs already run this way — the packet-capture tool `tcpdump`, the DHCP client `dhclient`, and the terminal emulator `xterm`. They all follow the same shape: do all the global-namespace work first, narrow each descriptor's rights, then enter capability mode and stay there. The rest of this chapter traces how that is implemented, starting from the data structures that store the rights and ending at the checks that run on every system call.
 
 ## Architecture
 
-Capsicum consists of two interlocking mechanisms implemented primarily in `sys/kern/sys_capability.c` and enforced through hooks in the syscall entry path and file descriptor operations. The first mechanism, capability mode, is a process-wide flag stored in the process credential structure. When a process calls `cap_enter()`, the kernel sets the `P_CAPMODE` flag on the process, recorded in the `ucred` structure. From that point forward, the kernel enforces a restricted syscall set: operations that could create new file descriptors referencing global namespace objects — such as [`open(2)`](../../lib/libsys/open.2), `openat(2)`, [`execve(2)`](../../lib/libsys/execve.2) with a path, `linkat(2)`, `mkdirat(2)`, and most directory operations — return `ECAPMODE` instead of proceeding. The allowed syscalls are defined by `CAPENABLED` flags in `syscalls.master`, and each syscall handler must be carefully audited to ensure it cannot be used to escape the sandbox.
+Capsicum is implemented in three source locations that correspond to the three jobs it does. The rights definitions and the inline check helpers live in headers: `sys/sys/caprights.h` defines the `cap_rights_t` type and the `cap_*_rights` constant sets, and `sys/sys/capsicum.h` defines the individual right macros (`CAP_READ`, `CAP_WRITE`, `CAP_MMAP`, ...) together with the `cap_check_inline()` helper. The mode and the rights-management system calls live in `sys/kern/sys_capability.c`, and the per-descriptor enforcement lives in `sys/kern/kern_descrip.c`, where the `fget*()` family of functions lives.
 
-The second mechanism, capability rights, is a per-file-descriptor constraint stored alongside the file structure in the file descriptor table. Each entry in the file descriptor table, represented by `struct filedescent` in `sys/sys/filedesc.h`, contains a `struct filecaps` that holds a rights bitmask (`fc_rights`), an array of allowed ioctl commands (`fc_ioctls`), and a bitmask of allowed fcntl commands (`fc_fcntls`). When a syscall operates on a file descriptor — for example, [`read(2)`](../../lib/libsys/read.2) reading from an fd, or [`ioctl(2)`](../../lib/libsys/ioctl.2) performing an operation on it — the kernel checks the descriptor's rights mask against the operation being performed. If the required capability is not present in the mask, the syscall returns `ENOTCAPABLE`. This check happens at syscall entry time, before any operation is performed, ensuring that the constraint is enforced uniformly regardless of how the fd was obtained.
+The capability-mode side is a per-process [state](../netpfil/pf/README.md#glossary). `sys_cap_enter()` in `sys/kern/sys_capability.c` is the entry point for [`cap_enter(2)`](../../lib/libsys/cap_enter.2); it validates the request, drops the process's privilege, and sets a flag on the process that marks it as being in capability mode. That flag is inherited by children across [`fork(2)`](../../lib/libsys/fork.2) and survives [`execve(2)`](../../lib/libsys/execve.2). Once set, the system-call entry layer consults it: a call that was not marked as allowed in capability mode is rejected before its handler runs. The set of allowed calls is not a hand-maintained list in C — it is encoded in the system-call table. In `sys/kern/syscalls.master`, each call may carry the `CAPENABLED` option, and the comment in that file states plainly that a `CAPENABLED` syscall "is allowed in capability mode". The table generator turns that option into a per-call flag that the entry layer tests, so the allowlist is audited in one place, in the same table that already defines every call's prototype and number.
 
-The rights are encoded as 64-bit values using the `CAPRIGHT(idx, bit)` macro defined in `sys/sys/capsicum.h`. The macro places an index value in the high bits (starting at bit 57) and a per-index bit pattern in the low bits. This encoding allows the kernel to store multiple rights compactly in a small array (`struct cap_rights`), with the array length itself encoded in the top two bits of the first element. The current version (`CAP_RIGHTS_VERSION_00`) supports up to five array elements, providing 320 distinct capability bits. The kernel maintains pre-defined rights constants for common operation sets — for example, `cap_read_rights`, `cap_write_rights`, `cap_ioctl_rights` — which can be applied to file descriptors using [`cap_rights_limit(2)`](../../lib/libsys/cap_rights_limit.2).
+The capability-rights side is per-descriptor. When a descriptor is opened, the kernel installs a `struct filedescent` that pairs a `struct file` with a `struct filecaps` holding the rights (see Key Data Structures). The rights start out wide and are then reduced by [`cap_rights_limit(2)`](../../lib/libsys/cap_rights_limit.2) (implemented by `kern_cap_rights_limit()` in `sys/kern/sys_capability.c`); rights can only be removed, never added, so the mask is monotonic. When a system call needs a descriptor, it does not call a bare `fget()` — it calls the rights-aware variant for the operation it is about to perform: `fget_read()` for a read, `fget_write()` for a write, `fget_cap()` for a call that needs no specific right, and so on. Those variants look up the descriptor, then test the descriptor's rights against the required right and return `ENOTCAPABLE` if it is missing. Specialized checkers handle the trickier operations: `cap_ioctl_check()` and `cap_ioctl_limit_check()` for [`ioctl(2)`](../../lib/libsys/ioctl.2), `cap_fcntl_check()` and `cap_fcntl_check_fde()` for [`fcntl(2)`](../../lib/libsys/fcntl.2), and `cap_rights_to_vmprot()` to translate the mmap rights into the page protections that [`mmap(2)`](../../lib/libsys/mmap.2) will actually install.
 
-Capability rights are enforced at syscall entry by the `_cap_check()` function, which is called from syscall handlers that operate on file descriptors. The check compares the required capability against the rights mask stored in the `filedescent` entry. For ioctls, which have an unbounded command space, the kernel maintains a separate allowlist (`fc_ioctls`) rather than using the bitmask. For fcntl commands, a bitmask (`fc_fcntls`) is used. The enforcement is per-fd rather than per-syscall because the same syscall may operate on multiple fds with different rights, and the constraint must follow the resource (the fd) rather than the operation. This design reflects the capability model principle: authority is attached to the object, not to the code that accesses it.
-
-The framework is implemented as a kernel option (`CAPABILITY_MODE` in `opt_capsicum.h`) and is compiled into the base kernel. A `FEATURE` macro in `sys/kern/sys_capability.c` exposes the capability mode feature to userland diagnostics. A sysctl variable `trap_enotcap` in the same file allows processes to receive `SIGTRAP` instead of `ENOTCAPABLE` errors, which is useful for debugging capability violations during development.
+This two-layer split is the whole architecture in one sentence: capability mode gates *which calls a process may make at all*, and capability rights gate *what a call may do to a particular descriptor*. The first is a property of the process; the second is a property of the descriptor. They compose because a call must pass both — it must be an allowed call, and it must hold the right on the descriptor it names.
 
 ## Key Data Structures
 
-The core data structures for Capsicum are defined across three header files: `sys/sys/caprights.h` for the rights array, `sys/sys/capsicum.h` for the individual capability bits, and `sys/sys/filedesc.h` for the per-descriptor storage.
+The rights mask itself is a fixed-size array of 64-bit words, defined in `sys/sys/caprights.h`:
 
 ```c
-# From sys/sys/caprights.h
+#define	CAP_RIGHTS_VERSION_00	0
+#define	CAP_RIGHTS_VERSION	CAP_RIGHTS_VERSION_00
+
 struct cap_rights {
 	uint64_t	cr_rights[CAP_RIGHTS_VERSION + 2];
 };
+
+typedef	struct cap_rights	cap_rights_t;
 ```
 
-The `struct cap_rights` holds the rights array. The length of the array is encoded in the top two bits of the first element: if those bits are zero, the array has two elements. This encoding allows the kernel to validate and iterate the array without requiring an explicit length field. Each subsequent element's top five bits encode the index, allowing up to five elements (indices 0 through 4). The current version (`CAP_RIGHTS_VERSION_00`) uses this two-element layout.
+With `CAP_RIGHTS_VERSION` at 0 the array is two `uint64_t` words, 128 bits in all. The individual rights are not scattered flags; each is a 64-bit value built by the `CAPRIGHT(idx, bit)` macro in `sys/sys/capsicum.h`:
 
 ```c
-# From sys/sys/capsicum.h
 #define	CAPRIGHT(idx, bit)	((1ULL << (57 + (idx))) | (bit))
-
-#define	CAP_READ		CAPRIGHT(0, 0x0000000000000001ULL)
-#define	CAP_WRITE		CAPRIGHT(0, 0x0000000000000002ULL)
-#define	CAP_SEEK_TELL		CAPRIGHT(0, 0x0000000000000004ULL)
-#define	CAP_SEEK		(CAP_SEEK_TELL | 0x0000000000000008ULL)
-#define	CAP_MMAP		CAPRIGHT(0, 0x0000000000000010ULL)
-#define	CAP_IOCTL		CAPRIGHT(0, 0x0000000000000040ULL)
 ```
 
-The `CAPRIGHT(idx, bit)` macro creates a 64-bit capability value. The index is placed in bits 57-61, and the bit pattern is in bits 0-56. This leaves room for version and length encoding in the top bits. Each capability represents a specific operation: `CAP_READ` allows [`read(2)`](../../lib/libsys/read.2), `readv(2)`, and `openat(O_RDONLY)`; `CAP_WRITE` allows [`write(2)`](../../lib/libsys/write.2), `writev(2)`, and `openat(O_WRONLY | O_APPEND)`; `CAP_MMAP` allows [`mmap(2)`](../../lib/libsys/mmap.2) with `PROT_NONE`. Composite rights like `CAP_MMAP_R` combine multiple base rights.
+The high bits of the value carry an index marker identifying which element of the array the right belongs to, and the low bits are the right itself. This self-describing encoding is what lets a whole set of rights be tested with a single bitwise operation: a "does this set contain that right?" check is just an AND of the two masks. The header comment notes that the top 7 bits of every element are reserved, and that index 0 uses "2 bit array size + 5 bit array element" while higher indices use "2 bits of 0 + 5 bit array element" — which is why at most five elements are addressable.
+
+Concrete rights, also from `sys/sys/capsicum.h`, are composed from these primitives:
 
 ```c
-# From sys/sys/filedesc.h
+/* Allows for openat(O_RDONLY), read(2), readv(2). */
+#define	CAP_READ		CAPRIGHT(0, 0x0000000000000001ULL)
+/* Allows for openat(O_WRONLY | O_APPEND), write(2), writev(2). */
+#define	CAP_WRITE		CAPRIGHT(0, 0x0000000000000002ULL)
+/* Allows for lseek(fd, 0, SEEK_CUR). */
+#define	CAP_SEEK_TELL		CAPRIGHT(0, 0x0000000000000004ULL)
+/* Allows for lseek(2). */
+#define	CAP_SEEK		(CAP_SEEK_TELL | 0x0000000000000008ULL)
+/* Allows for aio_read(2), pread(2), preadv(2). */
+#define	CAP_PREAD		(CAP_SEEK | CAP_READ)
+/* Allows for aio_write(2), openat(O_WRONLY), pwrite(2), pwritev(2). */
+#define	CAP_PWRITE		(CAP_SEEK | CAP_WRITE)
+/* Allows for mmap(PROT_NONE). */
+#define	CAP_MMAP		CAPRIGHT(0, 0x0000000000000010ULL)
+/* Allows for mmap(PROT_READ). */
+#define	CAP_MMAP_R		(CAP_MMAP | CAP_SEEK | CAP_READ)
+/* Allows for mmap(PROT_WRITE). */
+#define	CAP_MMAP_W		(CAP_MMAP | CAP_SEEK | CAP_WRITE)
+```
+
+Notice that compound rights are just unions of simpler ones: `CAP_PREAD` is `CAP_SEEK | CAP_READ`, and `CAP_MMAP_R` is `CAP_MMAP | CAP_SEEK | CAP_READ`. A program that wants to [`mmap(2)`](../../lib/libsys/mmap.2) a file read-only needs all three, and the kernel's `mmap` path will demand exactly that combination.
+
+The rights are stored per descriptor, not per process. In `sys/sys/filedesc.h` each descriptor in the table is a `struct filedescent`, and the capability state is a `struct filecaps` embedded in it:
+
+```c
 struct filecaps {
 	cap_rights_t	 fc_rights;	/* per-descriptor capability rights */
 	u_long		*fc_ioctls;	/* per-descriptor allowed ioctls */
@@ -79,163 +99,93 @@ struct filedescent {
 #define	fde_nioctls	fde_caps.fc_nioctls
 ```
 
-The `struct filecaps` holds the rights for a single file descriptor. The `fc_rights` field stores the capability bitmask. The `fc_ioctls` field is a dynamically allocated array of ioctl command values that are permitted on this descriptor; `fc_nioctls` stores the array size. The `fc_fcntls` field is a 32-bit bitmask of allowed fcntl commands. The `struct filedescent` embeds a `struct filecaps` inline (not as a pointer), so each file descriptor table entry carries its own rights copy. The `fde_seqc` field is a sequence counter used to detect concurrent modifications to the file structure and its caps, ensuring atomic updates.
+Three things are worth pausing on. First, the rights sit in `fde_caps.fc_rights`, reachable through the `fde_rights` alias — the check is "does *this* `filedescent`'s mask contain the right", which is why the model is per-fd. Second, `fc_ioctls` and `fc_fcntls` are separate from `fc_rights` because `ioctl` and `fcntl` are open-ended operation sets that cannot be captured by a fixed bitmask of named rights; instead a descriptor carries an explicit list of allowed `ioctl` request codes (`fc_ioctls`, sized by `fc_nioctls`) and a `fcntl` command mask (`fc_fcntls`). Third, `fde_seqc` is a sequence counter that keeps the `struct file` and its capability state consistent when the descriptor is duplicated or closed concurrently — the `fget*()` paths take it so a reader never sees a half-updated pair.
+
+The rights-management allocation is its own malloc tag, defined in `sys/kern/kern_descrip.c`:
 
 ```c
-# From sys/sys/filedesc.h
-struct filedesc {
-	struct	fdescenttbl *fd_files;	/* open files table */
-	/* ... */
-};
+MALLOC_DEFINE(M_FILECAPS, "filecaps", "descriptor capabilities");
 ```
-
-The `struct filedesc` is the per-process file descriptor table. It contains a pointer to `fd_files`, which is a `struct fdescenttbl` — a flexible array of `struct filedescent` entries, one per open file descriptor. The rights are stored inline in each `filedescent` entry, not in the `filedesc` structure itself, reflecting the per-fd granularity of the capability model.
 
 ## Deep Dive
 
-The entry point for capability mode is `sys_cap_enter()`, defined in `sys/kern/sys_capability.c`. When a process calls [`cap_enter(2)`](../../lib/libsys/cap_enter.2), the kernel invokes this function, which performs the following steps:
+The lifecycle of a sandboxed process moves through four kernel entry points, and it is useful to walk each one.
 
-1. **Check preconditions**: The function verifies that the process is not already in capability mode, and that it holds the necessary privileges. The `P_CAPMODE` flag in the process credential is checked to prevent re-entry.
-
-2. **Create a new credential**: A new `ucred` structure is allocated with the `P_CAPMODE` flag set. The old credential is preserved temporarily to ensure atomicity.
-
-3. **Update the process credential**: The process's credential is replaced with the new one. From this point forward, all syscall handlers that check `P_CAPMODE` will find it set.
-
-4. **Enforce restrictions**: Subsequent syscalls that attempt to create new file descriptors or access global namespaces will be rejected by the capability mode checks in the syscall handlers.
-
-The rights enforcement happens in the syscall entry path through the `_cap_check()` function. When a syscall operates on a file descriptor — for example, [`read(2)`](../../lib/libsys/read.2) calls `fget_read()` to retrieve the file structure — the kernel checks whether the required capability is present in the descriptor's rights mask. The check is implemented as follows (simplified):
+**Entering capability mode.** The user calls [`cap_enter(2)`](../../lib/libsys/cap_enter.2), which lands in `sys_cap_enter()` in `sys/kern/sys_capability.c`:
 
 ```c
-# From sys/kern/sys_capability.c (conceptual)
-static inline int
-_cap_check(struct file *fp, cap_rights_t *rights)
-{
-	struct filedescent *fde;
-	struct filecaps *fc;
-	int i;
-
-	/* Get the filecaps from the filedescent */
-	fde = fdp_find(fp);
-	fc = &fde->fde_caps;
-
-	/* Check the rights bitmask */
-	for (i = 0; i < CAP_RIGHTS_VERSION + 2; i++) {
-		if ((fc->fc_rights.cr_rights[i] & rights->cr_rights[i]) !=
-		    rights->cr_rights[i])
-			return (ENOTCAPABLE);
-	}
-
-	/* Check ioctl allowlist if applicable */
-	/* ... */
-
-	return (0);
-}
-```
-
-The `_cap_check()` function is called from syscall handlers that operate on file descriptors. For example, the [`read(2)`](../../lib/libsys/read.2) handler calls `fget_read()` to retrieve the file structure, then calls `_cap_check()` to verify that `CAP_READ` is present in the descriptor's rights. If the check fails, the syscall returns `ENOTCAPABLE` immediately, before any I/O is performed.
-
-For ioctls, the check is more complex because ioctl commands are unbounded 32-bit values. Instead of a bitmask, the kernel maintains an allowlist of permitted ioctl commands in `fc_ioctls`. The `cap_ioctl_check()` function iterates over this array to verify that the requested command is permitted. This approach is necessary because a bitmask would require 2^32 bits, which is impractical.
-
-The rights are set using [`cap_rights_limit(2)`](../../lib/libsys/cap_rights_limit.2), which calls `sys_cap_rights_limit()` in the kernel. This function validates the rights array, copies the rights into the `filecaps` structure for the specified fd, and updates the `fde_seqc` counter to ensure atomicity with concurrent file descriptor operations.
-
-```c
-# From sys/kern/sys_capability.c (conceptual)
 int
-sys_cap_rights_limit(struct thread *td, struct cap_rights_limit_args *uap)
+sys_cap_enter(struct thread *td, struct cap_enter_args *uap)
 {
-	struct file *fp;
-	struct filedescent *fde;
-	struct filecaps *fc;
-	cap_rights_t *new_rights;
-
-	/* Get the file structure for the fd */
-	fp = fget(td->td_lwp, uap->fd, FWRITE);
-	if (fp == NULL)
-		return (EBADF);
-
-	/* Allocate and copy the new rights */
-	new_rights = malloc(sizeof(cap_rights_t), M_FILECAPS, M_WAITOK | M_ZERO);
-	/* Copy and validate rights from userland */
-	/* ... */
-
-	/* Update the filecaps */
-	fde = fdp_find(fp);
-	fc = &fde->fde_caps;
-	fc->fc_rights = *new_rights;
-
-	/* Update sequence counter */
-	fde_seqc_update(fp);
-
-	fdrop(fp, td);
-	return (0);
+	struct ucred *newcred, *oldcred;
+	...
 }
 ```
 
-The `M_FILECAPS` malloc type is defined in `sys/kern/kern_descrip.c` for allocating rights structures. This ensures that capability-related memory is tracked separately from other file descriptor allocations.
+The function allocates a new credential, drops the privileges the process no longer needs, and sets the per-process capability-mode flag. After it returns, the process is in capability mode for its lifetime and for every child it forks; there is no `cap_exit` — the transition is one-way, which is exactly the point of a sandbox. Because the flag lives on the process and is inherited across [`fork(2)`](../../lib/libsys/fork.2) and [`execve(2)`](../../lib/libsys/execve.2), a supervised daemon can drop into capability mode once and every later re-exec stays inside it.
 
-Capability mode and capability rights compose with each other: entering capability mode does not automatically restrict existing file descriptors — the process must explicitly limit each fd using `cap_rights_limit()`. However, once in capability mode, the process cannot open new fds at all, so the rights set before entering mode are the only ones that will ever apply. This design allows a process to open all its needed resources, limit each one precisely, and then enter the sandbox with confidence that no new resources can be obtained.
+**Trimming rights.** Before entering, the process narrows each descriptor with [`cap_rights_limit(2)`](../../lib/libsys/cap_rights_limit.2), handled by `kern_cap_rights_limit()` in the same file. The operation is a bitwise AND of the new mask with the existing `fde_rights`: a bit that is already off cannot be turned back on. This monotonicity is what makes the model safe to reason about — a process can only ever give up rights, and a child can never hold more than its parent did at the moment of [`fork(2)`](../../lib/libsys/fork.2). The userland helper that builds a mask from named rights is [`cap_rights_init(3)`](../../lib/libc/capability/cap_rights_init.3), which ORs the `CAP_*` macros together; the kernel never trusts a mask that names a right the descriptor was never given.
 
-The enforcement is per-fd because the capability model attaches authority to resources, not to code. A single process may have file descriptors with different rights: one fd may have `CAP_READ` for a log file, another may have `CAP_WRITE` for a socket, and another may have `CAP_IOCTL` for a device. The rights follow the fd, so the same syscall ([`read(2)`](../../lib/libsys/read.2)) may succeed on one fd and fail on another, depending on the rights attached to each.
+**The per-descriptor check.** Now the interesting part: where the right is actually tested. A system call that reads a file does not call a plain `fget()`; it calls `fget_read(fd)`, defined in `sys/kern/kern_descrip.c`. That function resolves the descriptor to its `struct filedescent`, and before handing the `struct file` back it runs the rights test. The test itself is in `sys/kern/sys_capability.c`, where `cap_check()` (and the faster `cap_check_inline()` / `cap_check_inline_transient()` in `sys/sys/capsicum.h`) AND the required right against `fde_rights` and, on failure, call `cap_check_failed_notcapable()` to return `ENOTCAPABLE`. The whole family is visible in the descriptor code: `fget_read()`, `fget_write()`, `fget_cap()`, `fget_mmap()`, `fgetvp_rights()`, and the unlocked variants `fget_unlocked()`, `fget_unlocked_flags()`, `fget_unlocked_seq()`. Each one is a thin wrapper that knows which right its caller needs and lets `cap_check()` do the comparison.
+
+The special operations get their own checkers, also in `sys/kern/sys_capability.c`. [`ioctl(2)`](../../lib/libsys/ioctl.2) is checked by `cap_ioctl_check()` against the descriptor's `fc_ioctls` list (the limit is enforced by `cap_ioctl_limit_check()`), because an `ioctl` request is an arbitrary code that a fixed bitmask cannot enumerate. [`fcntl(2)`](../../lib/libsys/fcntl.2) is checked by `cap_fcntl_check()` and `cap_fcntl_check_fde()` against `fc_fcntls`. [`mmap(2)`](../../lib/libsys/mmap.2) is checked against the `CAP_MMAP*` rights, and `cap_rights_to_vmprot()` converts the granted rights into the `VM_PROT_*` flags the virtual-memory layer will install — so a descriptor that was limited to `CAP_MMAP_R` can be mapped read-only but not writable, regardless of what the caller asks for.
+
+**The capability-mode gate.** The other half of enforcement is at the very top of the call path. When a system call enters the kernel, the entry layer checks whether the current process is in capability mode. If it is, and the call was not marked `CAPENABLED` in `sys/kern/syscalls.master`, the call is rejected with `ECAPMODE` before its handler runs. This is why, after [`cap_enter(2)`](../../lib/libsys/cap_enter.2), calls like [`open(2)`](../../lib/libsys/open.2) on an absolute path, [`chroot(2)`](../../lib/libsys/chroot.2), and most of the address-space and namespace calls fail with `ECAPMODE`: they are not in the audited allowlist. The allowlist is maintained in the same table that defines every call, so a new call is only reachable in capability mode if someone explicitly marked it and audited it for safety.
+
+A useful way to see the division of labor: [`read(2)`](../../lib/libsys/read.2) on a read-only log descriptor passes the mode gate (it is a `CAPENABLED` call) and then passes the rights check (the descriptor has `CAP_READ`). [`read(2)`](../../lib/libsys/read.2) on a descriptor that was limited to `CAP_WRITE` passes the mode gate but fails the rights check with `ENOTCAPABLE`. A call like [`chroot(2)`](../../lib/libsys/chroot.2) fails the mode gate with `ECAPMODE` before any descriptor is even looked at. The two layers catch two different classes of mistake.
 
 ## Flow / Diagram
 
 ```mermaid
 flowchart TD
-    subgraph InitPhase_grp ["Initialization Phase (before cap_enter)"]
-        A[Process starts] --> B[Open files, sockets, devices]
-        B --> C[Call cap_rights_limit on each fd]
-        C --> D[Set rights: READ, WRITE, IOCTL, etc.]
-    end
-
-    subgraph SandboxPhase_grp ["Sandbox Phase (after cap_enter)"]
-        D --> E[Call cap_enter]
-        E --> F[P_CAPMODE flag set in ucred]
-        F --> G[Process executes in capability mode]
-        G --> H{Syscall on fd?}
-        H -->|Yes| I[_cap_check rights mask]
-        I --> J{Rights present?}
-        J -->|Yes| K[Execute syscall]
-        J -->|No| L[Return ENOTCAPABLE]
-        H -->|No: open, execve, linkat| M[Return ECAPMODE]
-        K --> G
-        L --> G
-        M --> G
-    end
-
-    InitPhase --> SandboxPhase
-
-    subgraph Enforcement ["Kernel Enforcement"]
-        N[Syscall entry] --> O{P_CAPMODE set?}
-        O -->|Yes| P[Check CAPENABLED flag]
-        P --> Q{Syscall allowed?}
-        Q -->|Yes| R[Check fd rights]
-        Q -->|No| S[Return ECAPMODE]
-        O -->|No| T[Normal syscall path]
-        R --> U{Rights match?}
-        U -->|Yes| V[Execute]
-        U -->|No| W[Return ENOTCAPABLE]
-    end
-
-    G --> N
+  subgraph UserlandGroup ["Userland"]
+    U1["open files, bind sockets"]
+    U2["cap_rights_limit(fd, rights)"]
+    U3["cap_enter()"]
+  end
+  subgraph EntryGroup ["Syscall entry — capability-mode gate"]
+    E1["amd64_syscall()"]
+    E2{"in capability mode AND call not CAPENABLED?"}
+    E3["return ECAPMODE"]
+  end
+  subgraph RightsGroup ["Per-fd rights check (kern_descrip.c)"]
+    R1["fget_read / fget_write / fget_cap"]
+    R2{"cap_check(): fde_rights contains the required right?"}
+    R3["return ENOTCAPABLE"]
+  end
+  subgraph OpGroup ["Operation"]
+    O1["read / write / mmap / ioctl / fcntl"]
+  end
+  U1 --> U2 --> U3 --> E1
+  E1 --> E2
+  E2 -->|yes| E3
+  E2 -->|no| R1
+  R1 --> R2
+  R2 -->|no| R3
+  R2 -->|yes| O1
 ```
 
-The diagram shows the two-phase execution model: first, the process initializes and sets rights on its file descriptors; then, it enters capability mode and executes under enforcement. The enforcement path checks both the process-wide capability mode flag and the per-fd rights mask.
+The left column is what the program does before it locks the door. The middle is the capability-mode gate, which only bites once [`cap_enter(2)`](../../lib/libsys/cap_enter.2) has been called. The bottom is the per-descriptor rights check, which runs on every descriptor-bearing call whether or not the process is in capability mode — a process that has limited a descriptor's rights but has not entered capability mode is still bound by them.
 
 ## Advanced Notes
 
-**Debugging capability violations**: Capsicum does not currently expose DTrace SDT probes for capability mode entry or rights check failures. Debugging is typically performed using the `kern.trap_enotcap` sysctl, which causes the kernel to deliver a `SIGTRAP` signal to the process instead of returning `ENOTCAPABLE`. This allows debuggers like `gdb(1)` to catch the violation at the exact point of failure. Alternatively, [`ktrace(1)`](../../usr.bin/ktrace/ktrace.1) can be used to trace system call entry and exit for processes running in capability mode.
+**Debugging.** The kernel exposes a tunable that turns capability failures into traps: `sys/kern/sys_capability.c` defines
 
-**Performance implications**: The capability check adds minimal overhead — a bitwise AND comparison per fd operation. The `_cap_check()` function is typically inlined by the compiler, and the rights comparison is a simple loop over the small rights array (two elements for version 00). The ioctl allowlist check requires a linear scan of the `fc_ioctls` array, which is typically small (dozens of entries at most). The `seqc` mechanism for atomic updates adds a small overhead but avoids locking. Overall, the performance impact is negligible for well-behaved capability-mode programs.
+```c
+bool __read_frequently trap_enotcap;
+SYSCTL_BOOL(_kern, OID_AUTO, trap_enotcap, CTLFLAG_RWTUN, &trap_enotcap, 0,
+    "Deliver SIGTRAP on ECAPMODE and ENOTCAPABLE");
+```
 
-**Common pitfalls**: A common mistake is to enter capability mode before limiting all file descriptors. Once `cap_enter()` is called, no new fds can be opened, so any fds that were not limited before entering mode will have unrestricted rights — potentially allowing operations that should have been restricted. Another pitfall is assuming that [`close(2)`](../../lib/libsys/close.2), [`dup(2)`](../../lib/libsys/dup.2), and `dup2(2)` require capability rights; these syscalls are explicitly exempt from rights checks because they operate on the fd table itself, not on the underlying resource. A third pitfall is forgetting that [`mmap(2)`](../../lib/libsys/mmap.2) and `aio*()` syscalls may require read or write rights depending on context — the kernel checks the operation context, not just the syscall name.
+Setting `kern.trap_enotcap` to 1 makes a capability failure raise `SIGTRAP` instead of just returning an error, which is invaluable when a program dies with `ENOTCAPABLE` and you need a stack trace showing exactly which call and which descriptor tripped it. For tracing the rights themselves, the kernel keeps the current mask in the descriptor's `fde_rights` field (see Key Data Structures), which a supervisor can inspect directly, and the `bitset_strprint()` / `bitset_strscan()` helpers in the capability code turn a mask into and from a human-readable string of right names. Under DTrace, the capability entry points are ordinary kernel functions, so a [probe](README_driver.md#glossary) on `sys_cap_enter` or on the `fget*()` family lets you watch a process enter the sandbox and watch each descriptor get tested.
 
-**Connection to OS theory**: Capsicum implements the capability model as described by Butler Lampson in "Protection" (1969) and adapted to Unix by Gary Kildall and others. The key insight is that authority is attached to resources (file descriptors) rather than to processes (credentials). In the traditional Unix model, a process has a single credential (uid, gid, groups) that applies to all operations; in the capability model, each resource has its own set of authorities. Capsicum bridges the gap by wrapping Unix fds with capability rights, allowing incremental adoption without replacing the entire credential model.
+**Performance.** The rights check is a single bitwise AND on a 128-bit value that is already resident in the descriptor the call is about to touch, so it adds essentially no cost to the common path; it is not a lock acquisition or a hash lookup. The capability-mode gate is a single flag test at the entry layer. The one place the cost is real is `ioctl`, where `cap_ioctl_check()` walks the `fc_ioctls` list rather than testing a bit — which is why `fc_ioctls` is a small, bounded array (`fc_nioctls` elements) and why the header caps it at `IOCTLS_MAX_COUNT` (256) in `sys/kern/sys_capability.c`.
 
-Capsicum is orthogonal to jails because jails operate at the process and network level, partitioning the system across multiple isolated environments using the traditional Unix credential model. A jail can contain many processes, each of which may or may not run in capability mode. Capsicum operates within a single process, providing fine-grained control over individual file descriptors. The two mechanisms compose naturally: a process in a jail can also run in capability mode, providing defense in depth.
+**Pitfalls.** The first trap is assuming rights are per-process. They are not: two descriptors that point at the same `struct file` (for example, after a [`dup(2)`](../../lib/libsys/dup.2)) each carry their own `fde_rights`, and limiting one does not limit the other. The second is forgetting that `close`, `dup`, and `dup2` do not require a capability at all — the header comment in `sys/sys/capsicum.h` calls this out explicitly, because a sandboxed process still needs to manage its descriptor table. The third is the `mmap` and AIO paths, which the same comment flags as needing special attention because whether they read or write depends on context; that is exactly why `CAP_MMAP_R`, `CAP_MMAP_W`, and `CAP_MMAP_X` exist as distinct rights rather than a single `CAP_MMAP`. Finally, because capability mode is one-way, a program that enters too early — before it has opened everything it will ever need — is stuck; the discipline is to do all global-namespace work first.
 
-Capsicum is distinct from MAC (Mandatory Access Control) because MAC operates on the credential and label model — the kernel checks labels on processes and resources against a policy. Capsicum operates on per-file-descriptor rights that are set by the process itself, not by an external policy. MAC is a system-wide policy enforcement mechanism; Capsicum is a per-process sandboxing mechanism. They can be used together: MAC can restrict which processes can enter capability mode or which resources can be opened, while Capsicum provides fine-grained control within the process.
+**Connection to OS theory.** Textbooks describe the access matrix and note that it can be sliced two ways: by columns into access lists attached to objects, or by rows into *capability lists* attached to a domain, where each entry names an object plus the operations permitted on it (Tanenbaum and Bos, *Modern Operating Systems*, §9.2.3; Silberschatz, Galvin and Gagne, *Operating System Concepts*, §14.5.3). Capsicum is the row-slicing idea applied to the Unix file descriptor: the descriptor is the capability token, `fde_rights` is the set of permitted operations, and the kernel's `cap_check()` is the lookup that verifies the token before the operation proceeds. The textbook concern that a capability must not be forgeable maps directly onto the monotonic rights mask — a process cannot synthesize a right it was never given, and `cap_rights_limit()` can only shrink the set. Where the textbook model and the implementation diverge is the second axis: the capability-mode gate is not part of the classic capability model at all; it is a separate, process-level restriction that says "this domain may only make these calls", layered on top of the per-token rights.
 
-**Historical context**: Capsicum was developed at the University of Cambridge Computer Laboratory starting in 2008, with support from Google. The design was influenced by the seccomp-bpf mechanism in Linux, but extends it by providing per-fd rights rather than just a syscall filter. The framework was integrated into FreeBSD 9.0 in 2012 and has been refined in subsequent releases. The capability rights encoding was designed to support future versions with more rights bits, using the top bits of the 64-bit values for version and length encoding.
+**Composition with jails and MAC.** Jails and Capsicum solve different problems and compose cleanly. A jail partitions the system — it gives a group of processes their own view of the network, the filesystem namespace, and the resource limits, using the traditional credential model. Capsicum sandboxes a single process by restricting what it can do with the specific descriptors it holds. A process can be inside a jail and in capability mode at the same time: the jail decides which global objects the process can even see, and Capsicum decides what it can do with the ones it has. MAC (Mandatory Access Control) is a third, orthogonal layer that reasons about labels and credentials across the system, enforced by policy modules; Capsicum, by contrast, is a self-imposed, per-descriptor restriction that the process sets on itself. The three can all be active on one process and each checks a different property.
 
 ## See Also
 - [Jails — OS-level Isolation](README_jail.md)
@@ -244,16 +194,9 @@ Capsicum is distinct from MAC (Mandatory Access Control) because MAC operates on
 
 
 
-- [`sys/kern/sys_capability.c`](sys_capability.c) — kernel implementation of capability mode and rights
-- [`sys/sys/capsicum.h`](../sys/capsicum.h) — capability bit definitions
-- [`sys/sys/caprights.h`](../sys/caprights.h) — rights array structure and version encoding
-- [`sys/sys/filedesc.h`](../sys/filedesc.h) — file descriptor table and filecaps structure
-- [`sys/kern/kern_descrip.c`](kern_descrip.c) — file descriptor management, including capability integration
-- [`lib/libsys/cap_enter.2`](../../lib/libsys/cap_enter.2) — userland documentation for [`cap_enter(2)`](../../lib/libsys/cap_enter.2), [`cap_rights_limit(2)`](../../lib/libsys/cap_rights_limit.2)
-- `README_jail.md` — jail isolation, for comparison with Capsicum
-- `security/mac/` — MAC framework, for comparison with Capsicum
-- [`sys/kern/README_capsicum.md`](README_capsicum.md) — additional kernel documentation
+- Source: [`sys/kern/sys_capability.c`](sys_capability.c) (mode and rights-management calls), [`sys/kern/kern_descrip.c`](kern_descrip.c) (the `fget*()` rights-aware family and `M_FILECAPS`), [`sys/sys/caprights.h`](../sys/caprights.h) (`cap_rights_t` and the `cap_*_rights` sets), [`sys/sys/capsicum.h`](../sys/capsicum.h) (the `CAP_*` macros and `cap_check_inline()`), [`sys/sys/filedesc.h`](../sys/filedesc.h) (`struct filecaps` and `struct filedescent`).
+- Man pages: [`cap_enter(2)`](../../lib/libsys/cap_enter.2), [`cap_rights_limit(2)`](../../lib/libsys/cap_rights_limit.2), [`cap_rights_init(3)`](../../lib/libc/capability/cap_rights_init.3), [`jail(8)`](../../usr.sbin/jail/jail.8).
 
 ---
 
-> _Generated by [DaemonDocs](https://github.com/ocochard/DaemonDocs) on 2026-05-03 18:23 UTC using model `Qwen3.6-35B-A3B-UD-Q8_K_XL` (llama.cpp build `b8985-27aef3dd9`). AI-generated content — verify against source before relying on it._
+> _Generated by [DaemonDocs](https://github.com/ocochard/DaemonDocs) on 2026-08-29 07:14 UTC using model `Qwen3.8-27B-Q8_0` (llama.cpp build `b10553-cd26896c1`). AI-generated content — verify against source before relying on it._

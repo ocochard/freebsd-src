@@ -5,247 +5,228 @@
 **Navigation:**
   **Up:** [Source Tree — Layout and Conventions](../README_internals.md)
   **Related:** [Source Tree — Layout and Conventions](../README_internals.md) | [Boot Process — UEFI Bootloader to Kernel Handoff](../stand/efi/loader/README.md) | [Process Management — Scheduling and Lifecycle](kern/README_process.md)
-  **All chapters:** [Source Tree — Layout and Conventions](../README_internals.md) | [Boot Process — UEFI Bootloader to Kernel Handoff](../stand/efi/loader/README.md) | [Build System — buildworld and buildkernel](../share/mk/README.md) | [Virtual Memory Subsystem — vm_page, UMA, and Pagers](vm/README.md) | [Process Management — Scheduling and Lifecycle](kern/README_process.md) | [Locking Primitives — Mutexes, sx, rmlocks, and Atomics](kern/README_locking.md) | [Buffer Cache — Block I/O Subsystem](vm/README_bcache.md) | [GEOM — Storage Framework](geom/README.md) ...
+  **All chapters:** [Source Tree — Layout and Conventions](../README_internals.md) | [Boot Process — UEFI Bootloader to Kernel Handoff](../stand/efi/loader/README.md) | [Build System — buildworld and buildkernel](../share/mk/README.md) | [System Calls and Image Activation — Entry, sysent, and exec](kern/README_syscall.md) | [Kernel Modules and the Linker — KLD, SYSINIT, and linker sets](kern/README_kld.md) | [Virtual Memory Subsystem — vm_page, UMA, and Pagers](vm/README.md) | [Process Management — Scheduling and Lifecycle](kern/README_process.md) | [Locking Primitives — Mutexes, sx, rmlocks, and Atomics](kern/README_locking.md) ...
 ---
 
 
 ## Quick Summary
 
-The FreeBSD kernel startup sequence bridges the gap between firmware execution and a fully operational userland environment. When the bootloader finishes, it transfers control to a small assembly stub that switches the CPU into long mode (on x86_64) or enables the MMU (on ARM64), establishes a trusted stack, and passes metadata pointers (such as the module list and memory layout) to the C entry point. From this moment, the kernel must initialize hardware abstractions, memory management, interrupt dispatch, and scheduling before any user process can run.
+The FreeBSD kernel owns the narrow window between the last instruction of the bootloader and the first userland process. The loader hands off a small set of pointers — the module list and the end of kernel memory — and drops control into an assembly stub. That stub must get the CPU into a [state](netpfil/pf/README.md#glossary) where C code can run: a known stack, a known address space, and (on the architectures that need it) the memory management unit turned on. Only once that is true can the kernel begin the long, ordered walk through its own subsystems.
 
-FreeBSD uses a strict, ordered initialization framework called `sysinit`. Every subsystem registers a startup function with a numeric level and an ordering value. The build system and linker script arrange these registrations into a contiguous linker set, which `mi_startup` iterates in order, guaranteeing that foundational services like the virtual memory system and interrupt controller are ready before higher-level components like network stacks or filesystems attempt to use them. This deterministic ordering prevents race conditions and dangling pointer dereferences during early boot.
+FreeBSD does not scatter that walk across hand-edited call chains. Instead it uses the `SYSINIT` framework: every subsystem registers a startup function together with a numeric *subsystem* level (`SI_SUB_*`) and an *order* value (`SI_ORDER_*`). The linker collects all of those registrations into one contiguous block of memory, and `mi_startup` (in `sys/kern/init_main.c`) sorts that block and calls each function in order. The result is a deterministic dependency order: virtual memory is initialized before the code that allocates from it, the interrupt controller before the code that registers interrupt handlers, and so on. A subsystem author only has to pick the right level and order; nobody has to maintain a global list of call sites.
 
-Once the `sysinit` loop completes, the kernel initializes the initial process (`proc0`), which represents the idle thread and the boot context. The final step of the startup sequence spawns the first userland process (`/sbin/init`), establishes its execution environment, and switches the CPU to user mode. The transition marks the end of kernel bootstrap and the beginning of normal system operation.
+The startup has two distinct phases. *Early boot* is the machine-specific, mostly single-threaded phase in which the CPU, memory, and interrupt machinery are brought up. *Userland bootstrap* is the final phase, in which the kernel finalizes the initial process, `proc0`, and then forks and executes `/sbin/init` to hand the machine to the operating system's userland. Everything up to `mi_startup` returning is kernel work; the moment `init` runs in user mode, normal system operation begins.
+
+This chapter traces that path from `_start`/`btext` through `cpu_startup` to the functions in `sys/kern/init_main.c`, explains how `SI_SUB` ordering works, and draws the line between the two phases.
+
+## Glossary
+
+**linker set** — a named, contiguous block of memory that the linker fills with identical records emitted by many compilation units; the kernel reads the block between `__start_set_*` and `__stop_set_*` symbols. It is how `SYSINIT` gathers hundreds of registrations without a hand-edited list.
+
+**`SI_SUB_*`** — the coarse subsystem level of a startup entry (e.g. `SI_SUB_CPU`, `SI_SUB_VM`, `SI_SUB_CONFIG`). Entries are sorted by this value first, which fixes the relative order of whole subsystems.
+
+**`SI_ORDER_*`** — the fine-grained tie-breaker used *within* a single `SI_SUB_*` level (e.g. `SI_ORDER_FIRST`, `SI_ORDER_MIDDLE`, `SI_ORDER_ANY`). It lets several functions in the same subsystem run in a defined sequence.
+
+**`proc0`** — the kernel's first and idle process, statically allocated in `sys/kern/init_main.c`. It has no user address space; it is the parent from which `/sbin/init` is forked.
+
+**`thread0`** — the kernel's first thread, statically stored in `thread0_st`. It runs `mi_startup` and carries the `TDP_NOFAULTING` flag until the VM subsystem is ready.
+
+**BSP** — the bootstrap processor, the single CPU that performs early boot before secondary CPUs are brought online.
+
+**MMU** — the memory-management unit; the hardware that translates virtual addresses to physical ones using page tables. It must be enabled before the kernel can use its own virtual address space.
+
+**GDT / IDT** — the Global Descriptor Table and Interrupt Descriptor Table; the per-CPU tables that define segment selectors and interrupt/exception entry points. Both must be built before C code on that CPU can run safely.
+
 
 ## Architecture
 
-Kernel entry points are architecture-specific and live in `sys/<arch>/<arch>/locore.S`. On x86_64, the symbol `btext` serves as the entry point. It validates CPU flags, switches to a kernel-controlled stack, and calls `hammer_time` (defined in `sys/amd64/amd64/machdep.c`), which prepares the architecture for C execution. `hammer_time` sets up the per-CPU data structures, enables the local APIC, and eventually calls `mi_startup` (defined in `sys/kern/init_main.c`), which iterates the sysinit framework.
+Kernel entry is architecture-specific and lives in `sys/<arch>/<arch>/locore.S`. The two most common paths are shown below; both converge on the same machine-independent function, `mi_startup`, defined in `sys/kern/init_main.c`.
+
+**x86_64.** The loader jumps to `btext`. The CPU is already in long mode on a 64-bit code segment, but the loader's stack and flags are not trusted. `btext` pushes `PSL_KERNEL` (a known-good program status word that sets the CPU into a safe kernel-mode state with interrupts disabled), moves onto the static `bootstack`, and then reads the two metadata pointers the loader left on the stack: `modulep` (the module list) and `kernend` (the end of kernel memory). It passes them to `hammer_time` (in `sys/amd64/amd64/machdep.c`), which performs the earliest C-level CPU setup — validating CPU features, building the GDT (Global Descriptor Table) and IDT (Interrupt Descriptor Table), and setting up per-CPU state. `hammer_time` returns a kernel stack address in `%rax`, which `btext` loads into `%rsp` before calling `mi_startup`. After `mi_startup` returns, the [BSP](#glossary) (bootstrap processor — the single CPU that performs early boot) parks in an `hlt`/`jmp` loop.
 
 ```asm
 # From sys/amd64/amd64/locore.S
 ENTRY(btext)
-    /* Don't trust what the loader gives for rflags. */
-    pushq   $PSL_KERNEL
-    popfq
-    /* Get onto a stack that we can trust - there is no going back now. */
-    movq    %rsp, %rbp
-    movq    $bootstack,%rsp
-    /* Grab metadata pointers from the loader. */
-    movl    4(%rbp),%edi    /* modulep (arg 1) */
-    movl    8(%rbp),%esi    /* kernend (arg 2) */
-    xorq    %rbp, %rbp
-    call    hammer_time     /* set up cpu for unix operation */
-    movq    %rax,%rsp       /* set up kstack for mi_startup() */
-    call    mi_startup      /* autoconfiguration, mountroot etc */
-0:  hlt
-    jmp     0b
+
+	/* Don't trust what the loader gives for rflags. */
+	pushq	$PSL_KERNEL
+	popfq
+
+	/* Get onto a stack that we can trust - there is no going back now. */
+	movq	%rsp, %rbp
+	movq	$bootstack,%rsp
+
+	/* Grab metadata pointers from the loader. */
+	movl	4(%rbp),%edi		/* modulep (arg 1) */
+	movl	8(%rbp),%esi		/* kernend (arg 2) */
+	xorq	%rbp, %rbp
+
+	call	hammer_time		/* set up cpu for unix operation */
+	movq	%rax,%rsp		/* set up kstack for mi_startup() */
+	call	mi_startup		/* autoconfiguration, mountroot etc */
+0:	hlt
+	jmp	0b
 ```
 
-On ARM64, the entry point is `_start` (defined in `sys/arm64/arm64/locore.S`), which follows a different flow. Rather than relying on a separate early CPU setup function, ARM64 performs substantial early setup directly in assembly: entering the kernel exception level, creating page tables, enabling the MMU, and setting up the bootstrap stack. The module pointer (originally in x0) is preserved in x1, and after zeroing the BSS section, the code calls `mi_startup()` directly. Unlike x86_64, where a large portion of CPU setup is delegated to C code for early CPU initialization, ARM64 handles these low-level operations in `locore.S` before transitioning to C code, keeping the assembly stub focused on getting the MMU and stack operational.
+**ARM64.** The entry point is `_start` (in `sys/arm64/arm64/locore.S`). ARM64 does the bulk of its early CPU work in assembly rather than delegating it to a C function like `hammer_time`. `_start` enters the kernel exception level, zeroes the context ID (a register that tags TLB entries to prevent stale translations from a previous kernel or hypervisor), computes the virtual-to-physical offset, builds the page tables, and enables the [MMU](#glossary). It then jumps to the virtual address of the kernel text and calls `mi_startup`. The reason for doing so much in assembly is that the MMU cannot be enabled from the physical address the kernel was loaded at — the code must first compute its own virtual mapping, switch to it, and only then is it safe to run the C startup.
 
 ```asm
 # From sys/arm64/arm64/locore.S
 ENTRY(_start)
-    /* Enter the kernel exception level */
-    bl  enter_kernel_el
-    /* Set the context id */
-    msr contextidr_el1, xzr
-    /* Get the virt -> phys offset */
-    bl  get_load_phys_addr
-    /* Create the page tables */
-    bl  create_pagetables
-    /* Enable the mmu */
-    bl  start_mmu
-    /* Jump to the virtual address space */
-    ldr x15, .Lvirtdone
-    br  x15
+	/* Enter the kernel exception level */
+	bl	enter_kernel_el
+
+	/* Set the context id */
+	msr	contextidr_el1, xzr
+
+	/* Get the virt -> phys offset */
+	bl	get_load_phys_addr
+
+	/* Create the page tables */
+	bl	create_pagetables
+
+	/* Enable the mmu */
+	bl	start_mmu
+
+	/* Jump to the virtual address space */
+	ldr	x15, .Lvirtdone
+	br	x15
 ```
 
-The `sysinit` framework relies on ELF linker sets to collect registration macros (`SYSINIT`) scattered across the source tree. The linker concatenates these entries into contiguous memory regions marked by `__start_set_sysinit` and `__stop_set_sysinit`. `mi_startup` iterates over this set, sorting entries by `si_sub` and `si_order` values at runtime using `sysinit_compar`, and invokes each function. The ordering guarantees that CPU-specific setup (`SI_SUB_CPU`) runs before virtual memory initialization (`SI_SUB_VM`), which in turn precedes interrupt handling (`SI_SUB_INTR`) and I/O subsystem setup (`SI_SUB_IO`).
+Once in C, both paths run the same sequence inside `mi_startup`: iterate the `sysinit` [linker set](#glossary), sort it, and call each entry. Architecture-specific initialization such as `cpu_startup` (amd64) is itself registered as a `SYSINIT` at `SI_SUB_CPU`, so it runs at the right point in the global order rather than at a hard-coded location. The tail of `mi_startup` is the userland bootstrap: after the `sysinit` loop, the kernel finalizes `proc0` and calls `create_init` (also in `sys/kern/init_main.c`), which forks a new process and `execve`s `/sbin/init`. That `execve` is the first time the image-activation code in `sys/kern/imgact_elf.c` runs for a real binary, and the first time control passes from kernel mode to user mode.
 
-The `struct sysinit` type, defined in `sys/sys/kernel.h`, is the core data structure of the framework:
+
+## Key Data Structures
+
+The central record of the framework is `struct sysinit`, defined in `sys/sys/kernel.h`. Each element is one startup function together with the two values that place it in the global order and the argument passed to it:
 
 ```c
 # From sys/sys/kernel.h
 struct sysinit {
-    sub_t           si_sub;           /* sub-id (level) */
-    order_t         si_order;         /* ordering value */
-    void            (*si_func)(void *); /* function pointer */
-    void            *si_arg;          /* function argument */
-    const char      *si_name;         /* name */
-    TAILQ_ENTRY(sysinit) si_list;     /* list of sysinit entries */
+	void	(*func)(void *);	/* function to call */
+	struct sysinit	*next;	/* next entry in the list */
+	u_int32_t	order;		/* order within subsystem */
+	u_int32_t	subsystem;	/* subsystem number */
+	void	*udata;		/* data for function */
 };
 ```
 
-Each `SYSINIT` macro invocation creates a `struct sysinit` entry placed in the linker set. The enumeration `enum sysinit_sub_id` in `sys/sys/kernel.h` defines the sub-id levels, with values chosen explicitly for binary compatibility rather than implicit ordering.
+The `func` pointer is what `mi_startup` calls; `udata` is the per-entry argument (often a pointer to a small descriptor). The `subsystem` and `order` fields are the two values the runtime sort keys on. A separate variant, `struct sysinit_tslog`, exists for entries that want a `tslog` timestamp; its fields are `func`, `*data`, and `*name`.
 
-## Key Data Structures
-
-### `struct sysinit`
-
-The `struct sysinit` is the fundamental unit of the initialization framework. Each subsystem registers one or more entries using the `SYSINIT` macro. The fields are:
-
-- `si_sub`: The sub-id level (e.g., `SI_SUB_CPU`, `SI_SUB_VM`, `SI_SUB_INTR`). These are defined in `sys/sys/kernel.h` as an enumeration `enum sysinit_sub_id`.
-- `si_order`: Within the same sub-id level, entries are sorted by this value. Lower values execute first.
-- `si_func`: A function pointer to the initialization routine, taking a `void *` argument.
-- `si_arg`: An argument passed to the function.
-- `si_name`: A human-readable name for debugging and tracing.
-- `si_list`: A `TAILQ_ENTRY` used to link sysinit entries into a doubly-linked list.
-
-The framework also includes `struct sysinit_tslog` for timestamping sysinit entries, which records `func`, `data`, and `name` fields for performance analysis.
-
-### `proc0` and `thread0_storage`
-
-The initial process and thread are statically allocated and never freed. In `sys/kern/init_main.c`:
+The coarse ordering level is `enum sysinit_sub_id`, also in `sys/sys/kernel.h`. The values are explicit and chosen only for ordering; `SI_SUB_LAST` is a sentinel that must sort after every real level.
 
 ```c
-# From sys/kern/init_main.c
-static struct session session0;
-static struct pgrp pgrp0;
-struct  proc proc0;
-struct thread0_storage thread0_st __aligned(32) = {
-    .t0st_thread = {
-        /*
-         * thread0.td_pflags is set with TDP_NOFAULTING to
-         * short-cut the vm page fault handler until it is
-         * ready.  It is cleared in vm_init() after VM
-         * initialization.
-         */
-        .td_pflag = TDP_NOFAULTING,
-    },
+# From sys/sys/kernel.h
+enum sysinit_sub_id {
+	SI_SUB_DUMMY		= 0x0000000,	/* not executed; placeholder */
+	SI_SUB_BOOT1,
+	SI_SUB_BOOT2,
+	SI_SUB_BOOT3,
+	SI_SUB_CPU,
+	SI_SUB_VM,
+	SI_SUB_INTR,
+	SI_SUB_IO,
+	SI_SUB_KMEM,
+	SI_SUB_LINKER,
+	SI_SUB_CONFIG,
+	SI_SUB_SOCKINIT,
+	SI_SUB_KLD,
+	SI_SUB_SMP,
+	SI_SUB_LAST		/* must have the highest lexical value */
 };
 ```
 
-The `thread0_st` structure is aligned to 32 bytes. The `TDP_NOFAULTING` flag is set initially to short-circuit the VM page fault handler until `vm_init()` clears it, preventing page faults during early initialization before the virtual memory system is fully operational.
+The fine-grained tie-breaker within a level is `enum sysinit_elem_order`. Its values are spaced with gaps so a subsystem author can insert a new ordering point between, say, `SI_ORDER_EARLY` and `SI_ORDER_MIDDLE` without renumbering the others — in the Device Drivers book's listing, `SI_ORDER_MIDDLE` is `0x1000000` and `SI_ORDER_ANY` is `0xfffffff`.
 
-### `enum sysinit_sub_id`
+```c
+# From sys/sys/kernel.h
+enum sysinit_elem_order {
+	SI_ORDER_FIRST,		/* First. */
+	SI_ORDER_EARLY,		/* Early. */
+	SI_ORDER_MIDDLE,		/* Somewhere in the middle. */
+	SI_ORDER_LATE,		/* Late. */
+	SI_ORDER_LAST,		/* Last but one. */
+	SI_ORDER_ANY		/* Last. */
+};
+```
 
-Defined in `sys/sys/kernel.h`, this enumeration specifies the initialization levels:
+Finally, the kernel's first process and [thread](kern/README_process.md#glossary) are not allocated dynamically — they are static objects in `sys/kern/init_main.c`. `struct thread0_storage` (in `sys/sys/proc.h`) holds the static thread plus room for the scheduler's per-thread state:
 
-- `SI_SUB_DUMMY` (0x0000000): Not executed; a placeholder.
-- `SI_SUB_CPU`: CPU-specific initialization.
-- `SI_SUB_VM`: Virtual memory system initialization.
-- `SI_SUB_INTR`: Interrupt handling setup.
-- `SI_SUB_IO`: I/O subsystem setup.
-- `SI_SUB_LAST`: Must have the highest value; marks the end of the enumeration.
+```c
+# From sys/sys/proc.h
+struct thread0_storage {
+	struct thread	t0st_thread;
+	char		t0st_sched[10];
+};
+```
 
-These values are explicit rather than implicit to provide binary compatibility with inserted elements. The numbers are chosen only for ordering purposes.
+`thread0_st` is the instance that runs `mi_startup`. Its `td_pflags` is set with `TDP_NOFAULTING` to short-circuit the VM page-fault handler until `vm_init()` clears it — a guard against faults on a VM subsystem that is not yet ready.
+
 
 ## Deep Dive
 
-### The Boot Sequence: From Firmware to Userland
+The `SYSINIT` macro is the entry point of the whole mechanism. Its signature, from `sys/sys/kernel.h`, is:
 
-The kernel startup sequence proceeds in distinct phases:
+```c
+# From sys/sys/kernel.h
+#define SYSINIT(uniquifier, subsystem, order, func, ident)	\
+```
 
-**Phase 1: Firmware to Assembly Entry**
+It emits a `struct sysinit` record into the `set_sysinit` linker set, with the stringified `uniquifier` naming the record. Because every subsystem uses the same macro, the linker is free to place the records in any order it likes; the dependency order is imposed later, at runtime, by the sort.
 
-The bootloader (UEFI loader on current platforms, or legacy boot loaders) loads the kernel into memory and transfers control. On x86_64, the entry point is `btext` in `sys/amd64/amd64/locore.S`. The loader provides the stack with metadata: a 32-bit return address at `0(%rsp)`, a module pointer at `4(%rsp)`, and `kernend` at `8(%rbp)`. The assembly code discards the loader's rflags, switches to a trusted stack (`bootstack`), and extracts these metadata pointers into registers.
+The heart of the framework is `mi_startup` in `sys/kern/init_main.c`. It does three things: it collects the raw linker-set elements into a working list, it sorts that list, and it dispatches each entry.
 
-On ARM64, `_start` in `sys/arm64/arm64/locore.S` receives the module pointer in x0. The code enters the kernel exception level, creates page tables with `create_pagetables`, enables the MMU with `start_mmu`, and jumps to the virtual address space. After setting up the bootstrap stack and zeroing the BSS section, it preserves the module pointer in x1 and prepares the boot parameters structure.
+First, the elements are gathered. The linker set is a flat array of `struct sysinit` records bounded by `__start_set_sysinit` and `__stop_set_sysinit`. `mi_startup` copies those records into a working array it can reorder, because the in-place linker-set region is read-only and its order is not the order the subsystems need.
 
-**Phase 2: Architecture-Specific C Initialization**
+Second, the list is sorted. The comparator is `sysinit_compar`, which orders records by `subsystem` first and `order` second. Because the `SI_SUB_*` values are explicit and `SI_SUB_LAST` is the maximum, a plain ascending sort produces the correct global dependency order. The sort is what turns a bag of registrations into a sequence — the linker only guarantees the records exist in one place, not that they are in any particular order. The cost is a one-time sort of a few hundred records at boot, which is negligible, and the benefit is that a subsystem author never has to reason about link order.
 
-On x86_64, `hammer_time` in `sys/amd64/amd64/machdep.c` performs the bulk of early CPU setup. It initializes per-CPU data structures, configures the local APIC, sets up interrupt vectors, and prepares the machine for C execution. The function returns a stack pointer in `%rax`, which becomes the stack for `mi_startup`.
+Third, each entry is dispatched. `mi_startup` walks the sorted list and calls `func(udata)` for each record, printing the entry when verbose [sysinit](../share/mk/README.md#glossary) output is enabled (`options VERBOSE_SYSINIT`). The architecture-specific `cpu_startup` is not called from `mi_startup` directly; it is registered as a `SYSINIT` at `SI_SUB_CPU`, so it executes in the global order at exactly the point where CPU-specific state must exist. On amd64, `cpu_startup` (in `sys/amd64/amd64/machdep.c`) finalizes per-CPU setup, brings up the local APIC, and starts the secondary CPUs (via `cpu_mp_start` in `sys/amd64/amd64/mp_machdep.c`) once the rest of the boot is ready to use them. Because it is a [sysinit](kern/README_kld.md#glossary), its ordering relative to `vm_init` (`SI_SUB_VM`) and the interrupt setup (`SI_SUB_INTR`) is enforced by the framework, not by a hand-edited call.
 
-On ARM64, most of this work happens in assembly before the C transition. The `machdep.c` file in `sys/arm64/arm64/` handles some early setup, but the bulk of MMU and page table work is done in `locore.S`.
+The tail of `mi_startup` is the userland bootstrap. After the `sysinit` loop, the kernel has a working scheduler, a working VM, and a working console, but no user process. `mi_startup` finalizes `proc0` (the idle process, statically allocated above) and then calls `create_init` (also in `sys/kern/init_main.c`), which forks a new process and `execve`s `/sbin/init`. That `execve` is the first time the image-activation code in `sys/kern/imgact_elf.c` runs for a real binary, and the first time control passes from kernel mode to user mode. From that point on, the kernel is a service provider and `init` is its first client.
 
-**Phase 3: The sysinit Loop**
-
-`mi_startup` in `sys/kern/init_main.c` is the heart of the initialization framework. It iterates over the linker set from `__start_set_sysinit` to `__stop_set_sysinit`, sorting entries by `si_sub` and `si_order` using `sysinit_compar` (also defined in `init_main.c`). For each entry, it calls the registered function with the provided argument.
-
-The ordering guarantees that:
-1. `SI_SUB_CPU` functions run first, initializing CPU-specific features.
-2. `SI_SUB_VM` functions run next, setting up the virtual memory system.
-3. `SI_SUB_INTR` functions configure interrupt handling.
-4. `SI_SUB_IO` functions initialize I/O subsystems.
-5. Higher-level subsystems (networking, filesystems, etc.) run in subsequent sub-id levels.
-
-This strict ordering eliminates the need for locks during early boot, as there are no concurrent execution contexts at that stage. Each subsystem must complete its initialization before any subsystem that depends on it can begin.
-
-**Phase 4: Process Creation**
-
-After the sysinit loop completes, `mi_startup` calls `create_init`, which initializes `proc0` and the initial thread. The `session0` and `pgrp0` structures, also statically allocated, form the session and process group for the initial process. `create_init` configures resource limits, sets up the initial execution context, and eventually forks a child process to execute `/sbin/init`.
-
-The transition to user mode involves setting up the userland execution environment: the stack, registers, and program counter are configured to point to the init executable. The CPU switches from kernel mode to user mode, marking the end of the bootstrap phase.
-
-### Architecture-Specific Differences
-
-The x86_64 and ARM64 boot paths differ significantly in how they handle early setup:
-
-**x86_64** delegates substantial CPU initialization to C code via `hammer_time`. This approach keeps the assembly stub minimal but requires the MMU to be enabled by the bootloader before jumping to `btext`. The `la57_trampoline` function (also in `locore.S`) handles the transition from 4-level to 5-level paging when LA57 is enabled.
-
-**ARM64** performs MMU setup, page table creation, and exception level transitions entirely in assembly. This is necessary because ARM64 starts in a lower exception level (EL2 or EL1) and must enter the kernel exception level (EL1 for normal operation) before the MMU can be safely enabled. The `enter_kernel_el`, `create_pagetables`, and `start_mmu` functions in `locore.S` handle these transitions.
 
 ## Flow / Diagram
 
 ```mermaid
 sequenceDiagram
-    participant UEFI as UEFI Firmware
-    participant Loader as UEFI Loader
-    participant Arch as Architecture Entry
-    participant Hammer as hammer_time (x86_64)
-    participant MiStartup as mi_startup
-    participant Sysinit as sysinit Framework
-    participant CPU as SI_SUB_CPU
-    participant VM as SI_SUB_VM
-    participant Intr as SI_SUB_INTR
-    participant IO as SI_SUB_IO
-    participant CreateInit as create_init
-    participant Init as /sbin/init
+    participant Loader
+    participant locore as locore.S
+    participant hammer as hammer_time
+    participant mi as mi_startup
+    participant set as sysinit linker set
+    participant cpu as cpu_startup
+    participant conf as configure
+    participant ci as create_init
+    participant user as init
 
-    UEFI->>Loader: Boot kernel
-    Loader->>Arch: Transfer control (btext/_start)
-    Arch->>Arch: Early CPU setup (stack, MMU, page tables)
-    alt x86_64
-        Arch->>Hammer: Call hammer_time
-        Hammer->>Hammer: Initialize APIC, per-CPU data
-        Hammer->>MiStartup: Call mi_startup
-    else ARM64
-        Arch->>MiStartup: Call mi_startup directly
-    end
-    MiStartup->>Sysinit: Iterate sysinit linker set
-    Sysinit->>CPU: Call SI_SUB_CPU functions
-    Sysinit->>VM: Call SI_SUB_VM functions
-    Sysinit->>Intr: Call SI_SUB_INTR functions
-    Sysinit->>IO: Call SI_SUB_IO functions
-    Sysinit-->>MiStartup: Loop complete
-    MiStartup->>CreateInit: Initialize proc0/thread0
-    CreateInit->>CreateInit: Set up session0, pgrp0
-    CreateInit->>Init: Fork and exec /sbin/init
-    Init-->>Arch: Switch to user mode
+    Loader->>locore: control + modulep, kernend (btext / _start)
+    locore->>locore: trusted stack; enable MMU (arm64)
+    locore->>hammer: hammer_time(modulep, kernend)
+    hammer-->>locore: kernel stack in %rax
+    locore->>mi: call mi_startup
+    mi->>set: gather __start_set_sysinit .. __stop_set_sysinit
+    mi->>mi: sort with sysinit_compar
+    mi->>cpu: dispatch SI_SUB_CPU
+    mi->>conf: dispatch SI_SUB_CONFIG
+    mi->>ci: after the sysinit loop
+    ci->>ci: fork + execve /sbin/init
+    ci->>user: first user-mode transition
+    user-->>Loader: system is up
 ```
 
 ## Advanced Notes
 
-### Debugging with Boot Trace
+**Debugging the order.** The `SI_SUB`/`SI_ORDER` values are the single most common source of boot regressions, and they are easy to mis-set. If a subsystem registers at too low a level, it runs before its dependencies exist and dereferences an uninitialized pointer; if too high, it may miss a window in which an earlier [hook](netgraph/README.md#glossary) expects it. The framework is single-threaded during early boot, so the failure is deterministic, not a race — a subsystem that is "sometimes" broken at boot is almost always an ordering bug, not a concurrency bug. Three tools expose the order. Build with `options VERBOSE_SYSINIT` to print each entry as it is dispatched. Use the `boottrace` facility (`sys/kern/kern_boottrace.c`) to capture a timestamped log of boot events, and `ktr` (`sys/sys/ktr.h`) to stamp specific transition points. In [DDB](kern/README_kdb.md#glossary), the `db_show_print_syinit` command dumps the sysinit state, which is useful for confirming whether a particular entry ran at all.
 
-FreeBSD includes a boot trace mechanism (`kern_boottrace.c`) that records sysinit events for performance analysis. The `boottrace()` function logs the start and end of each sysinit entry, providing timing data that can be dumped via DDB or the `boottrace` sysctl. The `bt_event` and `bt_table` structures in `sys/kern/kern_boottrace.c` store event records, while `boottrace_init()` initializes the trace buffer.
+**Why the sort is at runtime, not link time.** The linker set guarantees the records are collected in one contiguous region bounded by `__start_set_sysinit` and `__stop_set_sysinit`, but the order of that region is the order the linker happened to emit objects, which is not the order the subsystems need. `sysinit_compar` plus a sort in `mi_startup` is what imposes the real dependency order. The cost is a one-time sort of a few hundred records at boot, which is negligible, and the benefit is that a subsystem author only needs to pick the right `subsystem`/`order` and never has to reason about link order. This is the same idea as ELF constructors: registration at link time, ordering at run time.
 
-DTrace Static Tracing (SDT) probes are available during kernel startup for performance analysis. The `sys/sys/dtrace_bsd.h` header provides the `DTRACE_PROBE` macros used throughout the kernel, including in `init_main.c`. During `mi_startup`, SDT probes can fire at key points such as sysinit entry and exit, allowing precise measurement of initialization times.
+**Early boot vs. userland bootstrap.** The line is the `execve` in `create_init`. Before it, there is no `struct vmspace` (the per-process virtual address space descriptor) for a user process, no file descriptors, no user address space — only `proc0` and its statically allocated `thread0_st`, whose `TDP_NOFAULTING` flag keeps the fault handler out of the way until `vm_init()` clears it. After it, the kernel's job changes from "build the machine" to "service requests." A useful mental model: the `sysinit` loop is the kernel's constructor, and `create_init` is the point at which the constructor hands the object to the first client.
 
-### Performance Considerations
+**Textbook connection.** Tanenbaum and Bos describe kernel initialization in three stages: a machine-specific stage in assembly (get onto a stack, enable the MMU), a machine-specific stage in C (set up the CPU, memory, and devices), and a machine-independent stage that builds the process environment and starts userland. FreeBSD maps onto that model directly: `locore.S` is the first stage, `hammer_time`/`cpu_startup` are the second, and `mi_startup`'s `sysinit` loop plus `create_init` are the third. The `SYSINIT` framework is FreeBSD's answer to the question "how do you order hundreds of independent subsystems without a single point of failure in the call graph" — the answer is a data-driven, link-time-registered, run-time-sorted list.
 
-The sysinit framework's sorting step adds overhead during boot. `sysinit_compar` performs a comparison-based sort on the linker set entries at runtime. For systems with many subsystems, this sort can be noticeable. The `opt_verbose_sysinit.h` option enables verbose output during boot, printing each sysinit entry as it executes, which is useful for identifying slow initialization functions.
 
-The `sysinit_mklist` and `sysinit_add` functions in `init_main.c` provide mechanisms for dynamically adding sysinit entries at runtime, which is used by kernel modules. Modules that load after the initial boot can register their own initialization functions, which are appended to the sysinit framework.
-
-### Common Pitfalls
-
-1. **Ordering dependencies**: If a subsystem registers a sysinit entry with an incorrect sub-id or order value, it may execute before its dependencies are ready. For example, registering a network subsystem at `SI_SUB_CPU` instead of a higher level will cause failures if the network code depends on the virtual memory system.
-
-2. **Missing sysinit entries**: If a subsystem's initialization function is not registered via `SYSINIT`, it will not be called during boot. This can lead to subtle bugs where the subsystem appears to work in some configurations but fails in others.
-
-3. **Thread0 page fault flag**: The `TDP_NOFAULTING` flag on `thread0` must be cleared by `vm_init()` after virtual memory initialization. If this flag is not cleared, page faults in the initial thread will be silently ignored, leading to silent data corruption or kernel panics later.
-
-4. **Linker set boundaries**: The `__start_set_sysinit` and `__stop_set_sysinit` symbols must be correctly defined in the linker script. If the linker set is not contiguous, `mi_startup` may read garbage entries or miss valid ones.
-
-5. **ARM64 exception level transitions**: On ARM64, incorrect exception level transitions in `locore.S` can lead to kernel panics that are difficult to debug, as the CPU may be in an unexpected state. The `enter_kernel_el` function must correctly configure the exception level and security state.
-
-### Connection to OS Theory
-
-The sysinit framework embodies the principle of layered initialization, a concept found in many operating systems. Unlike monolithic kernels that initialize everything in a single function, FreeBSD's approach allows subsystems to be developed, tested, and reordered independently. The explicit ordering values (sub-id and order) provide a form of dependency management that is simpler than the dependency graphs used in some systems but sufficient for the boot-time phase where concurrency is absent.
-
-The use of linker sets (ELF sections) for collecting initialization entries is a technique shared with Linux's `initcall` mechanism and NetBSD's `init` framework. FreeBSD's implementation is notable for its runtime sorting, which allows new entries to be inserted without requiring recompilation of the entire kernel.
+- Man pages: [`SYSINIT(9)`](../share/man/man9/SYSINIT.9), `proc(9)`, `thread(9)`, [`kenv(2)`](../lib/libsys/kenv.2)
+- Source: `sys/kern/init_main.c`, `sys/sys/kernel.h`, `sys/sys/linker_set.h`, `sys/kern/kern_boottrace.c`, `sys/kern/kern_conf.c`, `sys/amd64/amd64/locore.S`, `sys/amd64/amd64/machdep.c`, `sys/arm64/arm64/locore.S`
 
 ## See Also
 - [Source Tree — Layout and Conventions](../README_internals.md)
@@ -254,12 +235,6 @@ The use of linker sets (ELF sections) for collecting initialization entries is a
 
 
 
-- [`sys/kern/init_main.c`](kern/init_main.c): The main file containing `mi_startup`, `create_init`, and the sysinit framework implementation.
-- [`sys/amd64/amd64/locore.S`](amd64/amd64/locore.S): x86_64 assembly entry point (`btext`) and `hammer_time` call.
-- [`sys/arm64/arm64/locore.S`](arm64/arm64/locore.S): ARM64 assembly entry point (`_start`) with MMU setup.
-- [`sys/sys/kernel.h`](sys/kernel.h): Definition of `struct sysinit`, `enum sysinit_sub_id`, and the `SYSINIT` macro.
-- [`sys/kern/kern_boottrace.c`](kern/kern_boottrace.c): Boot trace infrastructure for performance analysis.
-
 ---
 
-> _Generated by [DaemonDocs](https://github.com/ocochard/DaemonDocs) on 2026-05-03 22:07 UTC using model `Qwen3.6-35B-A3B-UD-Q8_K_XL` (llama.cpp build `b8985-27aef3dd9`). AI-generated content — verify against source before relying on it._
+> _Generated by [DaemonDocs](https://github.com/ocochard/DaemonDocs) on 2026-09-03 08:29 UTC using model `Qwen3.8-27B-Q8_0` (llama.cpp build `b10553-cd26896c1`). AI-generated content — verify against source before relying on it._

@@ -5,32 +5,65 @@
 **Navigation:**
   **Up:** [Kernel Core — Structure and Entry Point](../README.md) ▸ [Source Tree — Layout and Conventions](../../README_internals.md)
   **Related:** [Process Management — Scheduling and Lifecycle](README_process.md) | [Locking Primitives — Mutexes, sx, rmlocks, and Atomics](README_locking.md) | [Device Driver Framework — newbus and devclass](README_driver.md)
-  **All chapters:** [Source Tree — Layout and Conventions](../../README_internals.md) | [Boot Process — UEFI Bootloader to Kernel Handoff](../../stand/efi/loader/README.md) | [Kernel Core — Structure and Entry Point](../README.md) | [Build System — buildworld and buildkernel](../../share/mk/README.md) | [Virtual Memory Subsystem — vm_page, UMA, and Pagers](../vm/README.md) | [Process Management — Scheduling and Lifecycle](README_process.md) | [Locking Primitives — Mutexes, sx, rmlocks, and Atomics](README_locking.md) | [Buffer Cache — Block I/O Subsystem](../vm/README_bcache.md) ...
+  **All chapters:** [Source Tree — Layout and Conventions](../../README_internals.md) | [Boot Process — UEFI Bootloader to Kernel Handoff](../../stand/efi/loader/README.md) | [Kernel Core — Structure and Entry Point](../README.md) | [Build System — buildworld and buildkernel](../../share/mk/README.md) | [System Calls and Image Activation — Entry, sysent, and exec](README_syscall.md) | [Kernel Modules and the Linker — KLD, SYSINIT, and linker sets](README_kld.md) | [Virtual Memory Subsystem — vm_page, UMA, and Pagers](../vm/README.md) | [Process Management — Scheduling and Lifecycle](README_process.md) ...
 ---
 
 
 ## Quick Summary
 
-When a hardware device asserts an interrupt line, the CPU must respond quickly to acknowledge the event and defer potentially expensive processing. FreeBSD implements a two-tier interrupt model that separates the immediate, minimal work from the full device driver callback. The first tier — the filter handler — runs in interrupt context with interrupts disabled, performs just enough work to determine whether the device actually needs attention, and returns `FILTER_STRAY` if nothing needs doing or `FILTER_HANDLED` if it does. The second tier — the action handler — runs in a dedicated kernel thread context, where it can safely sleep, lock, and perform the full I/O processing without holding up other interrupts.
+An interrupt is the hardware's way of interrupting the CPU to say "something finished" or "something needs attention." Because a CPU is orders of magnitude faster than the devices it drives, the kernel cannot afford to sit in a loop polling each device. Instead, the device raises a signal, the interrupt controller routes it to a CPU, and that CPU jumps into a small piece of kernel code. The operating-system textbooks frame this around three hardware requirements: a way to defer handling during critical sections, a fast dispatch to the right handler without polling every device, and a priority mechanism so urgent work preempts non-urgent work. FreeBSD meets all three, but it adds a layer on top that the textbook diagram hides: the split between a *filter* that runs in raw interrupt context and an *action* (the "ithread") that runs in a normal kernel [thread](README_process.md#glossary).
 
-This threaded interrupt model, called the "ithread framework," was introduced to address a fundamental problem: traditional BSD interrupt handlers ran entirely in interrupt context, which meant that slow device drivers could starve the system of CPU time during interrupt storms. By moving the bulk of interrupt processing into kernel threads, FreeBSD achieves better latency for high-priority interrupts while still providing full driver functionality. Each interrupt event — a unique hardware interrupt source identified by its vector on x86 or its IRQ number on ARM64 — gets its own ithread that runs on a designated CPU.
+The reason for that split is an engineering trade-off. Acknowledging an interrupt — reading a status register, clearing a bit, re-enabling the line — must happen quickly and cannot sleep, so it runs in a tight filter function. But the actual work, such as walking a network receive ring or copying a block of disk data, is slow and may need to sleep on memory or locks. If that slow work ran in interrupt context it would hold the interrupt line closed and starve every other device. FreeBSD therefore defers the slow part to a dedicated kernel thread, one per interrupt source, that sleeps until the filter wakes it. The filter does the few-microsecond critical part; the thread does everything else.
 
-In an SMP system, FreeBSD supports interrupt affinity, allowing administrators to pin specific interrupt events to specific CPUs. This is critical for NUMA systems where memory access latency varies by CPU, and for high-performance networking where keeping interrupt processing and the corresponding network queues on the same CPU reduces cache misses. The framework also includes interrupt storm protection, which automatically disables level-triggered interrupts when they fire too rapidly, preventing a single misbehaving device from locking up the entire system.
+The glue is the `struct intr_event` framework in `sys/kern/kern_intr.c`. Each hardware or software interrupt source is represented by one `struct intr_event`, which owns an ordered list of `struct intr_handler` records (each pairing a filter and an action) plus a small set of machine-dependent hooks. Those hooks — `pre_ithread`, `post_ithread`, `post_filter`, and `assign_cpu` — let the same machine-independent dispatch code talk to a legacy 8259 PIC, an I/O APIC (Advanced Programmable Interrupt Controller, in its I/O form; each CPU also has a local APIC), an MSI (Message-Signaled Interrupt), or an ARM GIC without knowing the details of any of them. The controller-specific driver fills in the hooks; the framework calls them at the right moments.
+
+On a multi-processor machine the framework also decides *which* CPU handles an interrupt. The `assign_cpu` [hook](../netgraph/README.md#glossary), combined with per-source CPU assignment and an optional auto-balancer, lets FreeBSD pin a device's interrupts to one core for cache locality, spread them across cores for throughput, or migrate them when load shifts. The result is a single, portable interrupt model: hardware raises a line, the controller delivers a vector or INTID, `intr_event_handle` runs the filters, and — only when the filter asks for it — a kernel thread picks up the heavy lifting.
 
 ## Architecture
 
-The interrupt framework spans three architectural layers: the machine-dependent interrupt controller code, the common ithread dispatch framework, and the device driver registration API. On x86, the machine-dependent layer lives in `sys/x86/x86/intr_machdep.c` and handles the Interrupt Descriptor Table (IDT), the 8259A PIC, the I/O APIC, and MSI/MSI-X support. On ARM64, the equivalent code lives in `sys/arm64/arm64/gic_v3.c` and implements the Generic Interrupt Controller (GIC) v3 interface, including SPI (Shared Peripheral Interrupts), PPI (Private Peripheral Interrupts), and SGI (Software Generated Interrupts) routing.
+The machine-independent core lives in `sys/kern/kern_intr.c`, with the public API declared in `sys/sys/interrupt.h` and documented in [`intr_event(9)`](../../share/man/man9/intr_event.9). The machine-dependent half is split per architecture: `sys/x86/x86/intr_machdep.c` (with the `struct pic` and `struct intsrc` types in `sys/x86/include/intr_machdep.h`) for x86, and `sys/arm64/arm64/gic_v3.c` (with `sys/arm64/include/intr.h`) for ARM64. The two meet at exactly one boundary: a controller driver implements a small set of `pic_*` methods and the four `struct intr_event` hooks, and the framework in `kern_intr.c` drives them.
 
-The common framework in `sys/kern/kern_intr.c` manages `struct intr_event` objects, each representing a unique interrupt source. When an interrupt fires, the machine-dependent code looks up the corresponding `intr_event` and invokes the filter handlers in sequence. If any filter returns `FILTER_HANDLED`, the framework schedules the ithread for that event, which in turn runs all registered action handlers. The ithread is a kernel thread created during boot, with one thread per interrupt event, managed by the `struct intr_thread` structure.
+**x86 path.** The CPU's IDT (Interrupt Descriptor Table) holds one entry per interrupt vector. The first 16 ISA IRQs get fixed vectors; every other device interrupt — I/O APIC pins, MSI, MSI-X — allocates an IDT vector on demand. The header comment in `sys/x86/include/intr_machdep.h` documents the layout:
 
-Interrupt registration happens through the `BUS_SETUP_INTR` function, which is implemented by each bus subsystem (PCI, FDT, ACPI). Drivers call `BUS_SETUP_INTR` with a filter function, an action function, and an argument pointer. The bus code creates an `intr_event` if one does not already exist for that interrupt source, then adds a new `intr_handler` to the event's handler list. The `intr_handler` structure contains function pointers to both the filter and action handlers, along with a priority field that determines execution order.
+```c
+/*
+ * The first 16 IRQs (0 - 15) are reserved for ISA IRQs.  Interrupt
+ * pins on I/O APICs for non-ISA interrupts use IRQ values starting at
+ * IRQ 17.  This layout matches the GSI numbering used by ACPI so that
+ * IRQ values returned by ACPI methods such as _CRS can be used
+ * directly by the ACPI bus driver.
+ *
+ * MSI interrupts allocate a block of interrupts starting at the end
+ * of the I/O APIC range.
+ */
+```
 
-On x86, interrupt sources are indexed by vector in the `interrupt_sources` array defined in `sys/x86/x86/intr_machdep.c`. The `intsrc` structure (interrupt source) describes which PIC the source belongs to and includes methods to mask, unmask, and acknowledge that source. The `pics` TAILQ maintains a list of all registered PICs (8259A, I/O APIC, etc.), and the `intrpic_lock` mutex protects modifications to this list. On ARM64, the GIC provides its own mapping between IRQ numbers and interrupt handlers through the `gic_map_intr` and `gic_setup_intr` callbacks.
+When a vector fires, the assembly entry builds a `struct trapframe`, looks up the `struct intsrc` for that vector via `intr_lookup_source()` (in `sys/x86/x86/intr_machdep.c`), and calls `intr_event_handle()` on the associated event. The `intsrc` knows which `struct pic` owns it, so the EOI (End of Interrupt) and enable/disable operations dispatch to the right controller — 8259, I/O APIC, or MSI.
+
+**ARM64 path.** ARM64 uses the GIC (Generic Interrupt Controller). The vector handler `arm_gic_v3_intr()` (in `sys/arm64/arm64/gic_v3.c`) reads the GIC's IAR (interrupt acknowledge register) to learn the INTID (Interrupt ID), maps that INTID to a `struct gic_v3_irqsrc`, and calls `intr_event_handle()`. The GIC v3 driver registers the same four hooks as x86: `gic_v3_pre_ithread`, `gic_v3_post_ithread`, `gic_v3_post_filter`, and a CPU-assignment hook. `sys/arm64/include/intr.h` defines the interrupt space: `NIRQ` (16384) and the two root vectors `INTR_ROOT_IRQ` (0) and `INTR_ROOT_FIQ` (1). For newer GICv5 and for LPIs (locality-specific peripheral interrupts, the GIC's answer to MSI), the ITS (interrupt translation service) driver `sys/arm64/arm64/gicv3_its.c` builds command queues and translation tables so a device can target a specific CPU directly.
+
+**The registration path.** A driver never touches the IDT or the GIC directly. It calls `bus_setup_intr()` (declared in `sys/sys/bus.h`, documented in `bus_setup_intr(9)`):
+
+```c
+int
+bus_setup_intr(device_t dev, struct resource *r, int flags,
+    driver_filter_t filter, driver_intr_t ithread, void *arg,
+    void **cookiep);
+```
+
+The bus method routes that to the controller's `pic_setup_intr`, which calls `intr_event_create()` to allocate the event (if not already present) and `intr_event_add_handler()` to append the filter/action pair. `bus_teardown_intr()` removes the handler and, when the last handler leaves, destroys the event.
 
 ## Key Data Structures
 
+The handler record is the unit a driver registers. It is defined in `sys/sys/interrupt.h`:
+
 ```c
-/* From sys/sys/interrupt.h */
+/*
+ * Describe a hardware interrupt handler.
+ *
+ * Multiple interrupt handlers for a specific event can be chained
+ * together.
+ */
 struct intr_handler {
 	driver_filter_t	*ih_filter;	/* Filter handler function. */
 	driver_intr_t	*ih_handler;	/* Threaded handler function. */
@@ -44,10 +77,26 @@ struct intr_handler {
 };
 ```
 
-The `intr_handler` structure describes a single interrupt handler entry. The `ih_filter` and `ih_handler` function pointers distinguish between the two execution tiers. The `ih_argument` pointer is passed to both functions when they are invoked. The `ih_flags` field contains per-handler configuration, including `IH_NET` for network devices (which receive special scheduling treatment), `IH_EXCLUSIVE` for devices that should not share their interrupt line, `IH_ENTROPY` to mark the device as a good entropy source for the random number generator, and `IH_MPSAFE` indicating the handler does not require the Giant mutex.
+Both `ih_filter` and `ih_handler` are optional; a handler may supply either or both. The handler list is a `CK_SLIST` (a lock-free singly-linked list from `sys/ck.h`) ordered by `ih_pri`, so the highest-priority filter runs first. The flags are:
 
 ```c
-/* From sys/sys/interrupt.h */
+#define	IH_NET		0x00000001	/* Network. */
+#define	IH_EXCLUSIVE	0x00000002	/* Exclusive interrupt. */
+#define	IH_ENTROPY	0x00000004	/* Device is a good entropy source. */
+#define	IH_DEAD		0x00000008	/* Handler should be removed. */
+#define	IH_SUSP		0x00000010	/* Device is powered down. */
+#define	IH_CHANGED	0x40000000	/* Handler state is changed. */
+#define	IH_MPSAFE	0x80000000	/* Handler does not need Giant. */
+```
+
+`IH_MPSAFE` matters on SMP (Symmetric Multi-Processing): a handler that is not marked `IH_MPSAFE` runs with the [Giant](README_locking.md#glossary) lock held — Giant is FreeBSD's coarse kernel-wide lock, held to protect code not yet made SMP-safe — which serializes it against a large part of the kernel. Marking a handler `IH_MPSAFE` (the default for most new drivers) lets it run without Giant.
+
+The interrupt thread is the kernel thread that runs the slow action. There is one per event, defined at the top of `sys/kern/kern_intr.c`:
+
+```c
+/*
+ * Describe an interrupt thread.  There is one of these per interrupt event.
+ */
 struct intr_thread {
 	struct intr_event *it_event;
 	struct thread *it_thread;	/* Kernel thread. */
@@ -55,172 +104,141 @@ struct intr_thread {
 	int	it_need;		/* Needs service. */
 	int	it_waiting;		/* Waiting in the runq. */
 };
+
+/* Interrupt thread flags kept in it_flags */
+#define	IT_DEAD		0x000001	/* Thread is waiting to exit. */
+#define	IT_WAIT		0x000002	/* Thread is waiting for completion. */
 ```
 
-The `intr_thread` structure describes the kernel thread responsible for servicing a given interrupt event. The `it_thread` field points to the actual `struct thread` representing the kernel thread. The `it_need` field is set by the filter path when an interrupt requires action handler execution, and `it_waiting` indicates whether the thread is currently queued in the run queue. The `IT_DEAD` flag signals that the thread is waiting to exit, and `IT_WAIT` indicates the thread is blocking on a completion event.
+The `it_need` and `it_waiting` pair is the coalescing mechanism: when a filter finds work, it sets `it_need` and wakes the thread; if the thread is already running, a second interrupt just leaves `it_need` set, so the thread drains the backlog on its next pass rather than spawning a second thread.
+
+The event itself is the per-source container. Its full definition sits in `sys/sys/interrupt.h`, behind a long comment that documents the machine-dependent hooks. A level-triggered source stays asserted as long as the device's status bit is set, so it will re-fire until the filter clears that bit — unlike an edge-triggered source that fires once per transition. That comment is the contract the controller drivers implement:
 
 ```c
-/* From sys/x86/x86/intr_machdep.c */
-static struct intsrc **interrupt_sources;
-static TAILQ_HEAD(pics_head, pic) pics;
-u_long *intrcnt;
-char *intrnames;
-int nintrcnt;
+/*
+ * Describe an interrupt event.  An event holds a list of handlers.
+ * The 'pre_ithread', 'post_ithread', 'post_filter', and 'assign_cpu'
+ * hooks are used to invoke MD code for certain operations.
+ *
+ * The 'pre_ithread' hook is called when an interrupt thread for
+ * handlers without filters is scheduled.  It is responsible for
+ * ensuring that 1) the system won't be swamped with an interrupt
+ * storm from the associated source while the ithread runs and 2) the
+ * current CPU is able to receive interrupts from other interrupt
+ * sources.  The first is usually accomplished by disabling
+ * level-triggered interrupts until the ithread completes.  The second
+ * is accomplished on some platforms by acknowledging the interrupt
+ * via an EOI.
+ *
+ * The 'post_ithread' hook is invoked when an ithread finishes.  It is
+ * responsible for ensuring that the associated interrupt source will
+ * trigger an interrupt when it is asserted in the future.  Usually
+ * this is implemented by enabling a level-triggered interrupt that
+ * was previously disabled via the 'pre_ithread' hook.
+ *
+ * The 'post_filter' hook is invoked when a filter handles an
+ * interrupt.  It is responsible for ensuring that the current CPU is
+ * able to receive interrupts again.  On some platforms this is done
+ * by acknowledging the interrupts via an EOI.
+ */
 ```
 
-On x86, `interrupt_sources` is an array indexed by interrupt vector, pointing to `struct intsrc` objects that describe each interrupt source. The `pics` TAILQ maintains the list of all PICs (Programmable Interrupt Controllers) registered in the system. The `intrcnt` array holds per-source interrupt counters for statistics, and `intrnames` holds the human-readable names for each source. The `nintrcnt` variable tracks the total number of interrupt sources.
+The event's fields (per the header and the `intr_event_create()` signature) include the handler list head `ie_list`, the event lock `ie_lock`, the machine-dependent source pointer, the IRQ number, a priority, the thread count, and the four hook function pointers. The four hooks are the entire surface the controller must implement: `pre_ithread` (disable level-triggered source / EOI before the thread runs), `post_ithread` (re-enable it after), `post_filter` (EOI after a filter-only interrupt), and `assign_cpu` (pick the CPU that will own the source).
+
+On x86 the controller side is described by `struct pic` in `sys/x86/include/intr_machdep.h`, a table of function pointers the framework calls:
+
+```c
+struct pic {
+	void (*pic_register_sources)(struct pic *);
+	void (*pic_enable_source)(struct intsrc *);
+	void (*pic_disable_source)(struct intsrc *, int);
+	void (*pic_eoi_source)(struct intsrc *);
+	void (*pic_enable_intr)(struct intsrc *);
+	void (*pic_disable_intr)(struct intsrc *);
+	int (*pic_vector)(struct intsrc *);
+	int (*pic_source_pending)(struct intsrc *);
+	void (*pic_suspend)(struct pic *);
+	void (*pic_resume)(struct pic *, bool suspend_cancelled);
+	int (*pic_config_intr)(struct intsrc *, enum intr_trigger,
+	    enum intr_polarity);
+	int (*pic_assign_cpu)(struct intsrc *, u_int apic_id);
+	void (*pic_reprogram_pin)(struct intsrc *);
+	TAILQ_ENTRY(pic) pics;
+};
+```
+
+Each concrete controller — the 8259 (`atpic`), the I/O APIC (`io_apic.c`), and MSI (`msi.c`) — fills in one of these. The `pic_assign_cpu` method is what makes x86 SMP routing possible: it programs the I/O APIC redirection entry (or the MSI message) so the source targets a specific APIC ID.
 
 ## Deep Dive
 
-### Interrupt Registration Flow
-
-When a device driver probes its hardware and discovers an interrupt line, it calls `BUS_SETUP_INTR` to register its handlers. On x86, this function is implemented in `sys/x86/x86/intr_machdep.c`. The flow begins with the bus code looking up or creating an `intr_event` for the given interrupt vector. If the event does not exist, `intr_event_create` is called to allocate and initialize it.
+**Registration.** When a driver's `attach` routine calls `bus_setup_intr()`, the bus dispatches to the controller's `pic_setup_intr`. That function calls `intr_event_create()` to obtain the event for the IRQ (creating it the first time) and then `intr_event_add_handler()` to append the filter/action pair. The signatures, from [`intr_event(9)`](../../share/man/man9/intr_event.9), are:
 
 ```c
-/* From sys/kern/kern_intr.c */
-struct intr_event *clk_intr_event;
-struct proc *intrproc;
+int
+intr_event_create(struct intr_event **event, void *source, int flags,
+    int irq, void (*pre_ithread)(void *), void (*post_ithread)(void *),
+    void (*post_filter)(void *), int (*assign_cpu)(void *, int),
+    const char *fmt, ...);
 
-static MALLOC_DEFINE(M_ITHREAD, "ithread", "Interrupt Threads");
+int
+intr_event_add_handler(struct intr_event *ie, const char *name,
+    driver_filter_t filter, driver_intr_t handler, void *arg, u_char pri,
+    enum intr_type flags, void **cookiep);
 ```
 
-The `clk_intr_event` global points to the system clock interrupt event, which is created early during boot. The `intrproc` variable references the process context used for ithread management. The `M_ITHREAD` malloc type is used to allocate `intr_thread` structures.
+`intr_event_create()` stores the source pointer, the IRQ, and the four hooks, and inserts the new event into a global `event_list` protected by `event_lock`. `intr_event_add_handler()` allocates a `struct intr_handler`, copies in the filter, action, argument, priority, and flags, and splices it into the event's `CK_SLIST` in priority order. If the handler supplies an action (and the event has no thread yet), a kernel thread is created and parked in `ithread_loop()`. The `cookiep` out-parameter returns an opaque handle the driver later passes to `intr_event_remove_handler()`.
 
-Once the `intr_event` exists, `BUS_SETUP_INTR` allocates a new `intr_handler` structure and adds it to the event's handler list. The handler's priority (`ih_pri`) determines the order in which handlers are invoked during filter and action execution. Higher priority handlers run first. The filter handler is called first with interrupts disabled; if it returns `FILTER_HANDLED`, the action handler will be scheduled for execution in the ithread context.
-
-### The ithread Scheduling Path
-
-When a filter returns `FILTER_HANDLED`, the framework must schedule the corresponding ithread. This happens in `intr_event_schedule_thread` in `sys/kern/kern_intr.c`. The function checks whether the ithread is already running or waiting; if not, it sets the `it_need` flag and wakes the thread.
+**Dispatch.** When the hardware fires, the architecture entry (`arm_gic_v3_intr()` on ARM64, the IDT vector stub on x86) resolves the source to an event and calls:
 
 ```c
-/* From sys/kern/kern_intr.c */
-static int intr_storm_threshold = 0;
-SYSCTL_INT(_hw, OID_AUTO, intr_storm_threshold, CTLFLAG_RWTUN,
-    &intr_storm_threshold, 0,
-    "Number of consecutive interrupts before storm protection is enabled");
-static int intr_epoch_batch = 1000;
-SYSCTL_INT(_hw, OID_AUTO, intr_epoch_batch, CTLFLAG_RWTUN, &intr_epoch_batch,
-    0, "Maximum interrupt handler executions without re-entering epoch(9)");
+int
+intr_event_handle(struct intr_event *ie, struct trapframe *frame);
 ```
 
-The `intr_storm_threshold` sysctl controls interrupt storm protection. When set to a non-zero value, the framework tracks consecutive interrupts on the same event. If the count exceeds the threshold, the interrupt source is temporarily disabled to prevent system lockup. The `intr_epoch_batch` sysctl controls how many times the [epoch(9)](../../share/man/man9/epoch.9) mechanism can be re-entered before the framework yields, preventing long-running interrupt handlers from starving other work.
+`intr_event_handle()` walks the event's handler list. For each handler that has a filter, it calls the handler's filter (`ih->ih_filter(ih->ih_argument)`) in the current (interrupt) context. The filter's return value decides what happens next: a filter that fully handled the interrupt (returning `FILTER_HANDLED`, defined as `0x02` in `sys/sys/bus.h`) means no thread is needed for that handler; a filter that found work to defer wakes the event's ithread. Because the list is a `CK_SLIST`, the walk is lock-free and safe even while another CPU is adding or removing a handler — removal is done by marking the handler `IH_DEAD` and letting the next dispatch skip it.
 
-### Machine-Dependent Interrupt Dispatch
+**The ithread.** The kernel thread created for an event spins in `ithread_loop()` (in `sys/kern/kern_intr.c`). It sleeps on the event until a filter sets `it_need` and calls `wakeup()`. When woken, it runs each handler's action (`ih->ih_handler(ih->ih_argument)`) in normal thread context — where it may take sleep mutexes, allocate memory, and block. A recent change (visible in the git history of `kern_intr.c`) allows some ithreads to be marked sleepable, which matters for handlers that must hold a sleep mutex, for example when calling ACPI methods. When the loop finds no more work, it clears `it_need` and sleeps again.
 
-On x86, the IDT entry for each interrupt vector points to a machine-dependent assembly stub that saves the processor state, pushes the trapframe, and calls into C code. The stub in `sys/x86/x86/intr_machdep.c` looks up the `intsrc` for the vector, invokes the pre_ithread hook (which disables the interrupt source for level-triggered devices), then dispatches to the filter handlers.
+**The MD hooks in action.** Consider a level-triggered interrupt on x86. Before the ithread runs, `intr_event_handle()` invokes the `pre_ithread` hook, which masks the source in the I/O APIC so the level line cannot re-fire while the thread is busy (an interrupt storm would otherwise keep the line asserted). After the thread finishes, `post_ithread` re-enables the source. For a filter-only (fast) interrupt, `post_filter` issues the EOI so the CPU can accept the next interrupt. On ARM64 the GIC v3 driver implements the same three hooks with GIC register writes: `gic_v3_pre_ithread`, `gic_v3_post_ithread`, and `gic_v3_post_filter` program the GIC's priority and EOI registers for the current CPU's redistributor.
 
-```c
-/* From sys/x86/x86/intr_machdep.c */
-static struct intsrc **interrupt_sources;
-static struct sx intrsrc_lock;
-static struct mtx intrpic_lock;
-static struct mtx intrcnt_lock;
-```
-
-The `interrupt_sources` array maps interrupt vectors to `struct intsrc` objects. The `intrsrc_lock` (shared/exclusive lock) protects modifications to the interrupt source table, while `intrpic_lock` protects the PIC list and `intrcnt_lock` protects the interrupt counter arrays.
-
-On ARM64, the GIC v3 interrupt controller handles interrupt delivery through the `gic_v3.c` driver. The GIC provides methods for disabling, enabling, mapping, setting up, and tearing down interrupts through function pointers in the PIC structure:
-
-```c
-/* From sys/arm64/arm64/gic_v3.c */
-static pic_disable_intr_t gic_v3_disable_intr;
-static pic_enable_intr_t gic_v3_enable_intr;
-static pic_map_intr_t gic_v3_map_intr;
-static pic_setup_intr_t gic_v3_setup_intr;
-static pic_teardown_intr_t gic_v3_teardown_intr;
-static pic_post_filter_t gic_v3_post_filter;
-static pic_post_ithread_t gic_v3_post_ithread;
-static pic_pre_ithread_t gic_v3_pre_ithread;
-static pic_bind_intr_t gic_v3_bind_intr;
-```
-
-The `gic_v3_pre_ithread` hook is called before the iththread runs, ensuring the interrupt controller acknowledges the interrupt and prevents re-entry. The `gic_v3_post_ithread` hook is called when the iththread completes, re-enabling the interrupt for future events. The `gic_v3_bind_intr` hook allows the GIC driver to assign the interrupt to a specific CPU.
-
-### SMP Interrupt Routing
-
-FreeBSD supports interrupt affinity through the `BUS_BIND_INTR` function. On x86, the I/O APIC redirection table can be programmed to route interrupts to specific CPUs. On ARM64, the GIC distributor registers can be configured to direct interrupts to specific CPU interfaces.
-
-```c
-/* From sys/x86/x86/intr_machdep.c */
-#ifdef SMP
-static struct intsrc **interrupt_sorted;
-static int intrbalance;
-SYSCTL_INT(_hw, OID_AUTO, intrbalance, CTLFLAG_RWTUN, &intrbalance, 0,
-    "Interrupt auto-balance interval (seconds).  Zero disables.");
-static struct timeout_task intrbalance_task;
-#endif
-```
-
-The `intrbalance` sysctl enables automatic interrupt rebalancing. When set to a non-zero interval (in seconds), the framework periodically redistributes interrupts across CPUs to prevent hotspots. The `interrupt_sorted` array is used during the rebalancing process. On ARM64, the `sgi_to_ipi` array maps Software Generated Interrupts (SGIs) to Inter-Processor Interrupts (IPIs) for SMP communication:
-
-```c
-/* From sys/arm64/arm64/gic_v3.c */
-#ifdef SMP
-static u_int sgi_to_ipi[GIC_LAST_SGI - GIC_FIRST_SGI + 1];
-static u_int sgi_first_unused = GIC_FIRST_SGI;
-#endif
-```
+**SMP routing.** The `assign_cpu` hook is called when the framework needs to choose a CPU for a source. On x86, `intr_assign_cpu()` (in `sys/x86/x86/intr_machdep.c`) calls the controller's `pic_assign_cpu`, which programs the I/O APIC redirection entry or the MSI message to target the chosen APIC ID. The `hw.intrbalance` sysctl (default 0, disabled) controls an auto-balancer that periodically migrates sources across CPUs to even out load; when nonzero it is the reprogram interval in seconds. On ARM64 the GIC v3 driver exposes `gic_v3_ipi_send()` and `gic_v3_ipi_setup()` for inter-processor interrupts, mapping SGIs (software-generated interrupts) to IPIs so one CPU can signal another.
 
 ## Flow / Diagram
 
 ```mermaid
 sequenceDiagram
     participant HW as Hardware Device
-    participant CPU as CPU / Interrupt Controller
-    participant IDT as IDT / GIC
-    participant Filter as Filter Handler
-    participant Ithread as ithread Kernel Thread
-    participant Action as Action Handler
-    participant Driver as Device Driver
+    participant CTRL as GIC v3 / I/O APIC
+    participant VEC as Vector Handler<br/>(arm_gic_v3_intr / IDTVEC)
+    participant IEH as intr_event_handle()
+    participant FILT as Driver Filter (interrupt ctx)
+    participant IT as ithread / ithread_loop()
+    participant ACT as Driver Action (thread ctx)
 
-    HW->>CPU: Interrupt asserted
-    CPU->>IDT: Vector/IRQ delivered
-    IDT->>Filter: Enter interrupt context
-    Filter->>Filter: Check if device needs service
-    alt Device needs service
-        Filter-->>IDT: Return FILTER_HANDLED
-        IDT->>Ithread: Schedule ithread
-        Ithread->>Action: Execute action handlers
-        Action->>Driver: Process interrupt
-        Driver-->>Action: Complete processing
-        Action-->>Ithread: Return
-        Ithread-->>IDT: Complete
-        IDT-->>CPU: Enable interrupt source
-        CPU-->>HW: Acknowledge interrupt
-    else Device strayed
-        Filter-->>IDT: Return FILTER_STRAY
-        IDT-->>CPU: Enable interrupt source
-        CPU-->>HW: Acknowledge interrupt
+    HW->>CTRL: assert IRQ / SPI / LPI
+    CTRL->>VEC: IAR returns INTID / vector
+    VEC->>IEH: intr_event_handle(ie, frame)
+    IEH->>CTRL: pre_ithread (mask level source / EOI)
+    IEH->>FILT: ih_filter(arg)
+    FILT-->>IEH: FILTER_HANDLED or NEEDITHREAD
+    alt filter defers work
+        IEH->>IT: set it_need, wakeup()
+        IT->>ACT: ih_handler(arg)
+        ACT-->>IT: done
     end
+    IEH->>CTRL: post_filter / post_ithread (EOI, re-enable)
+    CTRL-->>HW: line cleared, source re-armed
 ```
 
 ## Advanced Notes
 
-### Debugging with DDB and DTrace
+**Debugging.** The kernel exposes two [DDB](README_kdb.md#glossary) (the kernel debugger) commands for live inspection: `db_dump_intr_event` and `db_dump_intrhand` (both in `sys/kern/kern_intr.c`). In DDB, dumping a `struct intr_event` shows its handler list, priorities, and which handlers are marked `IH_DEAD` or `IH_SUSP`; dumping a single `intr_handler` shows its filter and action function pointers and argument. This is the fastest way to confirm that a driver's handler is actually registered on the IRQ you expect. The `hw.intr_storm_threshold` sysctl (default 0, disabled) caps the number of consecutive interrupts from one source before the framework disables it and logs a warning — a useful tripwire when a misbehaving device is saturating a CPU. `hw.intr_epoch_batch` (default 1000) limits how many handler executions run before the code re-enters the [epoch(9)](../../share/man/man9/epoch.9) mechanism, which bounds how long a burst of interrupts can defer [epoch](../netinet/README_ip.md#glossary)-based reclamation.
 
-FreeBSD's debugger (DDB) provides commands for inspecting the interrupt subsystem. The `db_dump_intr_event` and `db_dump_intrhand` functions, declared in `sys/kern/kern_intr.c`, allow kernel developers to dump the state of interrupt events and handlers from the debugger. The `intr_event` list is protected by `event_lock`, so these operations must be performed carefully to avoid deadlocks.
+**Performance and locking.** The filter runs in interrupt context, so it may only use spin mutexes and must not sleep; that is why filters are short and why the heavy work is pushed to the ithread. The `IH_MPSAFE` flag is the main lever: a handler that is not `IH_MPSAFE` runs under Giant, which serializes it against much of the kernel and is a common source of SMP contention. New drivers should mark their handlers `IH_MPSAFE` and avoid Giant. The `CK_SLIST` handler list is lock-free precisely so that a hot dispatch path never takes a lock while walking it; handler add/remove instead uses reference counting and the `IH_DEAD` flag, which is why a removed handler can briefly still appear in the list.
 
-For runtime debugging, the `ktr` (kernel trace) framework can be used to trace interrupt dispatch. The `KTR_INTR` trace point logs filter and action handler invocations, which can be viewed with `dtrace -n 'syscall:::entry { trace(args[0]); }'` or through the `ktr` sysctl interface.
+**Pitfalls.** Three failure modes recur. First, a level-triggered source whose filter fails to clear the status bit will re-fire immediately after the EOI, producing an interrupt storm — the `pre_ithread` masking exists to contain exactly this, and `hw.intr_storm_threshold` will eventually disable the source. Second, sleeping in a filter (taking a sleep mutex, allocating with a flag that may sleep) is a lock-ordering and liveness bug; sleep belongs in the action. Third, on SMP, forgetting that an interrupt may land on a different CPU than the one that programmed it means per-CPU [state](../netpfil/pf/README.md#glossary) in a driver must be indexed by the running CPU, not assumed.
 
-### Performance Considerations
-
-The ithread model introduces a context switch between the filter and action paths. For high-frequency interrupts like network reception, this overhead can be significant. FreeBSD mitigates this through several mechanisms: the `IH_NET` flag causes network ithreads to be scheduled with higher priority, and the `intr_epoch_batch` sysctl controls how often the framework yields to other work. On systems with many network interfaces, administrators can use `sysctl hw.intr_storm_threshold` to fine-tune storm protection and `sysctl hw.intrbalance` to enable automatic interrupt rebalancing.
-
-The [epoch(9)](../../share/man/man9/epoch.9) mechanism interacts with interrupt handling through the `intr_epoch_batch` sysctl. When an ithread runs for many consecutive invocations without returning to epoch, the framework forces a reschedule point to prevent starvation of other kernel work. This is particularly important for network drivers that may process many packets in a single interrupt context.
-
-### Common Pitfalls
-
-One common mistake when writing interrupt handlers is assuming that the filter and action handlers run on the same CPU. While this is typically the case due to interrupt affinity, it is not guaranteed — the framework can migrate an ithread to a different CPU if the original CPU is overloaded. Drivers must not assume CPU-local storage will be consistent between filter and action invocations.
-
-Another pitfall is forgetting to return `FILTER_STRAY` from a filter when the device does not need service. If a filter returns `FILTER_HANDLED` unnecessarily, the framework will schedule the action handler, wasting CPU time and potentially causing unnecessary lock contention. Filters should always check the device's interrupt status register before returning `FILTER_HANDLED`.
-
-Level-triggered interrupts require special care. Unlike edge-triggered interrupts, level-triggered interrupts remain asserted until the device clears the interrupt condition. The `pre_ithread` and `post_ithread` hooks handle this by disabling the interrupt source before the ithread runs and re-enabling it afterward. Drivers must ensure they clear the device's interrupt status register before returning from the action handler, or the interrupt will re-fire immediately.
-
-### Connection to OS Theory
-
-FreeBSD's threaded interrupt model embodies the classic operating systems principle of separating interrupt handling into fast and slow paths. The filter handler corresponds to the "top half" in Linux terminology — minimal work done with interrupts disabled. The action handler corresponds to the "bottom half" — full processing done in process context where sleeping is allowed. This separation allows the system to maintain low interrupt latency while still providing the full functionality that device drivers require.
-
-The framework also illustrates the trade-off between interrupt coherence and CPU utilization. By keeping all handlers for a given interrupt event on the same CPU (when possible), FreeBSD reduces cache thrashing and lock contention. However, this can create hotspots on multi-core systems, which is why the interrupt balancing feature exists. The `intrbalance` sysctl allows administrators to choose between maximum cache coherence (by pinning interrupts) and maximum load distribution (by rebalancing).
+**Connection to textbook theory.** Silberschatz and others describe the interrupt-driven I/O cycle: the device raises a line, the interrupt controller dispatches to the handler, the handler services the device, and the CPU resumes the interrupted task. FreeBSD's filter/action split is a direct answer to the "fast dispatch" and "priority" requirements: the filter is the fast dispatch (a few register reads, no sleep), and the per-source thread plus the priority-ordered `CK_SLIST` provide the priority and [preemption](README_process.md#glossary) behavior the hardware alone cannot give a slow driver. The `pre_ithread`/`post_ithread` hook pair is the software's version of the hardware's "defer handling during critical sections" requirement, letting the kernel mask a source around a long-running thread.
 
 ## See Also
 - [Device Driver Framework — newbus and devclass](README_driver.md)
@@ -229,16 +247,16 @@ The framework also illustrates the trade-off between interrupt coherence and CPU
 
 
 
-- [`sys/kern/kern_intr.c`](kern_intr.c) — Core interrupt thread framework implementation
-- [`sys/x86/x86/intr_machdep.c`](../x86/x86/intr_machdep.c) — x86 machine-dependent interrupt code
-- [`sys/arm64/arm64/gic_v3.c`](../arm64/arm64/gic_v3.c) — ARM64 GIC v3 interrupt controller driver
-- [`sys/sys/interrupt.h`](../sys/interrupt.h) — Interrupt framework header with struct and function declarations
-- `man9 intr_event` — Manual page for interrupt event management
-- `man9 BUS_SETUP_INTR` — Manual page for interrupt registration API
-- `man9 swi` — Manual page for software interrupt (swi) framework
-- [`sys/kern/kern_clock.c`](kern_clock.c) — Clock interrupt handling
-- [`sys/dev/fdt/fdt_intr.h`](../dev/fdt/fdt_intr.h) — Device tree interrupt handling
+- [`sys/kern/kern_intr.c`](kern_intr.c) — the machine-independent `struct intr_event` framework: `intr_event_create()`, `intr_event_add_handler()`, `intr_event_handle()`, `ithread_loop()`, and the DDB dump commands.
+- [`sys/sys/interrupt.h`](../sys/interrupt.h) — `struct intr_handler`, `struct intr_event`, and the `IH_*` flags.
+- [`sys/x86/x86/intr_machdep.c`](../x86/x86/intr_machdep.c) and [`sys/x86/include/intr_machdep.h`](../x86/include/intr_machdep.h) — x86 `struct pic`/`struct intsrc`, `intr_lookup_source()`, `intr_assign_cpu()`, and the IRQ/vector allocation scheme.
+- [`sys/x86/x86/io_apic.c`](../x86/x86/io_apic.c), [`sys/x86/x86/msi.c`](../x86/x86/msi.c), [`sys/x86/x86/local_apic.c`](../x86/x86/local_apic.c) — the concrete x86 controllers.
+- [`sys/arm64/arm64/gic_v3.c`](../arm64/arm64/gic_v3.c) — the GIC v3 driver: `arm_gic_v3_intr()`, `gic_v3_setup_intr()`, and the `gic_v3_pre_ithread`/`post_ithread`/`post_filter` hooks.
+- [`sys/arm64/arm64/gicv3_its.c`](../arm64/arm64/gicv3_its.c) and [`sys/arm64/arm64/gicv5.c`](../arm64/arm64/gicv5.c) — LPI/ITS translation and GICv5 routing.
+- [`sys/sys/bus.h`](../sys/bus.h) — `bus_setup_intr()` / `bus_teardown_intr()` and `FILTER_HANDLED`.
+- Man pages: [`intr_event(9)`](../../share/man/man9/intr_event.9), `bus_setup_intr(9)`, [`swi(9)`](../../share/man/man9/swi.9), [`epoch(9)`](../../share/man/man9/epoch.9), [`lock(9)`](../../share/man/man9/lock.9).
+- Related chapters: [Kernel Core — Structure and Entry Point](../README.md) (how `SI_SUB_INTR` orders interrupt-controller startup), [Process Management — Scheduling and Lifecycle](README_process.md) (the ithread is a kernel thread on the same run queues as user processes), [Locking Primitives — Mutexes, sx, rmlocks, and Atomics](README_locking.md) (spin vs. sleep mutexes, and why filters may only use the former).
 
 ---
 
-> _Generated by [DaemonDocs](https://github.com/ocochard/DaemonDocs) on 2026-05-04 01:28 UTC using model `Qwen3.6-35B-A3B-UD-Q8_K_XL` (llama.cpp build `b8985-27aef3dd9`). AI-generated content — verify against source before relying on it._
+> _Generated by [DaemonDocs](https://github.com/ocochard/DaemonDocs) on 2026-08-27 19:17 UTC using model `Qwen3.8-27B-Q8_0` (llama.cpp build `b10553-cd26896c1`). AI-generated content — verify against source before relying on it._

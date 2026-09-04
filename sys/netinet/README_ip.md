@@ -5,34 +5,47 @@
 **Navigation:**
   **Up:** [Kernel Core — Structure and Entry Point](../README.md) ▸ [Source Tree — Layout and Conventions](../../README_internals.md)
   **Related:** [Network Stack — Architecture and Packet Flow](../net/README.md) | [VNET — Virtual Network Stacks](../net/README_vnet.md) | [pf — OpenBSD-derived Packet Filter](../netpfil/pf/README.md) | [mbuf — Network Buffer Allocation and Chaining](../sys/README_mbuf.md) | [Transport Protocols — inpcb, tcpcb, TCP State Machine, UDP](README_transport.md)
-  **All chapters:** [Source Tree — Layout and Conventions](../../README_internals.md) | [Boot Process — UEFI Bootloader to Kernel Handoff](../../stand/efi/loader/README.md) | [Kernel Core — Structure and Entry Point](../README.md) | [Build System — buildworld and buildkernel](../../share/mk/README.md) | [Virtual Memory Subsystem — vm_page, UMA, and Pagers](../vm/README.md) | [Process Management — Scheduling and Lifecycle](../kern/README_process.md) | [Locking Primitives — Mutexes, sx, rmlocks, and Atomics](../kern/README_locking.md) | [Buffer Cache — Block I/O Subsystem](../vm/README_bcache.md) ...
+  **All chapters:** [Source Tree — Layout and Conventions](../../README_internals.md) | [Boot Process — UEFI Bootloader to Kernel Handoff](../../stand/efi/loader/README.md) | [Kernel Core — Structure and Entry Point](../README.md) | [Build System — buildworld and buildkernel](../../share/mk/README.md) | [System Calls and Image Activation — Entry, sysent, and exec](../kern/README_syscall.md) | [Kernel Modules and the Linker — KLD, SYSINIT, and linker sets](../kern/README_kld.md) | [Virtual Memory Subsystem — vm_page, UMA, and Pagers](../vm/README.md) | [Process Management — Scheduling and Lifecycle](../kern/README_process.md) ...
 ---
 
+
 ## Quick Summary
-The IP layer in FreeBSD is the central nervous system of the network stack, responsible for routing, forwarding, and delivering datagrams between interfaces and upper-layer protocols. When a packet arrives from the wire, it is placed on a `netisr` queue and processed by the input function (`ip_input` for IPv4, `ip6_input` for IPv6). The IP layer verifies the header integrity, runs checksums, applies network filter hooks (like `pf` or `ipsec`), and determines whether the packet is destined for the local host or should be forwarded. For local delivery, it looks up the protocol number in the `ip_protox[]` dispatch table and hands the packet to TCP, UDP, ICMP, or another L4 protocol. For forwarding, it performs a route lookup, decrements the TTL, rewrites the header, and passes the packet to the output path.
 
-The output path (`ip_output` / `ip6_output`) is where the kernel prepares a packet for transmission. It fills in the source address, TTL, and identification fields, runs output pfil hooks, and performs a Forwarding Information Base (FIB) lookup to find the next hop. The FIB/nhop architecture, introduced in FreeBSD 12.x, replaced the older `rtentry`-based forwarding cache with a lock-free, immutable `nhop_object`. This separation of the routing tree from the next-hop forwarding state allows the fast path to dereference a simple pointer and transmit the packet without holding locks.
+The IP layer is the point where a packet stops being "a byte string on a wire" and becomes "a datagram with a destination." For every IPv4 packet that arrives, FreeBSD runs `ip_input()` (in `sys/netinet/ip_input.c`): it checks the version and header length, verifies the header checksum, walks the [pfil hook](#glossary) chain, then makes the single most important decision in the whole function — is this packet for *us*, or are we a *forwarder* for someone else? If it is for us, the packet is handed to the next layer through the `ip_protox[]` dispatch table. If we are forwarding, `ip_forward()` looks up the next hop and rewrites the header before the packet goes back out. The IPv6 twin, `ip6_input()` in `sys/netinet6/ip6_input.c`, does the same job but must first walk a chain of extension headers, and it never re-fragments in the middle of the network.
 
-FreeBSD treats IPv4 and IPv6 as distinct stacks sharing common abstractions. IPv6 enforces a design choice that eliminates in-network fragmentation: the sender must determine the path MTU and fragment packets accordingly. While IPv4 relies on the Address Resolution Protocol (ARP) to map IP addresses to MAC addresses, IPv6 uses Neighbor Discovery (NDP) to achieve the same goal, along with support for scope IDs on link-local addresses. The IP layer also handles fragmentation and reassembly for both protocols, though IPv6 fragmentation is restricted to the source host and handled via extension headers rather than built into the base header processing.
+The output path is the mirror image. A transport protocol calls `ip_output()` (in `sys/netinet/ip_output.c`) with a header that is only partly filled in; the IP layer supplies the source address, the TTL, the identification field, and the checksum, runs the `PFIL_OUT` hooks, resolves the next hop, and — if the packet is too big for the link and fragmentation is permitted — splits it with `ip_fragment()` before pushing the [mbuf](../sys/README_mbuf.md#glossary) down to the interface. On the receive side, `ip_reass()` (in `sys/netinet/ip_reass.c`) glues fragments back together, guarded by timeouts and queue limits so an attacker cannot exhaust memory by sending fragments that never complete.
+
+The most important architectural change in recent FreeBSD is the [FIB](#glossary)/[nhop](#glossary) rewrite. Before 12.x, forwarding [state](../netpfil/pf/README.md#glossary) lived in `struct rtentry`, with the next-hop information embedded inside the routing-table entry and a per-CPU forwarding cache that had to be kept in sync and locked. The rewrite split that into two objects: a *route table* (the `struct rib_head` radix tree, owned by the control plane) and an *immutable `nhop_object`* (the ready-to-use next hop, read by the datapath without a lock). The lookup data structure itself — radix, [DXR](#glossary) (a two-level direct-indexed trie optimized for large routing tables), or a binary-search array — is pluggable at runtime through `sys/net/route/fib_algo.c`, so the kernel can pick the structure that fits each table's size.
+
+IPv6 is treated here as a primary architectural contrast, not a footnote. Its 128-bit addresses, the ban on in-network fragmentation, neighbor discovery in place of ARP, and link-local scope IDs each forced a separate input/output path under `sys/netinet6/` rather than sharing the IPv4 code. The chapter closes on what hangs off the L3 entry points: the [`pfil(9)`](../../share/man/man9/pfil.9) [hook](../netgraph/README.md#glossary) framework that lets pf, ipfw, and ipsec interpose without patching `ip_input`/`ip_output`, the per-protocol input handlers, and the [`netisr(9)`](../../share/man/man9/netisr.9) boundary where the interrupt context hands off to the deferred packet-processing context.
+
+## Glossary
+
+**FIB** — Forwarding Information Base; the kernel's name for a routing (next-hop) table, one per routing table number.
+**DXR** — A two-level direct-indexed trie optimized for large routing tables; one of the pluggable FIB lookup structures.
+**nhop** — A next-hop object (`struct nhop_object`); an immutable, reference-counted record of everything the datapath needs to send a packet out one interface.
+**LPM** — Longest-prefix match; the routing-table lookup rule where the most specific (longest) matching prefix wins.
+**pfil hook** — A registration point in the [`pfil(9)`](../../share/man/man9/pfil.9) framework where packet-filter modules (pf, ipfw, ipsec) interpose on the IP path without modifying the IP code itself.
+**netisr** — The network interrupt service routine; the deferred, non-interrupt context that runs `ip_input`/`ip6_input` after a driver queues a packet.
+**PFIL_IN / PFIL_OUT** — The two pfil hook points on the input and output IP paths respectively.
+**epoch** — A kernel synchronization mechanism that defers freeing of memory until every CPU has passed through a quiescent point, guaranteeing no in-flight lookup still holds a stale pointer.
+**scope ID** — A 32-bit tag (the interface index) that disambiguates link-local IPv6 addresses, which are only valid on one link.
+**NHF_INVALID** — A `nhop_object` flag; when set, the next hop is considered unusable and the datapath treats the lookup as a miss.
 
 ## Architecture
-The IP layer is split into two main source trees: `sys/netinet` for IPv4 and `sys/netinet6` for IPv6. The core input and output files are `ip_input.c`, `ip_output.c`, `ip6_input.c`, and `ip6_output.c`.
 
-**Input Path:**
-When a packet reaches `ip_input()` in `sys/netinet/ip_input.c`, it first checks the header length and checksum. If valid, the packet traverses the `pfil` hooks, allowing tools like `pf` or `ipsec` to inspect or modify the packet. The kernel then checks if the destination is local. If not, and if `V_ipforwarding` is set, `ip_forward()` is called to handle the forwarding logic. Otherwise, the packet is dispatched to the appropriate L4 protocol via the `ip_protox[]` array (defined in `sys/netinet/in_proto.c`), which maps protocol numbers (e.g., `IPPROTO_TCP`, `IPPROTO_UDP`) to their respective input functions.
+FreeBSD's IP layer is split by address family, with a shared routing substrate underneath. The IPv4 plane lives in `sys/netinet/` (`ip_input.c`, `ip_output.c`, `ip_reass.c`, `in_fib.c`); the IPv6 plane lives in `sys/netinet6/` (`ip6_input.c`, `ip6_output.c`, `ip6_forward.c`, `frag6.c`, `in6_fib.c`). Both families resolve next hops through the same FIB/nhop machinery in `sys/net/route/` (`fib_algo.c`, `nhop.c`, `route_ctl.c`, `route_tables.c`), which is what makes the two planes comparable: the same `struct rib_head` tree and the same immutable `nhop_object` type serve both IPv4 and IPv6, differing only in the address family and the per-family lookup algorithm.
 
-**Output Path:**
-`ip_output()` in `sys/netinet/ip_output.c` is called by L4 protocols with a partially prepared `struct ip` header. It fills in the source IP (if missing), calculates the TTL, and increments the packet ID. It then traverses the output `pfil` hooks via `pfil_mbuf_fwd()` and `pfil_mbuf_out()`, allowing packet filtering and modification before transmission. The critical step is the route lookup, which uses the FIB subsystem to find a `struct nhop_object` (next hop). The `nhop_object` contains the interface pointer (`ifp`), the gateway address, and MTU information. Once the `nhop_object` is resolved, `ip_output()` pushes the `mbuf` chain down to the link layer via the interface's `if_transmit` function.
+The input path is driven by [`netisr(9)`](../../share/man/man9/netisr.9). A driver places an mbuf on the interface's input queue; `netisr` wakes a taskqueue [thread](../kern/README_process.md#glossary) that calls the family's input function. For IPv4 that is `ip_input()` in `sys/netinet/ip_input.c`. It validates the header, verifies the checksum, calls the `PFIL_IN` hook chain, and then branches: a fragment goes to `ip_reass()`, a packet destined for another host goes to `ip_forward()`, and a local packet is dispatched through `ip_protox[]`. The forwarding sysctl is `net.inet.ip.forwarding` (`VNET_DEFINE(int, ipforwarding)` in `ip_input.c`), and redirect behavior is governed by `net.inet.ip.redirect` (`ipsendredirects`).
 
-**FIB and nhop Architecture:**
-Prior to FreeBSD 12, the routing subsystem used `struct rtentry` to store both routing tree nodes and next-hop forwarding data. This required locking during the fast path. The rewrite introduced in FreeBSD 12.x decoupled these concerns. The FIB lookup algorithms (radix tree, DXR, or binary search) live in `sys/net/route/fib_algo.c` and `sys/netinet/in_fib.c`. They return a pointer to an immutable `struct nhop_object` (defined in `sys/net/route/nhop.h`). Because `nhop_object` objects are immutable once assigned to a route, the fast path can read them without locks. The control plane handles `nhop_object` creation and destruction using epoch-based reclamation to ensure safe memory reclamation.
+The output path is entered by the transport layer. `ip_output()` in `sys/netinet/ip_output.c` is the public entry; it normalizes the header, fills in the fields the caller did not, runs `ip_output_pfil()` for the `PFIL_OUT` hooks, then calls `ip_output_send()` which resolves the next hop and hands the mbuf to `if_transmit()`. When the packet exceeds the path MTU and fragmentation is allowed, `ip_fragment()` splits it. The IPv6 equivalents are `ip6_output()` → `ip6_output_send()`, `ip6_forward()` in `sys/netinet6/ip6_forward.c`, and `frag6_input()` in `sys/netinet6/frag6.c`.
 
-**IPv6 Differences:**
-IPv6 input/output logic is in `sys/netinet6/ip6_input.c` and `sys/netinet6/ip6_output.c`. The decision to maintain separate source files rather than extending the IPv4 code was driven by fundamental architectural differences between the two protocols. IPv6 uses a 40-byte base header (`struct ip6_hdr`) with a different field layout — including the flow label and traffic class fields — and does not compute a header checksum, leaving reliability to L4 protocols. IPv6 also introduces extension headers (Hop-by-Hop Options, Routing, Fragment, Authentication, Encapsulating Security Payload) that must be processed in sequence before reaching the upper-layer protocol. These extension headers require a completely different parsing loop that cannot be easily shared with IPv4's simpler header format. Additionally, IPv6 fragmentation is removed from the forwarding path — routers drop packets that require fragmentation and send an ICMPv6 "Packet Too Big" message — which changes the forwarding logic significantly. The Neighbor Discovery Protocol (NDP) replaces ARP, requiring separate link-layer address resolution logic. These differences, combined with the need for separate routing table management (IPv6 uses `in6_ifaddr` structures and a separate routing tree), made separate `ip6_input.c`/`ip6_output.c` files the cleaner architectural choice rather than adding complex conditional compilation to the IPv4 code. Fragmentation and reassembly logic is isolated in `frag6.c` and `ip6_reass.c`.
+The FIB/nhop rewrite is the architectural center of this chapter. The control plane owns `struct rib_head` (in `sys/net/route/route_var.h`): a radix tree plus an `rmlock` (`rib_lock`) that serializes route changes. Each route points at an `nhop_object`. The datapath never touches the tree or the lock; it calls the per-family lookup (`fib4_lookup()` / `fib6_lookup()`), which invokes the currently-selected algorithm's function pointer and returns a pointer to an immutable `nhop_object` that is valid for the duration of the current network [epoch](#glossary) (a kernel synchronization mechanism that defers freeing of memory until every CPU has passed through a quiescent point, guaranteeing no in-flight lookup still holds a stale pointer). `fib_algo.c` is what lets the algorithm itself be swapped: it defines `struct fib_lookup_module` (the registration record) and `struct fib_dp` (the per-table pointer to the active algorithm), and it lets the kernel choose among radix, DXR, and the binary-search array at runtime.
 
 ## Key Data Structures
-**`struct ip`** (`sys/netinet/ip.h`)
-The core IPv4 header. Load-bearing fields include:
+
+The IPv4 header, from `sys/netinet/ip.h` (per RFC 791). The load-bearing fields for this chapter are the header length (`ip_hl`), the fragment offset (`ip_off`), the TTL (`ip_ttl`), and the protocol (`ip_p`):
+
 ```c
 struct ip {
 #if BYTE_ORDER == LITTLE_ENDIAN
@@ -58,143 +71,300 @@ struct ip {
 } __packed;
 ```
 
-**`struct ip6_hdr`** (`sys/netinet/ip6.h`)
-The base header for IPv6. The top 32 bits combine version and traffic class (`ip6_vfc`), followed by the flow label, payload length, next header, and hop limit. The header uses a union to allow both structured access to individual fields and raw byte access for the version/class field.
+The IPv6 header, from `sys/netinet/ip6.h` (per RFC 2460). Note there is no header checksum, no TTL (it is `ip6_un1_hlim`, the hop limit), and no fragment offset — fragmentation moved to an extension header, which is the design decision that forbids in-network fragmentation:
+
 ```c
 struct ip6_hdr {
 	union {
-		struct {
-			u_int32_t ip6_flow; /* 20 bits of flow-ID, 4 bits version/class */
-			u_int16_t ip6_plen; /* payload length */
-			u_int8_t  ip6_nxt;  /* next header */
-			u_int8_t  ip6_hlim; /* hop limit */
+		struct ip6_hdrctl {
+			u_int32_t ip6_un1_flow;	/* 20 bits of flow-ID */
+			u_int16_t ip6_un1_plen;	/* payload length */
+			u_int8_t  ip6_un1_nxt;	/* next header */
+			u_int8_t  ip6_un1_hlim;	/* hop limit */
 		} ip6_un1;
-		u_int8_t ip6_vfc;   /* 4 bits version, top 4 bits class */
+		u_int8_t ip6_un2_vfc;	/* 4 bits version, top 4 bits class */
 	} ip6_ctlun;
-	struct in6_addr ip6_src;  /* source address */
-	struct in6_addr ip6_dst;  /* dest address */
+	struct in6_addr ip6_src;	/* source address */
+	struct in6_addr ip6_dst;	/* destination address */
+} __packed;
+```
+
+The IPv4 reassembly queue, from `sys/netinet/ip_var.h`. One `struct ipq` is created per datagram being reassembled; fragments are linked onto `ipq_frags` and the queue is timed out via `ipq_expire`:
+
+```c
+struct ipq {
+	TAILQ_ENTRY(ipq) ipq_list;	/* to other reass headers */
+	time_t	ipq_expire;		/* time_uptime when ipq expires */
+	u_char	ipq_nfrags;		/* # frags in this packet */
+	u_char	ipq_p;			/* protocol of this fragment */
+	u_short	ipq_id;			/* sequence id for reassembly */
+	int	ipq_maxoff;		/* total length of packet */
+	struct mbuf *ipq_frags;		/* to ip headers of fragments */
+	struct	in_addr ipq_src,ipq_dst;
+	struct label *ipq_label;	/* MAC label */
 };
 ```
 
-**`struct nhop_object`** (`sys/net/route/nhop.h`)
-The immutable next-hop object used by the FIB fast path.
-```c
-struct nhop_object {
-	uint32_t nh_flags; /* NHF_ flags used in the dataplane code */
-	uint32_t nh_mtu;   /* ready-to-use nexthop mtu */
-	uint32_t nh_prepend_len; /* link-level prepend length */
-	struct ifnet *nh_ifp; /* logical transmit interface */
-	struct ifaddr *nh_ifa; /* interface address to use */
-	counter_u64_t nh_pksent; /* counter reflecting transmitted packets */
-	/* ... gateway storage (gw_) ... */
-};
-```
+The per-table datapath pointer, from `sys/net/route/fib_algo.h`. This is the seam that makes the lookup algorithm swappable: `f` is the active algorithm's lookup function and `arg` is its private state. `fib4_lookup()` calls `dp->f(dp->arg, key, scopeid)` and never knows which algorithm is behind it:
 
-**`struct fib_dp`** (`sys/net/route/fib_algo.h`)
-Datapath structure for each FIB, containing callback functions for lookups.
 ```c
+/* Datapath lookup data */
 struct fib_dp {
 	flm_lookup_t	*f;
 	void		*arg;
 };
 ```
 
-**`ip_var.h` and Global State**
-`sys/netinet/ip_var.h` defines the per-VNET global state and statistics structures used throughout the IP layer. It declares `V_ipstat` (an `ipstat` structure tracking packet counts, checksum errors, and fragmentation statistics), `V_ipforwarding` (a boolean controlling IP forwarding), and `V_ipsendredirects` (controlling ICMP redirect generation). The file also defines `struct ipq` for IPv4 reassembly queues and `struct ipoption` for IP options handling. These global variables are accessed via the VNET abstraction, which allows multiple network stacks to coexist in a single kernel instance.
+The lookup key, also from `sys/net/route/fib_algo.h`. The union is what lets one `flm_lookup_t` signature serve both families:
 
-## Deep Dive
-**1. Packet Arrival and Dispatch (`ip_input`)**
-In `sys/netinet/ip_input.c`, `ip_input()` is the entry point called by the `netisr` subsystem.
-First, it verifies the IP version and header length (IHL). If the header is malformed, the packet is dropped and `ipstat.ips_badhdr` is incremented. Next, it calculates and verifies the IP checksum using the kernel's checksum verification routines.
-The packet then passes through the `pfil` hooks. If a hook drops the packet, processing stops. If the packet is destined for the local host, the kernel checks for IP options. If the packet is not local, `ip_forward()` is invoked. `ip_forward()` checks `V_ipforwarding` and `V_ipsendredirects`, decrements the TTL (dropping the packet if it reaches zero), and rewrites the source/destination IP addresses if necessary before passing it to `ip_output()`.
-For local delivery, `ip_input()` looks up the protocol number in the `ip_protox[]` table (registered in `sys/netinet/in_proto.c`). For example, TCP is registered at index `IPPROTO_TCP`, pointing to `tcp_input()`.
-
-**2. Packet Transmission (`ip_output`)**
-In `sys/netinet/ip_output.c`, the function is called with an `mbuf` chain containing a partially filled `struct ip`.
-- **Source Address:** If the source address is zero, `ip_output()` selects the appropriate local address based on the destination and the routing table.
-- **TTL and ID:** The TTL is initialized (usually to `IPDEFTTL` or a value specified by the socket) and the identification field is set to a random value for security.
-- **Output Hooks:** The output `pfil` hooks are run via `pfil_mbuf_fwd()` and `pfil_mbuf_out()` to allow packet filtering and modification before transmission.
-- **Route Lookup:** The core of `ip_output()` is the route lookup. It calls into the FIB subsystem to perform a lookup against the current FIB. The FIB returns a `struct nhop_object *`. The code checks if the `nhop_object` is valid and if the interface is up.
-- **Fragmentation:** If the packet size exceeds the interface MTU and the `IP_DF` (Don't Fragment) flag is not set, `ip_fragment()` is called. It splits the `mbuf` chain into smaller pieces, adjusting headers and checksums for each fragment.
-- **Transmit:** Finally, the packet is passed to the link layer via the interface's `if_transmit` function, with the `nhop_object` providing the interface pointer and link-layer address information.
-
-**3. The FIB/nhop Rewrite**
-The FIB architecture is defined in `sys/net/route/fib_algo.c` and `sys/net/route/nhop.c`.
-The `nhop_object` is a small, immutable structure that encapsulates all the data needed to transmit a packet out of an interface. It includes the `ifp`, gateway address, MTU, and flags. Because it is immutable, multiple routes can safely reference the same `nhop_object` without locking.
-The FIB lookup algorithms (e.g., radix tree, DXR, or binary search) are plugged into the datapath via `struct fib_dp`. When a route change occurs, the control plane rebuilds the lookup structure and swaps the datapath pointer atomically. This allows lock-free lookups on the fast path, a significant performance improvement over the pre-12.x `rtentry` model which required holding locks during route traversal.
-
-**4. IPv6 Specifics**
-In `sys/netinet6/ip6_input.c`, the input path is similar but handles IPv6 extension headers. After the base header, the `ip6_nxt` field indicates the next header type (e.g., Hop-by-Hop Options, Routing, Fragment). The code loops through these headers, processing each one. Fragmentation is handled by the Fragment Extension Header, which contains the offset and M-bit. Reassembly is managed by `frag6_input()` in `sys/netinet6/frag6.c`.
-IPv6 uses Neighbor Discovery (NDP) instead of ARP. NDP messages (Router Solicitation, Router Advertisement, Neighbor Solicitation, Neighbor Advertisement) are handled in `sys/netinet6/nd6_rtr.c`. The `in6_lltable` maintains the neighbor cache, mapping IPv6 addresses to link-layer addresses.
-
-**5. IPv4 Fragment Reassembly (`ip_reass`)**
-The reassembly mechanism in `sys/netinet/ip_reass.c` puts fragmented packets back together using the following logic:
-
-1. **Hashing and Queueing:** Each incoming fragment is hashed using a combination of source IP, destination IP, protocol, and identification field. The hash determines which of `IPREASS_NHASH` (1024) buckets the fragment belongs to. Each bucket contains a linked list of `struct ipq` entries, where each entry represents a fragment group (a set of fragments belonging to the same original packet).
-
-2. **Finding or Creating the ipq Entry:** The code first searches the bucket for an existing `struct ipq` that matches the hash key (src, dst, protocol, ID). If found, the fragment is added to that group. If not found, a new `struct ipq` is allocated and initialized with the fragment's metadata.
-
-3. **Tracking Fragment Offsets:** Each `struct ipq` tracks the fragments using the fragment offset and the More Fragments (MF) bit. The `ipq_nfrags` field counts the number of fragments received. The `ipq_maxoff` field tracks the highest offset seen so far, indicating how much of the original packet has been received. Each fragment's data is stored in the `ipq_frags` mbuf chain, with the fragment offset recorded.
-
-4. **Reassembly State Machine:** As fragments arrive, the code checks whether they fill gaps in the reassembly. If a fragment's offset falls within an existing range, it is merged. If it extends beyond the current `ipq_maxoff`, the max is updated. When all fragments have arrived (no more MF bit set, and all offsets from 0 to total length are covered), the reassembly is complete.
-
-5. **Constructing the Reassembled Packet:** Once all fragments are present, the code concatenates the fragment mbuf chains into a single mbuf chain, adjusting the header fields (total length, checksum) to reflect the reassembled packet. The reassembled packet is then passed up to the appropriate L4 protocol handler.
-
-6. **Timeouts and Pruning:** Each `struct ipq` has a timeout (`ipq_expire`) based on `time_uptime`. A periodic callout (`ipreass_callout`) scans the buckets and frees expired fragment groups, preventing memory exhaustion from incomplete reassembly. The reassembly queues are also protected by size limits — the maximum number of fragment groups (`ipq_maxbucketsize`) and total fragments (`ipreass_maxfragments`) — to mitigate fragmentation-DoS attacks.
-
-## Flow / Diagram
-```mermaid
-flowchart TD
-    subgraph InputPath_grp ["Input Path"]
-        A[Packet Arrives] --> B[netisr Queue]
-        B --> C[ip_input / ip6_input]
-        C --> D{Header Valid?}
-        D -- No --> E[Drop & Stat]
-        D -- Yes --> F[Checksum & pfil Hooks]
-        F --> G{Local Destination?}
-        G -- No --> H[ip_forward / ip6_forward]
-        H --> I[Decrement TTL]
-        I --> J{TTL > 0?}
-        J -- No --> E
-        J -- Yes --> K[ip_output / ip6_output]
-        G -- Yes --> L[ip_protox[] Dispatch]
-        L --> M[TCP / UDP / ICMP]
-    end
-
-    subgraph OutputPath_grp ["Output Path"]
-        K --> N[Fill Src, TTL, ID]
-        N --> O[Output pfil Hooks]
-        O --> P[FIB Lookup]
-        P --> Q[struct nhop_object]
-        Q --> R{MTU Check}
-        R -- Fragment --> S[ip_fragment / frag6]
-        R -- No Fragment --> T[Link Layer if_transmit]
-        S --> T
-    end
-
-    subgraph FIB_nhop_grp ["FIB / nhop Architecture"]
-        U[Route Table Changes] --> V[Control Plane]
-        V --> W[Create/Update nhop]
-        W --> X[Immutable nhop Object]
-        V --> Y[Rebuild FIB Algo]
-        Y --> Z[Swap fib_dp Pointer]
-        Z --> Q
-    end
-
-    InputPath --> OutputPath
-    OutputPath --> FIB_nhop
+```c
+struct flm_lookup_key {
+	union {
+		const struct in6_addr *addr6;
+		struct in_addr addr4;
+	};
+};
 ```
 
-## Comparison
-**Linux:** Linux uses a completely different forwarding architecture. Instead of an immutable `nhop_object` object, Linux uses `struct fib_info` and `struct rtable` (IPv4) or `struct fib6_node` (IPv6). The fast path in Linux often relies on RCU (Read-Copy-Update) for routing table traversal, whereas FreeBSD's `nhop_object` approach uses immutability and epoch-based reclamation. Linux also supports eBPF for packet filtering and routing, which is a more flexible alternative to FreeBSD's `pfil` hooks.
-**macOS/XNU:** XNU's IP layer is heavily derived from BSD but has diverged significantly. It uses a different socket layer (KPOSIX) and integrates network filtering via Network Extension frameworks and `npf` (in newer versions), replacing `pf`. XNU uses a unified routing cache (`struct rtentry` with embedded gateway pointers) rather than FreeBSD's explicit separation of the routing tree from next-hop forwarding state. The routing cache in XNU is tightly coupled with the socket layer, making route lookups dependent on socket state, whereas FreeBSD's FIB/nhop design decouples route resolution from socket operations entirely.
-**NetBSD/OpenBSD:** OpenBSD shares the `pf` firewall and much of the BSD network stack, but its routing architecture has remained closer to the traditional `rtentry` model, lacking the explicit `nhop_object` separation seen in FreeBSD 12+. NetBSD uses a similar `rtentry` structure but implements its routing lookups via a radix tree in `sys/net/radix.c` with a separate `rt_metrics` structure for per-route metrics, whereas FreeBSD 12+ moves the metrics and forwarding data into the immutable `nhop_object` and uses `fib_dp` callbacks for algorithm-agnostic lookups.
+The algorithm registration record, from `sys/net/route/fib_algo.h`. Each algorithm (radix, DXR, bsearch) fills in one of these and registers it; the callback set describes how to build, change, dump, and look up:
+
+```c
+struct fib_lookup_module {
+	char		*flm_name;		/* algo name */
+	int		flm_family;		/* address family this module supports */
+	int		flm_refcount;		/* # of references */
+	uint32_t	flm_flags;		/* flags */
+	uint8_t		flm_index;		/* internal algo index */
+	flm_init_t	*flm_init_cb;		/* instance init */
+	flm_destroy_t	*flm_destroy_cb;	/* destroy instance */
+	flm_change_t	*flm_change_rib_item_cb;/* routing table change hook */
+	flm_dump_t	*flm_dump_rib_item_cb;	/* routing table dump cb */
+	flm_dump_end_t	*flm_dump_end_cb;	/* end of dump */
+	flm_lookup_t	*flm_lookup;		/* lookup function */
+	flm_get_pref_t	*flm_get_pref;		/* get algo preference */
+	flm_change_batch_t	*flm_change_rib_items_cb;/* routing table change hook */
+	void		*spare[8];		/* Spare callbacks */
+	TAILQ_ENTRY(fib_lookup_module)	entries;
+};
+```
+
+The route-table head, from `sys/net/route/route_var.h`. This is the control-plane object: the radix tree (`head`), the lock that serializes changes (`rib_lock`), the generation counters used to detect stale datapath state (`rnh_gen`, `rnh_gen_rib`), and the pointer to the nhop subsystem (`nh_control`):
+
+```c
+struct rib_head {
+	struct radix_head	head;
+	rn_matchaddr_f_t	*rnh_matchaddr;	/* longest match for sockaddr */
+	rn_addaddr_f_t		*rnh_addaddr;	/* add based on sockaddr*/
+	rn_deladdr_f_t		*rnh_deladdr;	/* remove based on sockaddr */
+	rn_lookup_f_t		*rnh_lookup;	/* exact match for sockaddr */
+	rn_walktree_t		*rnh_walktree;	/* traverse tree */
+	rn_walktree_from_t	*rnh_walktree_from; /* traverse tree below a */
+	rnh_set_nh_pfxflags_f_t	*rnh_set_nh_pfxflags;	/* hook to alter record prior to insertion */
+	rt_gen_t		rnh_gen;	/* datapath generation counter */
+	struct radix_node	rnh_nodes[3];	/* empty tree for common case */
+	struct rmlock		rib_lock;	/* config/data path lock */
+	struct radix_mask_head	rmhead;		/* masks radix head */
+	struct vnet		*rib_vnet;	/* vnet pointer */
+	int			rib_family;	/* AF of the rtable */
+	u_int			rib_fibnum;	/* fib number */
+	struct callout		expire_callout;	/* Callout for expiring dynamic routes */
+	time_t			next_expire;	/* Next expire run ts */
+	uint32_t		rnh_prefixes;	/* Number of prefixes */
+	rt_gen_t		rnh_gen_rib;	/* fib algo: rib generation counter */
+	bool			rib_dying:1,	/* rib is detaching */
+				rib_algo_init:1;/* algo init done */
+	struct nh_control	*nh_control;	/* nexthop subsystem data */
+	rnh_augment_nh_f_t	*rnh_augment_nh;/* hook to alter nexthop prior to insertion */
+	CK_STAILQ_HEAD(, rib_subscription)	rnh_subscribers;/* notification subscribers */
+};
+```
+
+The next-hop object, `struct nhop_object`, lives in `sys/net/route/nhop.h`. It is the immutable record the datapath reads lock-free. The header documents its fields directly; the gateway storage is a fixed buffer (`gw_buf[28]`) sized to hold an `AF_INET`, `AF_INET6`, or `AF_LINK` gateway, exposed through the `gw_sa` member. The datapath-relevant fields are:
+
+```c
+/* From sys/net/route/nhop.h (field description from the header comment) */
+/* nh_flags:      NHF_ flags used in the dataplane code (NHF_GATEWAY,
+ *                NHF_BLACKHOLE, NHF_INVALID, ...) */
+/* nh_mtu:        ready-to-use nexthop mtu (link header + if MTU accounted) */
+/* nh_ifp:        logical transmit interface; if_transmit() target, non-NULL */
+/* nh_aifp:       ifnet of the source address (differs from nh_ifp only on
+ *                IPv6 loopback routes) */
+/* nh_ifa:        interface address to use, non-NULL */
+/* nh_pksent:     counter(9) of packets transmitted */
+/* gw_sa / gw_buf[28]: storage for an AF_INET / AF_INET6 / AF_LINK gateway */
+```
+
+The nhop type enum, verbatim from `sys/net/route/nhop.h`, shows the four link-level resolution modes the datapath can be in:
+
+```c
+enum nhop_type {
+	NH_TYPE_IPV4_ETHER_RSLV = 1,	/* IPv4 ethernet without GW */
+	NH_TYPE_IPV4_ETHER_NHOP = 2,	/* IPv4 with pre-calculated ethernet encap */
+	NH_TYPE_IPV6_ETHER_RSLV = 3,	/* IPv6 ethernet, without GW */
+	NH_TYPE_IPV6_ETHER_NHOP = 4	/* IPv6 with pre-calculated ethernet encap*/
+};
+```
+
+The IPv4 lookup result structure, from `sys/netinet/in_fib.h`. It is the per-lookup scratch that `fib4_lookup_rt()` fills in, holding the resolved nhop, the resolved link-level entry, and the prepend/MTU the output path will use:
+
+```c
+struct route_in {
+	/* common fields shared among all 'struct route' */
+	struct nhop_object *ro_nh;
+	struct llentry *ro_lle;
+	char		*ro_prepend;
+	uint16_t	ro_plen;
+	uint16_t	ro_flags;
+	uint16_t	ro_mtu;	/* saved ro_rt mtu */
+	uint16_t	spare;
+	/* custom sockaddr */
+	struct sockaddr_in ro_dst4;
+};
+```
+
+The IPv6 extension-header chain, described by `struct ip6_exthdrs` in `sys/netinet6/ip6_output.c`. The datapath walks this linked list of mbufs — fixed header, hop-by-hop, first destination, routing, second destination — which is why IPv6 input is a loop over headers rather than a single fixed-size parse:
+
+```c
+/* Fields of struct ip6_exthdrs (sys/netinet6/ip6_output.c) */
+/* struct mbuf *ip6e_ip6;     /* fixed IPv6 header          */
+/* struct mbuf *ip6e_hbh;     /* hop-by-hop options         */
+/* struct mbuf *ip6e_dest1;   /* first destination options  */
+/* struct mbuf *ip6e_rthdr;   /* routing header             */
+/* struct mbuf *ip6e_dest2;   /* second destination options */
+```
+
+## Deep Dive
+
+### The input path: `ip_input()`
+
+`ip_input()` in `sys/netinet/ip_input.c` is the IPv4 entry point, called from the [`netisr(9)`](../../share/man/man9/netisr.9) context (not interrupt context). It pulls the IPv4 header off the mbuf, checks that the version is 4 and that the header length (`ip_hl`) is at least the minimum and not longer than the packet, and verifies the header checksum. A bad version bumps `ips_badvers`, a bad length bumps `ips_badhlen`/`ips_badlen`, and a bad checksum bumps `ips_badsum` — all fields of `struct ipstat` in `sys/netinet/ip_var.h`, all exposed as SDT probes (see Advanced Notes).
+
+After validation it calls the `PFIL_IN` hook chain. This is the seam: pf, ipfw, and ipsec each register a [`pfil(9)`](../../share/man/man9/pfil.9) hook here, and each can pass the packet, drop it, or modify it. The IP code does not know which modules are present; it just walks the chain. If a hook drops the packet, `ip_input()` returns.
+
+The next branch is the fragment check. If `ip_off` is non-zero or the `IP_MF` flag is set, the packet is a fragment and is handed to `ip_reass()` (in `sys/netinet/ip_reass.c`) instead of the protocol. Only the final, unfragmented datagram reaches the transport layer.
+
+Then the forward-vs-local decision. `ip_input()` tests whether the destination is one of the local addresses (via `in_localip()` in `sys/netinet/in.c`). If the packet is not local and `ipforwarding` is set, it calls `ip_forward()`. If it is local, it indexes the `ip_protox[]` table by `ip_p` (the protocol field) and calls the registered input handler — UDP, TCP, ICMP, raw IP, and so on.
+
+### The forwarding path: `ip_forward()`
+
+`ip_forward()` in `sys/netinet/ip_input.c` is what makes a FreeBSD box a router. It decrements the TTL; if the result is zero it drops the packet and sends an ICMP time-exceeded. Otherwise it performs the FIB lookup (`fib4_lookup()`) to find the next hop, checks that the egress interface differs from the ingress interface (if not, and `ipsendredirects` is set, it sends an ICMP redirect), rewrites the header fields the forwarder owns (TTL, checksum), and hands the packet to `ip_output()` to go back out. The statistics `ips_forward`, `ips_fastforward`, and `ips_cantforward` track these outcomes.
+
+### The output path: `ip_output()`
+
+`ip_output()` in `sys/netinet/ip_output.c` is called by the transport layer with a header that is only partly filled in. The caller has set the destination and the protocol; `ip_output()` is responsible for the rest. It resolves the source address (from the socket, or by lookup if the caller left it zero), fills in the TTL (from the socket or the default), assigns the identification field (`ip_id`) for new datagrams, and computes the header checksum — or, when the checksum can be deferred to the NIC, calls `in_delayed_cksum()` to arrange a partial checksum.
+
+`ip_output()` then calls `ip_output_pfil()` to run the `PFIL_OUT` hook chain, and finally `ip_output_send()`. That function resolves the next hop via `fib4_lookup()`, obtains the MTU from the nhop, and decides whether the packet fits. If it does not, and the `IP_DF` flag is not set, `ip_fragment()` splits the datagram into pieces that fit the link MTU and sends each. If `IP_DF` is set, the packet cannot be fragmented and is dropped with an ICMP "fragmentation needed" (the source of path-MTU discovery). Otherwise the single mbuf is pushed down to the interface with `if_transmit()`.
+
+### Fragmentation and reassembly
+
+`ip_fragment()` (send side, `sys/netinet/ip_output.c`) walks the payload in MTU-sized chunks, copies the IPv4 header into each fragment, sets the fragment offset and the `IP_MF` flag on all but the last, and recomputes each header's checksum. The `ips_fragmented` and `ips_ofragments` counters track this.
+
+`ip_reass()` (receive side, `sys/netinet/ip_reass.c`) is the inverse. It keys each fragment by (source, destination, protocol, identification) and attaches it to a `struct ipq`. When the final fragment arrives (the one with `IP_MF` clear), it splices the fragments together into a single mbuf chain and hands the complete datagram to the protocol, bumping `ips_reassembled`.
+
+Reassembly is a classic denial-of-service target: an attacker can send the first fragment of many datagrams and never send the rest, pinning memory in half-built `ipq` entries. FreeBSD defends against this three ways. First, every `ipq` has an `ipq_expire` deadline; `ipreass_callout()` (the slow-timer callback) reaps expired queues, bumping `ips_fragtimeout`. Second, there is a global cap on the number of in-flight reassembly queues, `net.inet.ip.maxfragpackets` (`sysctl_maxfragpackets` in `ip_reass.c`); when the cap is hit, new fragments are dropped (`ips_fragdropped`) and `ipreass_drain_lowmem()` / `ipreass_drain_tomax()` [reclaim](../sys/README_mbuf.md#glossary) space. Third, the mbuf accounting ties reassembly buffers to the general low-memory reclaim path.
+
+### The FIB/nhop fast path
+
+The rewrite's payoff is visible in `fib4_lookup()` in `sys/netinet/in_fib.c`, which is the function `ip_forward()` and `ip_output()` both call. Quoted verbatim:
+
+```c
+#ifdef FIB_ALGO
+struct nhop_object *
+fib4_lookup(uint32_t fibnum, struct in_addr dst, uint32_t scopeid,
+    uint32_t flags, uint32_t flowid)
+{
+	struct nhop_object *nh;
+	struct fib_dp *dp = &V_inet_dp[fibnum];
+	struct flm_lookup_key key = {.addr4 = dst };
+
+	nh = dp->f(dp->arg, key, scopeid);
+	if (nh != NULL) {
+		nh = nhop_select(nh, flowid);
+		/* Ensure route & ifp is UP */
+		if (NH_IS_VALID(nh)) {
+			if (flags & NHR_REF)
+				nhop_ref_object(nh);
+			return (nh);
+		}
+	}
+	RTSTAT_INC(rts_unreach);
+	return (NULL);
+}
+```
+
+Read that carefully: there is no lock. `dp->f` is the active algorithm's lookup function (radix, DXR, or bsearch, depending on what `fib_algo.c` selected for this table). It returns a pointer to an `nhop_object`. `nhop_select()` breaks a multipath group into a single next hop using the flow ID. `NH_IS_VALID(nh)` is the macro `(!((nh)->nh_flags & NHF_INVALID))` from `sys/net/route/nhop.h` — a single flag test, no lock. If the caller needs the nhop to outlive the current network epoch (for example, to hold it across a lock drop), it passes `NHR_REF` and `nhop_ref_object()` takes a reference.
+
+This is the whole point of the rewrite. In the pre-12.x design, the next hop lived inside `struct rtentry` and the datapath kept a per-CPU forwarding cache of those entries; every lookup had to check the cache, and every route change had to invalidate caches on every CPU under a lock. The split into a control-plane `rib_head` (locked, mutable) and a datapath `nhop_object` (immutable, reference-counted, epoch-protected) means the fast path reads memory that the control plane only ever *swaps*, never mutates in place. The control plane builds a new nhop, atomically repoints the route at it, and lets the old one be reclaimed by the epoch mechanism once no CPU is still holding it.
+
+### `fib_algo.c`: swapping the lookup structure
+
+`sys/net/route/fib_algo.c` is the framework that makes the lookup structure a runtime choice. Each algorithm is a `struct fib_lookup_module` (see Key Data Structures) registered with `fib_module_register()`. The framework keeps one `struct fib_dp` per routing table, and `fib_select_algo_initial()` / `fib_check_best_algo()` pick the algorithm whose `flm_get_pref()` callback best matches the table's size (reported via `struct rib_rtable_info`: `num_prefixes`, `num_nhops`, `num_nhgrp`). When a route change arrives, `flm_change_rib_item_cb` updates the structure; if the structure cannot absorb the change incrementally it returns `FLM_REBUILD` and the framework rebuilds it from the tree.
+
+The three algorithms that ship: the default radix tree (in `sys/net/radix.c`), DXR (a two-level trie with a compact direct-index stage, in `sys/netinet/in_fib_dxr.c`), and a binary-search array (`bsearch4_*` in `sys/netinet/in_fib_algo.c`) for very small tables. The IPv6 side mirrors this with `lradix6_*` in `sys/netinet6/in6_fib_algo.c`. Because the choice is per-table and per-family, a small host's default route table can run on the binary-search array while a router's large table runs on DXR, with the same `fib4_lookup()`/`fib6_lookup()` call site in both cases.
+
+### The IPv6 path
+
+`ip6_input()` in `sys/netinet6/ip6_input.c` is the v6 entry. The first difference is structural: after validating the fixed header, it walks the extension-header chain. `ip6_process_hopopts()` and `ip6_hopopts_input()` handle hop-by-hop options; `dest6_input()` (in `sys/netinet6/dest6.c`) handles destination options. A routing header can redirect the packet to an intermediate destination. Only after the chain is exhausted does it reach the forwarding-vs-local decision.
+
+The second difference is fragmentation. IPv6 moved fragmentation out of the base header and into a fragment extension header, and the spec forbids intermediate nodes from fragmenting. So `ip6_input()` does not call an in-network reassembler for forwarded traffic the way IPv4 does; a packet that needs fragmenting must be fragmented by its source. On the receive side, `frag6_input()` in `sys/netinet6/frag6.c` reassembles fragments addressed to the local host, using `struct ip6qbucket` (a per-bucket counter with a `lock` and `count`, capped by a global max-fragments limit) and `struct ip6asfrag` (a per-datagram queue entry with a `ip6af_tq` timeout queue entry and the `ip6af_m` mbuf chain), with `frag6_slowtimo()` reaping expired entries.
+
+The third difference is neighbor resolution. IPv4 uses ARP (`arpresolve()` in `sys/netinet/if_ether.c`); IPv6 uses Neighbor Discovery, which replaces ARP's address resolution with Router Solicitation/Advertisement and Neighbor Solicitation/Advertisement, and adds stateless address autoconfiguration. The `enum nhop_type` values `NH_TYPE_IPV6_ETHER_RSLV` and `NH_TYPE_IPV6_ETHER_NHOP` are the v6 analogues of the v4 pair, and the nhop carries the link-level resolution state for either.
+
+The fourth difference is scope. A link-local IPv6 address (`fe80::/10`) is only meaningful on one link, so the kernel tags it with a [scope ID](#glossary) — the interface index — to disambiguate which `fe80::1` is meant. That scope ID is threaded through the lookup key (the `scopeid` argument to `fib4_lookup()`/`fib6_lookup()`) and stored in `struct scope6_id` (in `sys/netinet6/in6_var.h`), which maps address scopes to interface indices.
+
+## Flow / Diagram
+
+```mermaid
+flowchart TD
+  subgraph InputGroup ["IP Input (sys/netinet, sys/netinet6)"]
+    NI[netisr dispatch] --> IPIN[ip_input / ip6_input]
+    IPIN --> VHDR[verify header + checksum]
+    VHDR --> PFILIN[pfil PFIL_IN hooks]
+    PFILIN --> FRAGQ{fragment?}
+    FRAGQ -- "yes" --> REASS[ip_reass / frag6_input]
+    FRAGQ -- "no" --> FWDQ{forward?}
+    FWDQ -- "yes" --> FWD1[ip_forward / ip6_forward]
+    FWDQ -- "no, local" --> PROTO[ip_protox / per-protocol input]
+  end
+  subgraph FIBGroup ["FIB / nhop (sys/net/route)"]
+    FWD1 --> FIB4[fib4_lookup / fib6_lookup]
+    FILL2 --> FIB4
+    FIB4 --> NHOP[immutable nhop_object]
+    NHOP --> SEL[nhop_select + NH_IS_VALID]
+  end
+  subgraph OutputGroup ["IP Output (sys/netinet, sys/netinet6)"]
+    L4[transport calls ip_output / ip6_output] --> FILL2[fill source / TTL / ID / checksum]
+    FILL2 --> PFILOUT[pfil PFIL_OUT hooks]
+    PFILOUT --> FRAGOUT{too big, may fragment?}
+    FRAGOUT -- "yes" --> IPFRAG[ip_fragment]
+    FRAGOUT -- "no" --> SEND[ip_output_send / ip6_output_send]
+  end
+  SEL --> SEND
+  IPFRAG --> IFNET[if_transmit]
+  SEND --> IFNET
+  REASS --> PROTO
+  PROTO --> L4UP[protocol input handler]
+```
 
 ## Advanced Notes
-**Debugging with DTrace:** FreeBSD's IP layer is instrumented with SDT (Static DTrace Traces). Probes like `ip:input:begin`, `ip:output:begin`, and `fib:lookup:begin` allow kernel developers to trace packet flow without recompiling the kernel. For example, `dtrace -n 'ip:output:begin { printf("Dst: %s\n", copyinstr(arg1)); }'` can trace outgoing packets.
-**Performance Implications:** The `nhop_object` rewrite drastically reduces lock contention on the forwarding path. Because `nhop_object` objects are immutable, the fast path avoids `sx` or `rwlock` acquisition during route traversal. This is critical for high-throughput routers. However, control plane operations (route changes) still require locking and may trigger expensive FIB rebuilds.
-**Race Conditions:** The epoch-based reclamation system ensures that `nhop_object` objects are not freed while a CPU is still referencing them in the fast path. Developers must be careful to use `epoch_wait()` when modifying routing tables to ensure all in-flight packets have completed their traversal.
-**Fragmentation-DoS:** The reassembly queues (`ipq` for IPv4, `ip6qbucket` for IPv6) are protected by timeouts and size limits. An attacker can flood the reassembly queue with malformed fragments, causing memory exhaustion. FreeBSD mitigates this by limiting the number of fragments per source and aggressively pruning old fragments.
+
+**Debugging with DTrace / SDT.** The IP layer is heavily instrumented with SDT probes declared in `sys/netinet/in_kdtrace.h`. The `mib` provider exposes one [probe](../kern/README_driver.md#glossary) per `struct ipstat` counter — `mib::ip:count:ips_total`, `mib::ip:count:ips_badsum`, `mib::ip:count:ips_forward`, `mib::ip:count:ips_noroute`, `mib::ip:count:ips_reassembled`, `mib::ip:count:ips_fragtimeout`, and so on. The `ip` provider (via the `IP_PROBE` macro) carries per-packet events. A useful one-liner to watch forwarding and reassembly live:
+
+```
+dtrace -n 'mib::ip:count:ips_forward{ @f = count() }
+          mib::ip:count:ips_reassembled{ @r = count() }
+          mib::ip:count:ips_noroute{ @n = count() }'
+```
+
+The `struct ipstat` fields in `sys/netinet/ip_var.h` are the authoritative list of what is counted; each has a matching probe. For the FIB side, the `net.route` counters and the per-nhop `nh_pksent` counter (a [`counter(9)`](../../share/man/man9/counter.9)) let you confirm which next hop a flow is actually using.
+
+**Locking model — what is locked vs. lock-free.** The control plane takes `rib_lock` (an `rmlock` in `struct rib_head`) for every route add/delete/change, and `fib_algo.c` runs the algorithm's change callback under it. The datapath takes no lock at all: `fib4_lookup()`/`fib6_lookup()` read the immutable `nhop_object` and rely on the network epoch to guarantee the object is not freed while in use. The cost of a route change is paid once, on the CPU that made it, not on every CPU forwarding packets. This is the direct answer to the cache-line-bouncing problem on multiprocessors that Tanenbaum and Bos describe in *Modern Operating Systems*: a shared, contended lock on the forwarding path causes the cache line holding it to ping-pong between cores, so the design removes the lock from that path entirely rather than optimizing it.
+
+**Choosing a FIB algorithm.** Because the algorithm is selected per table by `flm_get_pref()`, you can watch which one is active and switch it for experimentation. Small tables (a desktop's handful of routes) favor the binary-search array because it is a flat, cache-friendly structure; large tables favor DXR for its compact two-level trie. The radix tree is the always-available default and the fallback when no specialized algorithm claims the table. If you are tuning a router, the choice between these three is often worth more than any micro-optimization in the packet path, because it changes the constant factor on every lookup.
+
+**Pitfalls.** (1) A packet that arrives fragmented never reaches the transport layer until `ip_reass()` has all the pieces; if you are tracing a "missing" UDP packet, check `ips_fragdropped` and `ips_fragtimeout` first. (2) The `IP_DF` flag turns path-MTU problems into hard drops with an ICMP "fragmentation needed" rather than silent fragmentation — when a flow stalls on a jumbo/MTU mismatch, that ICMP is the signal. (3) `NH_IS_VALID()` is the single gate on the fast path; a next hop with `NHF_INVALID` set (interface down, route withdrawn but not yet reaped) is reported as a miss even though the radix tree still points at it, which is why a transient `ips_noroute` spike can appear during a route flap. (4) On the v6 side, forgetting the scope ID when constructing a link-local lookup is a common bug: two `fe80::` addresses on different interfaces are the same 128-bit value and only the scope ID tells them apart.
+
+**Theory connection.** *Operating System Concepts* (9th ed.) describes the router's forwarding table exactly as this code implements it: a FIB organized so that the most specific routes are matched first, plus a route cache that stores only fully-resolved destination entries (no wildcards) so that the common case — a repeated lookup to the same destination — is a single cache hit rather than a full table walk. The FreeBSD rewrite generalizes that textbook route cache: instead of caching resolved `rtentry` copies per CPU, it caches the *next hop itself* as an immutable, reference-counted object shared across all CPUs, and it makes the matching structure (the "most specific first" walk) a swappable algorithm. The pfil seam matches the same text's note that "at various stages, the IP software passes packets to a separate section of code for firewall management" — FreeBSD formalizes that "separate section" as a registration-based hook chain so the IP code never names the filter it is calling.
 
 ## See Also
 - [Network Stack — Architecture and Packet Flow](../net/README.md)
@@ -205,13 +375,12 @@ flowchart TD
 
 
 
-- [`sys/netinet/ip_input.c`](ip_input.c)
-- [`sys/netinet/ip_output.c`](ip_output.c)
-- [`sys/netinet6/ip6_input.c`](../netinet6/ip6_input.c)
-- [`sys/netinet6/ip6_output.c`](../netinet6/ip6_output.c)
-- [`sys/net/route/nhop.c`](../net/route/nhop.c)
-- [`sys/net/route/fib_algo.c`](../net/route/fib_algo.c)
+- **Transport Protocols** chapter — what happens after `ip_input()` dispatches through `ip_protox[]` (TCP, UDP, SCTP).
+- **mbuf** chapter — mbuf chains, `m_pullup()`, and `pkthdr.csum_flags`, which the IP layer relies on but does not define.
+- **Locking Primitives** chapter — `rmlock`, epochs, and atomics that the FIB/nhop split depends on.
+- Source directories: [`sys/netinet/`](.) (IPv4 input/output/reassembly), [`sys/netinet6/`](../netinet6) (IPv6 input/output/frag6/NDP), [`sys/net/route/`](../net/route) (fib_algo, nhop, route_ctl, route_tables), [`sys/net/pfil.c`](../net/pfil.c) (the hook framework), [`sys/net/netisr.c`](../net/netisr.c) (the dispatch boundary).
+- Man pages: [`ip(4)`](../../share/man/man4/ip.4), [`ip6(4)`](../../share/man/man4/ip6.4), [`route(4)`](../../share/man/man4/route.4), [`arp(4)`](../../usr.sbin/arp/arp.4), `nd6(4)`, [`pfil(9)`](../../share/man/man9/pfil.9), [`netisr(9)`](../../share/man/man9/netisr.9), [`mbuf(9)`](../../share/man/man9/mbuf.9), [`counter(9)`](../../share/man/man9/counter.9), [`epoch(9)`](../../share/man/man9/epoch.9), `sdt(9)`, [`ifnet(9)`](../../share/man/man9/ifnet.9).
 
 ---
 
-> _Generated by [DaemonDocs](https://github.com/ocochard/DaemonDocs) on 2026-05-01 10:52 UTC using model `Qwen3.6-35B-A3B-UD-Q4_K_XL` (llama.cpp build `b8985-27aef3dd9`). AI-generated content — verify against source before relying on it._
+> _Generated by [DaemonDocs](https://github.com/ocochard/DaemonDocs) on 2026-09-01 05:51 UTC using model `Qwen3.8-27B-Q8_0` (llama.cpp build `b10553-cd26896c1`). AI-generated content — verify against source before relying on it._

@@ -5,586 +5,423 @@
 **Navigation:**
   **Up:** [Kernel Core — Structure and Entry Point](../README.md) ▸ [Source Tree — Layout and Conventions](../../README_internals.md)
   **Related:** [Network Stack — Architecture and Packet Flow](../net/README.md) | [VNET — Virtual Network Stacks](../net/README_vnet.md) | [mbuf — Network Buffer Allocation and Chaining](../sys/README_mbuf.md) | [IP Layer — IPv4, IPv6, Forwarding, FIB, and nhop](README_ip.md)
-  **All chapters:** [Source Tree — Layout and Conventions](../../README_internals.md) | [Boot Process — UEFI Bootloader to Kernel Handoff](../../stand/efi/loader/README.md) | [Kernel Core — Structure and Entry Point](../README.md) | [Build System — buildworld and buildkernel](../../share/mk/README.md) | [Virtual Memory Subsystem — vm_page, UMA, and Pagers](../vm/README.md) | [Process Management — Scheduling and Lifecycle](../kern/README_process.md) | [Locking Primitives — Mutexes, sx, rmlocks, and Atomics](../kern/README_locking.md) | [Buffer Cache — Block I/O Subsystem](../vm/README_bcache.md) ...
+  **All chapters:** [Source Tree — Layout and Conventions](../../README_internals.md) | [Boot Process — UEFI Bootloader to Kernel Handoff](../../stand/efi/loader/README.md) | [Kernel Core — Structure and Entry Point](../README.md) | [Build System — buildworld and buildkernel](../../share/mk/README.md) | [System Calls and Image Activation — Entry, sysent, and exec](../kern/README_syscall.md) | [Kernel Modules and the Linker — KLD, SYSINIT, and linker sets](../kern/README_kld.md) | [Virtual Memory Subsystem — vm_page, UMA, and Pagers](../vm/README.md) | [Process Management — Scheduling and Lifecycle](../kern/README_process.md) ...
 ---
-
-
-> ⚠ **UNVERIFIED DRAFT** — reviewer did not explicitly approve this draft. Treat claims as suspect until manually reviewed.
 
 
 ## Quick Summary
 
-FreeBSD's Layer 4 implementation provides the bridge between application sockets and the network stack. At its foundation sits the `inpcb` (Internet Protocol Control Block), a protocol-independent structure that binds a socket to network addresses and ports. The `inpcb` serves as the common ancestor for all IP transport protocols — TCP, UDP, and raw IP — enabling the kernel to demux incoming packets to the correct socket using hash tables keyed on the five-tuple (source/destination IP, source/destination port, and protocol). This design means that the kernel never needs a per-connection lookup table at the IP layer; instead, incoming packets are routed through `in_pcblookup_hash()` which searches the `inpcbinfo` hash buckets to find the matching `inpcb`.
+At layer 4 the kernel's job is to take a stream of IP packets and turn them into
+per-socket [state](../netpfil/pf/README.md#glossary). FreeBSD does this with two cooperating structures. `struct
+[inpcb](#glossary)` is the protocol-independent half: it records the socket's [four-tuple](#glossary)
+(local/remote address and port, plus the [FIB](README_ip.md#glossary)), owns the socket reference, and —
+crucially — is what gets hashed into the global inpcb hash tables. Those tables
+are the demux: an incoming TCP or UDP packet is looked up by its four-tuple and
+the matching socket is returned without any per-connection hop table. Every
+protocol that binds to an IP port — TCP, UDP, raw IP, divert — reuses the same
+`inpcb`, which is why `in_pcb.c` is shared by all of them.
 
-For TCP connections, a `tcpcb` (TCP Control Block) hangs off the `inpcb` and holds all TCP-specific state: sequence numbers, RTT estimators, congestion window, selective ACK (SACK) hints, and the full TCP state machine. This separation allows UDP and other protocols to reuse the `inpcb` infrastructure without paying the overhead of TCP state. The TCP state machine — defined in `tcp_fsm.h` — walks through eleven states from CLOSED through TIME_WAIT, with `tcp_input.c` implementing the receive-side transitions and `tcp_output.c` handling segment emission decisions.
+`struct tcpcb` hangs off the `inpcb` as its `ppcb` (private protocol control
+block) and carries everything TCP-specific: the send/receive sequence space, the
+RTT estimator, the congestion window and slow-start threshold, the timers, and
+the current state-machine state. UDP, by contrast, has almost no per-connection
+state at all — `struct udpcb` is a thin wrapper that mostly just points back at
+its `inpcb` — which is why `udp_usrreq.c` is a fraction the size of the TCP
+files and can lean on `in_pcb.c` for nearly all of its work.
 
-The stack defends against SYN floods using the syncache, a dedicated hash table that holds half-open connections before a full `tcpcb` is allocated. When the syncache overflows, SYN cookies allow the kernel to respond to SYNs without consuming kernel memory, at the cost of delaying the three-way handshake. On the send side, `tcp_output.c` implements Nagle's algorithm, delayed ACKs, and TCP Segmentation Offload (TSO), deciding when to actually emit segments based on application data availability and timer events.
+The TCP state machine lives in `tcp_input.c`. It validates each incoming header,
+then branches on the current state: a `LISTEN` socket routes SYNs through the
+[syncache](#glossary) (a small fixed entry, or a stateless [SYN cookie](#glossary) when that overflows) so
+a SYN flood cannot exhaust memory; an `ESTABLISHED` socket processes data, ACKs,
+fast retransmits, and SACK (Selective ACK, a TCP option that acknowledges
+out-of-order blocks) blocks. The send side, `tcp_output.c`, decides each
+call whether a segment should actually be emitted or held ([Nagle](#glossary), delayed ACK,
+push), and how long to make it ([MSS](#glossary), [TSO](#glossary) offload). `tcp_timer.c` drives the
+retransmit, persist, keepalive, and 2MSL timers through the kernel [callout](#glossary)
+facility. Finally, congestion control is pluggable: the `cc_algo` KPI (kernel
+provider interface, FreeBSD's term for a module function-pointer table) in
+`sys/netinet/cc/cc.h` lets CUBIC (the default), NewReno, DCTCP (Data Center TCP, a
+congestion controller using ECN (Explicit Congestion Notification, a TCP/IP
+mechanism where routers set a congestion mark in the IP header instead of
+dropping the packet) marks), HTCP (Hybrid TCP, a congestion
+controller blending Reno and AIMD), and CDG (Congestion-Delay Gradient, a
+delay-based congestion controller) swap in per-connection window logic, and the
+wider `tcp_function_block` KPI lets RACK (Recent Acknowledgment, a
+timestamp-based loss-detection algorithm) and BBR (Bottleneck Bandwidth and
+Round-trip propagation time, a model-based congestion controller) replace the
+entire input/output/timer state machine, not just the window controller.
 
-Timer-driven events — retransmission, persistence probes, keepalive, and the 2MSL wait in TIME_WAIT — are managed through FreeBSD's callout framework in `tcp_timer.c`. The congestion control subsystem, accessible through the `cc_algo` KPI, lets modules like CUBIC (the default), NewReno, DCTCP, and HTCP plug in to adjust the congestion window on ACKs and loss signals. For even deeper customization, `tcp_function_block` allows entire input/output state machines like RACK and BBR to replace the default TCP implementation, not just the congestion controller.
+## Glossary
 
-UDP, by contrast, is remarkably lightweight. The `udp_usrreq.c` implementation reuses the `inpcb` hash for demuxing but adds virtually no per-connection state beyond what `in_pcb.c` provides. UDP sockets are bound and connected through the same `in_pcbbind()` and `in_pcbconnect()` routines, but once bound, a UDP socket queues incoming datagrams on the socket buffer without sequence tracking, acknowledgments, or flow control.
+**inpcb** — the Internet Protocol Control Block; the kernel structure that binds a socket to an IP address/port pair and is hashed for packet demux.
+
+**ppcb** — the private protocol control block pointer inside an `inpcb`; for TCP it points at the `tcpcb`, for UDP at the `udpcb`.
+
+**four-tuple** — the (local address, local port, remote address, remote port) key used to identify a connection and to index the inpcb hash.
+
+**syncache** — a small fixed-size cache of half-open (SYN-received) connections that stands in for a full `tcpcb` so a SYN flood cannot exhaust memory.
+
+**SYN cookie** — a stateless fallback in which the listening socket encodes the connection's key parameters into the SYN-ACK's initial sequence number, so the server holds no per-half-open state at all.
+
+**MSS** — maximum segment size; the largest TCP payload a segment may carry, derived from the path MTU.
+
+**TSO** — TCP Segmentation Offload; the NIC slices one large buffer into MSS-sized segments, so the kernel hands it a single oversized mbuf.
+
+**Nagle** — the rule that a small unacknowledged segment is held back until the previous one is ACKed or a full-sized segment is ready, to avoid flooding the network with tiny packets.
+
+**2MSL** — twice the maximum segment lifetime; the quiet interval a connection keeps its `tcpcb` in `TIME_WAIT` so delayed segments from the old incarnation cannot corrupt the next one.
+
+**callout** — the kernel's one-shot timer facility ([`callout(9)`](../../share/man/man9/callout.9)); a function scheduled to run once after a given delay, used to drive every TCP timer.
 
 ## Architecture
 
-The L4 implementation spans several key source files in `sys/netinet/`:
+The split between `inpcb` and `tcpcb` is the organizing idea of the whole
+chapter. `struct inpcb` (defined in `sys/netinet/in_pcb.h`, implemented in
+`sys/netinet/in_pcb.c`) is deliberately protocol-agnostic. It stores the
+four-tuple — through the embedded `struct in_conninfo` / `struct in_endpoints`
+— the socket it belongs to, its reference count, the FIB number, and the pointer
+`inp_ppcb` to the protocol-specific block. Because the four-tuple and the hash
+insertion live here, every IP-port protocol gets demux for free: `in_pcblookup()`
+(`sys/netinet/in_pcb.c`) hashes the incoming packet's addresses and ports and
+walks the matching bucket to return the owning `inpcb`.
 
-**`sys/netinet/in_pcb.c` and `sys/netinet/in_pcb.h`** define the protocol-independent connection block. The `inpcbinfo` structure maintains a hash table of `inpcb` pointers, keyed on the five-tuple. When a packet arrives from the IP layer, `in_pcblookup_hash()` searches this table to find the matching socket. The `inpcb` itself contains endpoints (`inp_inc`) with local/foreign ports and addresses, protocol-specific pointers, and socket references.
+TCP adds `struct tcpcb` (`sys/netinet/tcp_var.h`, helpers in
+`sys/netinet/tcp_subr.c`) on top. The `tcpcb` is allocated by `tcp_subr.c` and
+stashed in `inp_ppcb`; it owns the sequence space (`snd_una`/`snd_max` on the
+send side, `rcv_nxt` on the receive side), the RTT estimator, the congestion
+window and slow-start threshold, the `t_state` field that holds the current
+`TCPS_*` state, and the `t_callout`/`t_timers[]`/`t_precisions[]` fields that
+`tcp_timer.c` uses to arm the timers. UDP's `struct udpcb`
+(`sys/netinet/udp_var.h`) is the opposite extreme — it is essentially a pointer
+back to its `inpcb` plus a couple of flags, which is why `udp_usrreq.c` is so
+small: nearly all of its logic (bind, connect, lookup, free) is already in
+`in_pcb.c`.
 
-**`sys/netinet/tcp_subr.c`** contains foundational TCP functions that operate on the connection lifecycle regardless of state. Key functions include `tcp_init()` for stack initialization, `tcp_ctlinput()` for processing ICMP control messages (such as destination unreachable), `tcp_close()` for tearing down connections, and `tcp_drop()` for forcibly aborting connections due to errors or timeouts. This file also handles TCP-level protocol statistics, processes ICMP errors for TCP, and manages the TCP protocol control block initialization and cleanup. It serves as the glue between the TCP state machine and the IP/ICMP layers, ensuring that control signals from the network layer are properly translated into TCP state transitions.
-
-**`sys/netinet/tcp_var.h`** defines `struct tcpcb`, which embeds a pointer to its parent `inpcb` (`t_inpcb`) and contains TCP-specific state: sequence numbers (`snd_una`, `snd_nxt`, `rcv_nxt`, `rcv_up`), RTT estimation (`sa`, `sv`, `rtt_base`), congestion control variables (`cwnd`, `ssthresh`), SACK state (`sackhint`), and timer structures. The `tcptemp` structure provides temporary storage for options during connection setup.
-
-**`sys/netinet/tcp_fsm.h`** enumerates the eleven TCP states (TCPS_CLOSED through TCPS_TIME_WAIT) and defines the `tcp_outflags[]` array that maps each state to the TCP flags to set when sending segments. The `TCPS_HAVERCVDSYN()`, `TCPS_HAVEESTABLISHED()`, and `TCPS_HAVERCVDFIN()` macros provide state-class checks used throughout the code.
-
-**`sys/netinet/tcp_input.c`** is the receive-side state machine. It validates headers, checks sequence numbers, processes SYNs through the syncache, handles established-state data delivery, manages SACK blocks, and triggers state transitions. The function `tcp_input()` is the main entry point, called from the IP layer after checksum validation.
-
-**`sys/netinet/tcp_output.c`** implements the send side. Functions like `tcp_output()` decide when to emit segments based on Nagle's algorithm, delayed ACK timers, push flags, and available data. It handles MSS selection, TSO offload, and calls into the congestion control module for window updates.
-
-**`sys/netinet/tcp_timer.c`** drives all TCP timers through FreeBSD's callout framework. Key timers include retransmission (RTO-based), persistence (to probe zero-window receivers), keepalive (idle connection detection), and the 2MSL wait. The `tcp_timer_activate()` and `tcp_timer_stop()` functions manage callout scheduling. Internal timer handlers such as `tcp_timer_2msl()`, `tcp_timer_keep()`, and `tcp_timer_persist()` are invoked by the callout framework to perform state-specific actions.
-
-**`sys/netinet/tcp_syncache.c`** implements the SYN cache, a hash table of half-open connections. When a SYN arrives for a listening socket, `syncache_add()` either finds an existing entry, creates a new one, or generates a SYN cookie. The syncache protects against SYN floods by limiting memory usage for half-open connections.
-
-**`sys/netinet/udp_usrreq.c`** implements UDP's socket-level operations. Functions like `udp_input()`, `udp6_input()`, `udp_send()`, and `udp6_send()` handle datagram processing. UDP reuses `in_pcblookup_hash()` for demuxing but adds no sequence tracking, acknowledgments, or state management beyond the `inpcb` itself.
-
-**`sys/netinet/cc/cc.h`** and **`sys/netinet/cc/cc.c`** define the congestion control KPI. The `cc_algo` structure lists function pointers for connection initialization, ACK processing, congestion signals, and cleanup. The `cc_var` structure passes per-connection state to these functions. Modules register via `cc_register_algo()` and are selected via the `net.inet.tcp.cc.algorithm` sysctl.
-
-**`sys/netinet/tcp_stacks/`** contains modular TCP implementations. RACK (`tcp_rack.h`) and BBR (`tcp_bbr.h`) define their own state structures and register via `tcp_function_block` to replace the default input/output state machine, not just the congestion controller.
+The input path is split into three files. `tcp_input.c` owns the state machine
+and the syncache interaction; `tcp_syncache.c` owns the half-open cache and the
+SYN-cookie encode/decode; `tcp_output.c` owns the send side; and `tcp_timer.c`
+owns the timers. Where `tcp_input` is called from (the IP layer's protocol
+dispatch, RSS steering, IPsec) belongs to the IP Layer chapter; this chapter
+starts at the point where a validated TCP header and its payload [mbuf](../sys/README_mbuf.md#glossary) arrive at
+`tcp_input()`.
 
 ## Key Data Structures
 
-### struct inpcb (sys/netinet/in_pcb.h)
-
-```c
-struct inpcb {
-    struct inpcb    *inp_hash_exact;      /* hash entry for exact match */
-    LIST_ENTRY(inpcb) inp_lbgroup_list;   /* load balancer group list */
-    struct socket   *inp_socket;          /* back pointer to socket */
-    struct in_conninfo inp_inc;           /* protocol-independent endpoints */
-    u_char           inp_vflag;           /* INP_IPV4 or INP_IPV6 */
-    u_char           inp_ip_ttl;          /* time to live of packets */
-    u_int8_t         inp_flags;           /* state flags (see below) */
-    /* ... protocol-specific pointer follows */
-};
-```
-
-The `inpcb` is allocated via `in_pcballoc()` and hashed into the `inp_hash_exact` hash table. The `inp_inc` field contains `in_endpoints` with `ie_fport`, `ie_lport`, and address fields. The protocol-specific pointer (e.g., `struct tcpcb *` for TCP) is stored immediately after the `inpcb` in memory, accessible via casting.
-
-### struct inpcbinfo (sys/netinet/in_pcb.h)
-
-```c
-struct inpcbinfo {
-    /* fields elided */
-};
-```
-
-Each protocol (TCP, UDP) has its own `inpcbinfo` instance. TCP uses `tcp_pcbinfo` and UDP uses `udp_pcbinfo`. The hash table enables O(1) lookup by five-tuple.
-
-### struct tcpcb (sys/netinet/tcp_var.h)
-
-```c
-struct tcpcb {
-    struct  inpcb t_inpcb;        /* embedded inpcb */
-    struct  tseg_qent *t_segq;    /* retransmit queue head */
-    struct  callout t_callout;    /* main callout */
-    struct  callout t_timers[TT_N]; /* callouts for timers */
-    int     t_precisions[TT_N];   /* timer precision values */
-    u_long  snd_una;              /* send unacknowledged */
-    u_long  snd_nxt;              /* send next */
-    u_long  snd_wl1;              /* seq # for window update */
-    u_long  snd_wl2;              /* ack # for window update */
-    u_long  snd_up;               /* send urgent pointer */
-    u_long  rcv_nxt;              /* receive next */
-    u_long  rcv_up;               /* receive urgent pointer */
-    u_long  snd_wnd, rcv_wnd;     /* receive and send window */
-    u_long  rcv_adv;              /* advertised next receive */
-    u_long  snd_max;              /* highest seqno sent */
-    u_long  snd_cwnd;             /* congestion-controlled window */
-    u_long  snd_ssthresh;         /* slow-start threshold */
-    u_long  snd_recover;          /* for Fast Recovery */
-    int     t_rxtshift;           /* log(2) of rexmt exp. backoff */
-    int     t_rxtcur;             /* current retransmit value */
-    int     t_idle;               /* idle time (for keepalive) */
-    int     t_rcvtime;            /* rcvd time (for keepalive) */
-    int     t_softerror;          /* possible soft error ahead */
-    int     t_state;              /* state of this connection */
-    int     t_flags;              /* flags (see below) */
-    /* SACK state */
-    struct  sackhint sackhint;
-    /* ... congestion control and modular stack state follows */
-};
-```
-
-The `tcpcb` embeds `t_inpcb` as its first member, allowing the `inpcb` pointer to be obtained via `&tp->t_inpcb`. The `t_timers[]` array holds callouts for each TCP timer. The `t_segq` chain holds segments awaiting acknowledgment. RTT estimation uses the classic Jacobson/Karels algorithm with `sa` (smoothed average) and `sv` (smoothed variance).
-
-### struct in_conninfo (sys/netinet/in_pcb.h)
+The four-tuple is stored in a small, cache-friendly struct that is shared by the
+inpcb and (by reference) by the syncache. From `sys/netinet/in_pcb.h`:
 
 ```c
 struct in_conninfo {
-    uint8_t         inc_flags;
-    uint8_t         inc_len;
-    uint16_t        inc_fibnum;
-    struct in_endpoints inc_ie;
+	uint8_t		inc_flags;
+	uint8_t		inc_len;
+	uint16_t	inc_fibnum;
+	struct in_endpoints {
+		uint16_t	ie_fport;		/* foreign port */
+		uint16_t	ie_lport;		/* local port */
+		union in_dependaddr {
+			struct {
+				uint32_t __pad[3];
+				struct in_addr id4_addr;
+			};
+			struct in6_addr	id6_addr;
+		} ie_dependfaddr, ie_dependladdr;
+#define	ie_faddr	ie_dependfaddr.id4_addr
+#define	ie_laddr	ie_dependladdr.id4_addr
+#define	ie6_faddr	ie_dependfaddr.id6_addr
+#define	ie6_laddr	ie_dependladdr.id6_addr
+		uint32_t	ie6_zoneid;		/* scope zone id */
+	} inc_ie;
 };
 ```
 
-The `in_endpoints` structure contains `ie_fport`, `ie_lport`, and protocol-dependent address fields (`ie_faddr`, `ie_laddr` for IPv4; `ie6_faddr`, `ie6_laddr` for IPv6). Macros like `inp_fport` and `inp_faddr` provide direct access to these fields from `inpcb`.
+Note the `union in_dependaddr`: the same storage is either an IPv4 address (with
+padding so the union is 16 bytes) or an IPv6 address, which is how one `inpcb`
+can serve both families. The header carries an explicit warning that
+`tcp_syncache.c` uses the first five 32-bit words (the ports and foreign
+address) to generate its hash, so these fields "shouldn't be moved" — a good
+example of a layout constraint imposed by a second consumer of the struct.
+Convenience macros in the same header let code write `inp_fport`, `inp_lport`,
+`inp_faddr`, `inp_laddr` (and the `in6p_*` forms) instead of reaching through
+`inp_inc.inc_ie`.
 
-### struct cc_algo (sys/netinet/cc/cc.h)
+The `tcpcb` (`sys/netinet/tcp_var.h`) is where all TCP state lives. The fields
+that matter for this chapter, as surfaced by the header, include the send
+pointers `snd_una` (oldest unacknowledged byte) and `snd_max`, the negotiated
+` t_maxseg` (MSS), the current `t_state`, and the timer machinery `t_callout`,
+`t_timers[TT_N]`, and `t_precisions[TT_N]` — one callout plus a per-timer
+active flag and a precision value, indexed by the `TT_*` timer id (retransmit,
+persist, keepalive, delayed-ACK, 2MSL). The congestion window, slow-start
+threshold, and RTT/RTT-var estimators live here too, as do the SACK bookkeeping
+structures (`sackhole`, `sackhint`) referenced by the input path.
+
+The congestion-control KPI is `struct cc_algo` (`sys/netinet/cc/cc.h`). Each
+module fills in a table of function pointers and a name, and the stack calls
+into that table on each relevant event. The per-connection scratch space the
+stack passes to a module is `struct cc_var` (also in `sys/netinet/cc/cc.h`):
 
 ```c
-struct cc_algo {
-    char            name[TCP_CA_NAME_MAX];
-    void            (*mod_init)(void);
-    void            (*mod_destroy)(void);
-    size_t          (*cc_data_sz)(void);
-    /* ... other function pointers elided */
-    STAILQ_ENTRY(cc_algo) next;
+struct cc_var {
+	void		*cc_data; /* Per-connection private CC algorithm data. */
+	int		bytes_this_ack; /* # bytes acked by the current ACK. */
+	tcp_seq		curack; /* Most recent ACK. */
+	uint32_t	flags; /* Flags for cc_var (see below) */
+	struct tcpcb	*tp; /* Pointer to tcpcb */
+	uint16_t	nsegs; /* # segments coalesced into current chain. */
+	uint8_t		labc;  /* Dont use system abc use passed in */
 };
 ```
 
-Each congestion control module implements these callbacks. The `mod_init()` function initializes the module; `mod_destroy()` cleans up. The `cc_data_sz()` returns the size of per-connection data. The `next` field links modules in the registration list. The `cc_var` structure passes per-connection state (bytes acked, current ACK, flags) to these functions.
+`cc_data` points at the module's own per-connection state (sized by the module's
+`cc_data_sz()`), and `tp` is the back-pointer to the `tcpcb` so the module can
+read and write `snd_cwnd`, `t_rtt`, and friends. The wider modular-stack KPI is
+`struct tcp_function_block` (`sys/netinet/tcp_var.h`), whose first field is
+`tfb_tcp_block_name[TCP_FUNCTION_NAME_LEN_MAX]` followed by a table of function
+pointers (including `tfb_tcp_output`) that the stack dispatches through instead
+of calling `tcp_input`/`tcp_output`/`tcp_timer` directly.
 
-### struct tcp_function_block (sys/netinet/tcp_var.h)
+UDP's only truly per-connection structure is the thin `struct udpcb`
+(`sys/netinet/udp_var.h`), which begins with `u_inpcb` — a pointer back to the
+owning `inpcb` — plus a small set of flags and a tunneled-ICMP callback. The
+input/output glue is the overlaid header `struct udpiphdr`:
 
 ```c
-struct tcp_function_block {
-    char            tfb_tcp_block_name[TCP_FUNCTION_NAME_LEN_MAX];
-    const struct tcp_function *tfb_functions;
-    int             tfb_refcnt;
+struct udpiphdr {
+	struct ipovly	ui_i;		/* overlaid ip structure */
+	struct udphdr	ui_u;		/* udp header */
 };
 ```
 
-The `tcp_function_block` replaces entire function pointers in the `tcpcb`, including input processing, output generation, and timer handlers. RACK and BBR register their own function blocks to replace the default TCP state machine, not just the congestion controller.
+and the counters are `struct udpstat`, with fields such as `udps_ipackets`,
+`udps_noport`, `udps_badsum`, `udps_fullsock`, and (on the output side)
+`udps_fastout` — the "fast path" counter is the one that proves UDP is doing
+almost no per-connection work.
 
 ## Deep Dive
 
-### The inpcb Hash and Packet Demux
+**Binding and hashing.** When a socket is created and bound, `in_pcballoc()`
+(`sys/netinet/in_pcb.c`) allocates the `inpcb` (from a per-protocol [UMA](../vm/README_bcache.md#glossary)
+(User-Managed Allocator, the kernel's scalable per-CPU memory allocator) [zone](../vm/README.md#glossary),
+chosen over general-purpose kmem because inpcbs are allocated and freed at high
+frequency on the packet fast path and benefit from per-CPU caching), and
+`in_pcbbind()` / `in_pcbbind_setup()` fill in the local address and port,
+choosing an ephemeral port from the `ipport_firstauto`..`ipport_lastauto` range
+if the caller asked for port 0. `in_pcbinshash()` then inserts the `inpcb` into
+the global hash keyed by the four-tuple. A `LISTEN`/wildcard socket is inserted
+with the foreign address/port zeroed so it matches any peer; an established
+socket is inserted with the full four-tuple. `in_pcblookup()` is the inverse:
+given a packet's four-tuple it computes the same hash, walks the bucket, and
+returns the matching `inpcb` (taking a reference so it survives reclamation).
+This is the entire demux — no per-connection table, just a hash [probe](../kern/README_driver.md#glossary).
 
-When an IP packet arrives, the IP layer calls the protocol's input function (e.g., `tcp_input()` for TCP). Before reaching protocol-specific processing, the packet must be demuxed to the correct socket. This is done via `in_pcblookup_hash()` in `sys/netinet/in_pcb.c`.
-
-The function constructs a lookup key from the packet's source/destination addresses and ports, then searches the appropriate `inpcbinfo` hash bucket. It uses a locked hash search (`in_pcblookup_hash_locked()`) that walks the chain of `inpcb` pointers in the bucket, comparing each entry's `inp_inc` against the lookup key. The search prioritizes exact matches (both local and foreign addresses match) before falling back to wildcard matches (local address is `INADDR_ANY`).
-
-```c
-// Simplified from in_pcblookup_hash()
-in_pcblookup_hash(struct inpcbinfo *pcbinfo,
-    u_int32_t faddr, u_int32_t laddr,
-    u_int16_t fport, u_int16_t lport,
-    u_int8_t fibnum, int lookforwild)
-{
-    struct inpcb *inp;
-    u_int hash;
-
-    hash = in_pcbinshash(pcbinfo, faddr, laddr, fport, lport);
-    READ_LOCK_SPARSE(&pcbinfo->hashlock);
-    HASH_FOREACH(inp, &pcbinfo->hashbase[hash], inp_hash) {
-        if (in_pcblookup_hash_match(inp, faddr, laddr, fport, lport, fibnum))
-            return inp;
-    }
-    if (lookforwild) {
-        HASH_FOREACH(inp, &pcbinfo->hashbase[hash], inp_hash) {
-            if (in_pcblookup_hash_wild_match(inp, faddr, laddr, fport, lport, fibnum))
-                return inp;
-        }
-    }
-    return (NULL);
-}
-```
-
-The hash function `in_pcbinshash()` combines the five-tuple into a hash index, using RSS-compatible hashing when configured. The result is an O(1) average lookup that scales with the number of connections per hash bucket, not the total connection count.
-
-### TCP State Machine in tcp_input.c
-
-The `tcp_input()` function in `sys/netinet/tcp_input.c` is the heart of TCP's receive-side processing. It begins with header validation, then dispatches based on the current state:
-
-**LISTEN state:** Incoming SYNs are handled by the syncache. The LISTEN state handler calls `syncache_add()` to either create a syncache entry, find an existing one, or generate a SYN cookie. No `tcpcb` is allocated at this point — the syncache entry holds only the SYN parameters and a cookie for verification.
-
-**SYN_RECEIVED state:** When the syncache entry's SYN is acknowledged (the three-way handshake completes), `syncache_insert()` allocates a `tcpcb` via `uma_zalloc(V_tcp_zone, M_WAITOK)` and transitions to ESTABLISHED. The `tcpcb` is linked to the `inpcb` via `t_inpcb`, and the syncache entry is freed.
-
-**ESTABLISHED and beyond:** Data segments are processed by the established-state handler. Sequence numbers are checked against `rcv_nxt` and `rcv_nxt + rcv_wnd`. Out-of-order segments are buffered for SACK if enabled. ACKs are processed to update `snd_una`, advance the congestion window, and trigger delayed ACKs.
-
-The state transition logic follows RFC 793 closely, with FreeBSD-specific extensions for SACK, timestamp validation, and ECN. The `TCPSTATES` macro (defined in `tcp_fsm.h`) provides human-readable state names for logging.
+**tcp_input.c — the state machine.** `tcp_input()` (and its port-steered
+variant `tcp_input_with_port()`) is the entry point. It first validates the
+header (minimum length, options, checksum already checked upstream), then does
+the `in_pcblookup()` for the four-tuple. If no exact match exists and the packet
+is a SYN to a listening port, it hands the SYN to the syncache. Otherwise it
+dispatches on `tp->t_state`. The state constants come from
+`sys/netinet/tcp_fsm.h`:
 
 ```c
-// From tcp_fsm.h - state transition table
-tcp_input(struct mbuf *m, int off, int proto)
-{
-    struct tcphdr *th;
-    struct tcpcb *tp;
-    int tlen, s, state;
-
-    // Header validation
-    th = mtod_offset(m, struct tcphdr *, off);
-    if (th->th_off * 4 < sizeof(struct tcphdr))
-        goto bad;
-
-    // Find or create tcpcb
-    inp = in_pcblookup_hash(...);
-    tp = intocb(inp);
-
-    state = tp->t_state;
-
-    // Dispatch based on state
-    switch (state) {
-    case TCPS_LISTEN:
-        // Handle SYN in LISTEN state via syncache
-        syncache_add(m, off, inp);
-        goto out;
-    case TCPS_SYN_RECEIVED:
-        // Handle 3-way handshake completion
-        break;
-    case TCPS_ESTABLISHED:
-        // Process data, ACKs, SACK
-        break;
-    // ... more states
-    }
-out:
-    m_freem(m);
-}
+#define	TCPS_CLOSED		0	/* closed */
+#define	TCPS_LISTEN		1	/* listening for connection */
+#define	TCPS_SYN_SENT		2	/* active, have sent syn */
+#define	TCPS_SYN_RECEIVED	3	/* have sent and received syn */
+#define	TCPS_ESTABLISHED	4	/* established */
+#define	TCPS_CLOSE_WAIT		5	/* rcvd fin, waiting for close */
+#define	TCPS_FIN_WAIT_1		6	/* have closed, sent fin */
+#define	TCPS_CLOSING		7	/* closed xchd FIN; await FIN ACK */
+#define	TCPS_LAST_ACK		8	/* had fin and close; await FIN ACK */
+#define	TCPS_FIN_WAIT_2		9	/* have closed, fin is acked */
+#define	TCPS_TIME_WAIT		10	/* in 2*msl quiet wait after close */
 ```
 
-### Syncache and SYN Cookies
+In `LISTEN` there is no `tcpcb` yet; the interesting work is deciding whether to
+accept the SYN (and via the syncache, how to record it). In `SYN_RECEIVED` the
+stack is completing the three-way handshake and, on the final ACK, allocates the
+real `tcpcb` and moves to `ESTABLISHED`. In `ESTABLISHED` the bulk of the code
+runs: it advances `rcv_nxt` for in-order data, records SACK blocks for
+out-of-order data, processes the ACK (advancing `snd_una`, updating the RTT via
+the module's RTT [hook](../netgraph/README.md#glossary), and calling the congestion controller's
+`cc_ack_received()`), and on three duplicate ACKs triggers fast retransmit. The
+FIN/ACK combinations that drive the close (`FIN_WAIT_1`, `CLOSING`, `LAST_ACK`,
+`FIN_WAIT_2`, `TIME_WAIT`) are handled in the same function but in separate
+branches keyed by `t_state`.
 
-The syncache in `sys/netinet/tcp_syncache.c` is a hash table that holds half-open connections during the three-way handshake. Its purpose is to limit memory usage during SYN floods — without it, a server would allocate a full `tcpcb` (hundreds of bytes) for every SYN, allowing attackers to exhaust kernel memory.
+**The syncache and SYN cookies.** A listening socket that accepts a SYN normally
+would allocate a `tcpcb` per half-open connection — exactly what a SYN flood
+exploits. `tcp_syncache.c` instead stores each pending SYN in a compact
+`struct syncache` entry inside a small fixed-size hash (sized by
+`tcp_syncache_limit`), reusing the four-tuple hashing from `in_conninfo`. When
+the cache is full, the stack falls back to stateless SYN cookies: the listen
+socket encodes the key parameters (a hash of the four-tuple plus a timestamp)
+into the SYN-ACK's initial sequence number, guarded by the `V_tcp_syncookies`
+sysctl (default on) and `V_tcp_syncookiesonly`. On the completing ACK the cookie
+is decoded and validated; if it checks out, the real `tcpcb` is built from the
+information recovered out of the sequence number. The result is that a flood of
+SYNs that never complete allocates nothing.
 
-When a SYN arrives for a listening socket, `syncache_add()` computes a hash from the five-tuple and searches the syncache. If found, it checks the cookie. If not found, it allocates a new entry and sends a SYN-ACK with a cookie embedded in the ISN (Initial Sequence Number). The cookie is computed using a cryptographic hash of the five-tuple and a secret key, making it infeasible for attackers to forge valid cookies.
+**tcp_output.c — the send side.** `tcp_output()` is called whenever there is a
+reason to consider sending: new data in the send buffer, a window update, a
+retransmit timer, a FIN to send, or a forced push. Each call it re-derives the
+segment length: it is bounded by the send buffer, the peer's advertised window
+(`rcv_wnd`), the congestion window (`snd_cwnd`), and the MSS (`t_maxseg`). If
+TSO is enabled (`V_tcp_do_tso`, default on) and the NIC supports it, the kernel
+may hand down a single oversized mbuf up to the offload limit and let the
+hardware slice it. The "should I actually emit now, or wait" decision is where
+Nagle and delayed-ACK logic live: a small segment may be held if a larger one is
+coalescable or if the previous segment is unacknowledged, while a `push` flag
+forces emission. `tcp_addoptions()` appends the TCP options (timestamps, SACK
+blocks, window scale) and `tcp_sndbuf_autoscale()` may grow the send buffer
+before the segment is built.
+
+**tcp_timer.c — the timers.** All TCP timers are one-shot [`callout(9)`](../../share/man/man9/callout.9) entries
+armed and disarmed from `tcp_timer.c`. The header `sys/netinet/tcp_timer.h`
+documents the four classic timers and their semantics:
 
 ```c
-// From tcp_syncache.c
-syncache_add(struct syncache_head *sch, struct mbuf *m, int off,
-    struct inpcb *inp)
-{
-    struct syncache *sc;
-    u_int hash;
-
-    // Compute hash from five-tuple
-    hash = syncache_hash(faddr, laddr, fport, lport);
-    sch = &V_syncache.sch_hash[hash];
-
-    // Search for existing entry
-    sc = syncache_lookup(sch, faddr, laddr, fport, lport);
-    if (sc != NULL) {
-        // Handle retransmitted SYN or ACK
-        if (TCP_FLAGS(th->th_flags) & TH_ACK)
-            syncache_ack(sc, th);
-        m_freem(m);
-        return;
-    }
-
-    // Check if syncache is full
-    if (syncache_full()) {
-        if (V_tcp_syncookies)
-            syncache_cookie_send(m, off, inp);
-        else
-            m_freem(m);
-        return;
-    }
-
-    // Allocate new syncache entry
-    sc = syncache_alloc(m, off, inp);
-    syncache_timer_start(sc);
-}
+/*
+ * The TCPT_REXMT timer is used to force retransmissions. ...
+ * The TCPT_PERSIST timer is used to keep window size information
+ * flowing even if the window goes shut. ...
+ * The TCPT_KEEP timer is used to keep connections alive. ...
+ */
 ```
 
-The syncache has configurable size limits via sysctls (`net.inet.tcp.syncache.hashsize`, `net.inet.tcp.syncache.cachelimit`). When the cache is full and SYN cookies are enabled (`net.inet.tcp.syncookies=1`), the server responds with a SYN cookie instead of allocating memory. The client's ACK must contain the correct cookie value for the connection to proceed.
+`tcp_timer_rexmt()` retransmits the oldest unacknowledged segment and backs off
+the RTO; `tcp_timer_persist()` probes a zero window (sending a 1-byte "window
+probe" if the window is still shut); `tcp_timer_keep()` sends the keepalive
+probe `<SEQ=SND.UNA-1><ACK=RCV.NXT><CTL=ACK>` and, after too many missed probes,
+resets the connection; and `tcp_timer_2msl()` expires a `TIME_WAIT` connection
+after twice the maximum segment lifetime, freeing the `tcpcb`. `tcp_timer_next()`
+picks the earliest of the active timers and (re)arms the single `t_callout`,
+while `tcp_timer_activate()`/`tcp_timer_stop()` manage the per-timer active
+flags. The RTO and keepalive intervals are tunable through sysctls declared at
+the top of the file (`tcp_persmin`, `tcp_persmax`, `tcp_keepinit`,
+`tcp_keepidle`, `tcp_keepintvl`, `tcp_delacktime`, and the VNET-scoped
+`tcp_msl` (VNET: virtual network, FreeBSD's per-namespace network-stack
+isolation)).
 
-### tcp_output.c — When Does the Stack Send?
+**Pluggable congestion control.** The stack never implements a window algorithm
+inline; it calls the `cc_algo` table. On connection setup `cc_conn_init()` is
+called to size and zero the module's `cc_data`; on each ACK the stack calls
+`cc_ack_received()` (which is where `snd_cwnd`/`t_ssthresh` move); on a loss
+signal (RTO, fast retransmit) it calls `cc_cong_signal()`; and on recovery or
+idle it calls `cc_post_recovery()` / `cc_after_idle()`. ECN handling goes through
+`cc_ecnpkt_handler()`. The module list is a VNET-scoped `STAILQ` (`cc_list`)
+protected by `cc_list_lock`, and `cc_register_algo()` / `cc_deregister_algo()`
+add and remove entries. The default is selected by the
+`net.inet.tcp.cc.algorithm` sysctl (falling back to the first registered
+module, which is `cubic` unless `CC_DEFAULT` overrides it). The production
+modules under `sys/netinet/cc/` are one-line plug-ins of this KPI: CUBIC
+(`cc_cubic.c`, the default), NewReno (`cc_newreno.c`), DCTCP (`cc_dctcp.c`),
+HTCP (`cc_htcp.c`), CDG (`cc_cdg.c`), plus Hamilton (`cc_hd.c`) and Vegas
+(`cc_vegas.c`).
 
-The `tcp_output()` function in `sys/netinet/tcp_output.c` is called whenever the stack needs to decide whether to emit a segment. This happens on timer events (retransmit, keepalive), on ACK receipt (triggering delayed ACK or window updates), and when the application writes data (via `soisconnected()` or socket buffer wakeup).
+**Modular stacks — the wider KPI.** `cc_algo` only replaces the window logic;
+the TCP state machine itself is hardwired in `tcp_input.c`/`tcp_output.c`.
+`struct tcp_function_block` goes further: a stack like RACK
+(`sys/netinet/tcp_stacks/tcp_rack.h`) or BBR (`tcp_bbr.h`) registers a block of
+function pointers (including `tfb_tcp_output`) that the core dispatches
+through, so the entire input/output/timer path — loss detection, retransmit
+policy, and the window algorithm together — is swappable as a unit. The lookup
+helpers `find_and_ref_tcp_fb()` / `find_tcp_fb_locked()` resolve a stack by name
+to a `tcp_function_block`, and a per-`tcpcb` field selects which block a given
+connection uses. This is strictly wider scope than `cc_algo`, because RACK and
+BBR change how the stack decides *what to retransmit and when*, not just how the
+congestion window moves.
 
-The function checks several conditions before sending:
-
-1. **Nagle's algorithm:** If there is unacknowledged data (`snd_una < snd_nxt`) and the segment would not be the last (i.e., more data is queued), defer sending until an ACK arrives. This prevents many small segments from flooding the network.
-
-2. **Delayed ACK:** If an ACK is pending and no data is being sent, schedule a delayed ACK timer (`tcp_delacktime`, typically 200ms). If data is being sent, send the ACK immediately to piggyback.
-
-3. **Push flag:** If the socket has the `SO_OOBINLINE` or `MSG_PUSH` flag set, send immediately regardless of Nagle.
-
-4. **Retransmission:** If the retransmit timer fires, resend unacknowledged data. The RTO is computed from `sa` and `sv` (smoothed RTT and variance), with exponential backoff on successive timeouts.
-
-5. **TSO (TCP Segmentation Offload):** If TSO is enabled (`net.inet.tcp.tso=1`) and the NIC supports it, send large segments (up to 64KB) and let the NIC handle segmentation. The MSS is reduced by TSO overhead (typically 128 bytes for headers).
-
-```c
-// Simplified tcp_output() logic
-tcp_output(struct tcpcb *tp)
-{
-    struct mbuf *m;
-    int flags, len;
-
-    // Check if we should send
-    if (tp->t_state < TCPS_ESTABLISHED) {
-        // Send control segment (SYN, SYN-ACK, etc.)
-        flags = tcp_outflags[tp->t_state];
-        len = 0;
-    } else {
-        // Check Nagle's algorithm
-        if (tp->snd_nxt != tp->snd_una && 
-            (tp->t_flags & TF_NODELAY) == 0 &&
-            (tp->t_flags & TF_NOACKSEND) == 0) {
-            // Wait for ACK or more data
-            return;
-        }
-
-        // Determine segment length
-        len = min(tp->snd_nxt - tp->snd_una, tp->t_maxseg);
-        if (tp->t_flags & TF_PUSH)
-            len = tp->snd_nxt - tp->snd_una;
-
-        flags = TH_ACK;
-        if (tp->t_state >= TCPS_FIN_WAIT_1)
-            flags |= TH_FIN;
-    }
-
-    // Build segment
-    m = tcp_mbuilf(tp, flags, len);
-    tcp_output_segment(m, tp);
-}
-```
-
-### TCP Timers in tcp_timer.c
-
-FreeBSD uses the callout framework to manage TCP timers. Each `tcpcb` has a `t_timers[]` array of callouts, indexed by timer type:
-
-- **TCPT_REXMT (retransmit):** Fires when unacknowledged data needs retransmission. The RTO is computed as `sa + 4*sv` (smoothed RTT plus four times the smoothed variance), with exponential backoff on successive timeouts (`t_rxtshift`).
-
-- **TCPT_PERSIST (persistence):** Fires when the receiver's window is zero. Sends a single byte probe to discover when the window opens. The timer uses exponential backoff between `tcp_persmin` and `tcp_persmax`.
-
-- **TCPT_KEEP (keepalive):** Fires after `tcp_keepidle` seconds of idle time, then every `tcp_keepintvl` seconds. Sends a keepalive probe to detect dead connections. The number of probes before declaring a connection dead is controlled by `tcp_keepcnt`.
-
-- **TCPT_2MSL (2MSL wait):** In TIME_WAIT state, fires after 2*MSL seconds (typically 120 seconds). Allows old duplicate segments to expire before the connection is fully closed.
-
-```c
-// From tcp_timer.c
-tcp_timer_activate(struct tcpcb *tp, int timer, int ttl)
-{
-    callout_reset(&tp->t_timers[timer], ttl, tcp_timer_2msl, (caddr_t)tp);
-}
-
-static void
-tcp_timer_2msl(void *xtp)
-{
-    struct tcpcb *tp = xtp;
-    int timer = /* determined from callout */;
-
-    switch (timer) {
-    case TCPT_REXMT:
-        tcp_rexmit_close(tp);
-        tcp_timer_activate(tp, TCPT_REXMT, tp->t_rxtcur);
-        break;
-    case TCPT_PERSIST:
-        tcp_output(tp);
-        tcp_timer_activate(tp, TCPT_PERSIST, tp->t_rxtcur);
-        break;
-    case TCPT_KEEP:
-        if (tp->t_state == TCPS_ESTABLISHED || 
-            tp->t_state >= TCPS_CLOSE_WAIT)
-            tcp_timer_keep(tp);
-        tcp_timer_activate(tp, TCPT_KEEP, V_tcp_keepidle);
-        break;
-    }
-}
-```
-
-### Congestion Control KPI
-
-The congestion control subsystem in `sys/netinet/cc/` provides a pluggable interface for window adjustment algorithms. Modules register via `cc_register_algo()` and are selected via `net.inet.tcp.cc.algorithm` (default: `cubic`).
-
-The `cc_algo` structure defines function pointers for each event the congestion controller needs to handle:
-
-- `mod_init()`: Initialize the module
-- `mod_destroy()`: Destroy the module
-- `cc_data_sz()`: Return per-connection data size
-- `acked()`: Called on each ACK to potentially increase the window
-- `loss()`: Called on loss detection to decrease the window
-- `recovery()`: Called after recovery to potentially increase the window
-- `idle()`: Called after idle periods to reset state
-- `destroy()`: Called to destroy per-connection state
-
-The `cc_var` structure passes per-connection state to these functions, including bytes acked, current ACK number, and flags. The congestion controller can read `tp->snd_cwnd`, `tp->snd_ssthresh`, and other `tcpcb` fields via the `tp` pointer in `cc_var`.
-
-```c
-// From cc.h
-struct cc_var {
-    void    *cc_data;     /* Per-connection private CC data */
-    int     bytes_this_ack;
-    tcp_seq curack;
-    uint32_t flags;
-    struct tcpcb *tp;
-    uint16_t nsegs;
-    uint8_t  labc;
-};
-
-// Module registration
-int
-cc_register_algo(struct cc_algo *add_cc)
-{
-    STAILQ_INSERT_TAIL(&cc_list, add_cc, next);
-    // Update default if this is the first module or explicitly set
-    if (V_default_cc_ptr == NULL)
-        V_default_cc_ptr = add_cc;
-    return (0);
-}
-```
-
-Production modules include CUBIC (default, optimized for high-bandwidth-delay-product networks), NewReno (conservative, good for lossy networks), DCTCP (data center TCP, uses ECN for fine-grained congestion signals), HTCP (HyperText Caching Protocol, for cache networks), and CDG (Congestion Discovery and Gradient, for low-latency networks).
-
-### Modular TCP Stacks
-
-For even deeper customization, `tcp_function_block` in `sys/netinet/tcp_stacks/` allows entire input/output state machines to replace the default. RACK (Recovery Algorithm for Kool Endpoints) and BBR (Bottleneck Bandwidth and RTT) register their own function blocks via `tcp_function_block` registration.
-
-The `tcp_function_block` structure contains function pointers for:
-- Input processing (`tfb_input`)
-- Output generation (`tfb_output`)
-- Timer handling (`tfb_timer`)
-- State transition (`tfb_state`)
-
-When a module registers, it replaces these function pointers in the `tcpcb`, effectively swapping out the entire TCP state machine. This is more extensive than the congestion control KPI, which only affects window adjustment.
-
-BBR, for example, replaces the loss-based congestion control with a model-based approach that estimates bottleneck bandwidth and RTT to set the congestion window. RACK replaces the RTO-based retransmission with a time-based approach that detects spurious retransmissions more accurately.
-
-```c
-// From tcp_var.h
-struct tcp_function_block {
-    char                    tfb_tcp_block_name[TCP_FUNCTION_NAME_LEN_MAX];
-    const struct tcp_function *tfb_functions;
-    int                     tfb_refcnt;
-};
-
-struct tcp_function {
-    struct tcp_function     *tf_next;
-    char                    tf_name[TCP_FUNCTION_NAME_LEN_MAX];
-    struct tcp_function_block *tf_fb;
-};
-```
-
-### UDP — Minimal State on Top of inpcb
-
-UDP's implementation in `sys/netinet/udp_usrreq.c` is remarkably lightweight compared to TCP. The key difference is that UDP adds no per-connection state beyond what `in_pcb.c` provides. A UDP socket is bound via `in_pcbbind()` (which allocates and hashes an `inpcb`) and connected via `in_pcbconnect()` (which sets the foreign address), but once bound, no sequence numbers, acknowledgments, or flow control are maintained.
-
-The `udp_input()` function receives datagrams from the IP layer, looks up the destination `inpcb` via `in_pcblookup_hash()`, and queues the datagram on the socket buffer. If no socket is bound to the destination port, it sends an ICMP port unreachable message (unless the datagram was a broadcast).
-
-```c
-// Simplified udp_input()
-udp_input(struct mbuf *m, int off, int proto)
-{
-    struct udpiphdr *ui;
-    struct inpcb *inp;
-    struct socket *so;
-
-    ui = mtod_offset(m, struct udpiphdr *, off);
-
-    // Find receiving socket
-    inp = in_pcblookup_hash(&udbinfo,
-        ui->ui_src.s_addr, ui->ui_dst.s_addr,
-        ui->ui_sport, ui->ui_dport, 0, 0);
-    if (inp == NULL) {
-        // No socket - send ICMP unreachable
-        icmp_error(m, ICMP_UNREACH, ICMP_UNREACH_PORT, 0, 0);
-        return;
-    }
-
-    so = inp->inp_socket;
-    sbappendaddr(&so->so_rcv, (struct sockaddr *)&ui->ui_src, m, NULL);
-    sorwakeup(so);
-}
-```
-
-UDP also supports broadcast and multicast via the `SO_BROADCAST` and `IP_ADD_MEMBERSHIP` socket options. Multicast groups are tracked via the `ip_mreq` structure and the IGMP subsystem. The `udpstat` structure in `udp_var.h` provides statistics for debugging (packets in, bad checksums, no port, etc.).
+**UDP — almost no state.** `udp_usrreq.c` implements the `pr_usrreq` entry
+points (`PRU_BIND`, `PRU_CONNECT`, `PRU_SEND`, `PRU_RCVMMSG`, etc.) but defers
+the heavy lifting to `in_pcb.c`: binding is `in_pcbbind()`, the send path is
+`udp_send()` (which builds the UDP/IP header and calls `ip_output`), and the
+receive path is `udp_input()` doing an `in_pcblookup()` on the four-tuple and
+then queuing the datagram to the socket. The only UDP-specific state is the
+`udpcb` (pointer back to the `inpcb`, a tunneled-ICMP flag, and an optional
+`u_tun_func`). Checksumming is controlled by the `V_udp_cksum` sysctl (default
+on). The net effect is that UDP is a thin protocol layer over the inpcb
+infrastructure, which is exactly why it is so much smaller than TCP.
 
 ## Flow / Diagram
 
-```mermaid
-stateDiagram-v2
-    [*] --> CLOSED
-    CLOSED --> LISTEN: socket() + bind() + listen()
-    LISTEN --> SYN_RECEIVED: SYN received (via syncache)
-    SYN_RECEIVED --> ESTABLISHED: SYN-ACK + ACK (3-way handshake)
-    ESTABLISHED --> CLOSE_WAIT: FIN received
-    CLOSE_WAIT --> FIN_WAIT_1: close() called
-    FIN_WAIT_1 --> FIN_WAIT_2: ACK of FIN received
-    FIN_WAIT_2 --> [*]: FIN received
-    FIN_WAIT_1 --> CLOSING: FIN received before ACK
-    CLOSING --> LAST_ACK: ACK of FIN received
-    LAST_ACK --> [*]: ACK of our FIN received
-    ESTABLISHED --> TIME_WAIT: close() + FIN received
-    TIME_WAIT --> [*]: 2MSL timer expires
-    SYN_RECEIVED --> CLOSED: Timeout / RST
-    ESTABLISHED --> CLOSED: RST received
-```
+The TCP connection state machine as driven by `tcp_input.c`, with the syncache
+standing in for the `tcpcb` during the half-open phase:
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Syncache: SYN received
-    Syncache --> TCPCB_Allocated: ACK with valid cookie
-    TCPCB_Allocated --> ESTABLISHED: Handshake complete
-    Syncache --> SYN_Cookie: Cache full
-    SYN_Cookie --> ESTABLISHED: Client sends valid cookie ACK
-    Syncache --> [*]: Timeout
-```
-
-```mermaid
-stateDiagram-v2
-    [*] --> Sending
-    Sending --> WaitingForACK: Data sent, Nagle active
-    WaitingForACK --> Sending: ACK received (Nagle satisfied)
-    WaitingForACK --> Sending: More data queued
-    WaitingForACK --> Sending: Delayed ACK timer fires
-    Sending --> Retransmit: RTO timer fires
-    Retransmit --> Sending: Segment resent
-    Sending --> Idle: All data acked
-    Idle --> Sending: Application writes data
-    Idle --> Keepalive: tcp_keepidle expires
+  [*] --> CLOSED
+  CLOSED --> LISTEN: listen()
+  CLOSED --> SYN_SENT: connect() / send SYN
+  LISTEN --> SYN_RECEIVED: SYN (syncache entry, or SYN cookie)
+  SYN_SENT --> SYN_RECEIVED: SYN-ACK
+  SYN_RECEIVED --> ESTABLISHED: ACK (allocate tcpcb)
+  ESTABLISHED --> CLOSE_WAIT: FIN
+  ESTABLISHED --> FIN_WAIT_1: close() / send FIN
+  CLOSE_WAIT --> LAST_ACK: close() / send FIN
+  FIN_WAIT_1 --> FIN_WAIT_2: ACK of our FIN
+  FIN_WAIT_1 --> CLOSING: FIN (simultaneous close)
+  CLOSING --> TIME_WAIT: ACK of our FIN
+  LAST_ACK --> CLOSED: ACK of our FIN
+  FIN_WAIT_2 --> TIME_WAIT: FIN
+  TIME_WAIT --> CLOSED: 2MSL timer expires
+  SYN_RECEIVED --> CLOSED: RST
+  ESTABLISHED --> CLOSED: RST
+  FIN_WAIT_1 --> CLOSED: RST
 ```
 
 ## Advanced Notes
 
-### Debugging with DTrace
+**Debugging.** The inpcb and tcpcb are the two objects to dump when a
+connection misbehaves. `netstat(8)` walks the inpcb hash to print the four-tuple
+and state; the [DDB](../kern/README_kdb.md#glossary) `db_print_inpcb()` helper (in `sys/netinet/in_pcb.c`) and the
+`tcpstates[]` string table in `tcp_fsm.h` give human-readable state names. The
+SDT probes defined in `sys/netinet/in_kdtrace.h` (fired from `tcp_input.c`,
+`tcp_output.c`, and `tcp_timer.c`) let DTrace trace segment send/receive,
+retransmits, and state transitions without recompiling. For congestion-control
+behavior, the per-algorithm `*_log_*` functions (e.g. `cubic_log_hystart_event()`)
+feed the TCP blackbox log when `TCP_BLACKBOX` is enabled.
 
-FreeBSD provides SDT (Statically Defined Tracing) probes in the TCP stack for runtime debugging. Key probes are defined in `sys/netinet/in_kdtrace.h` and include probes for packet input/output, timer events, and syncache operations. The actual probe names can be discovered by searching for `DTRACE_PROBE` in the source files.
+**Locking and races.** The inpcb hash is guarded by a per-bucket rwlock plus a
+shared-memory-reclamation (SMR) reader protocol, so `in_pcblookup()` can run
+under a reader lock while a writer removes a bucket; a reference
+(`in_pcbref()`/`in_pcbrele()`) keeps the `inpcb` alive across the lookup. The
+`tcpcb` is protected by the socket's lock for most operations, but the timer
+path (`tcp_timer.c`) re-acquires it via `tcp_timer_enter()`, which is why the
+timers are careful to re-check state after taking the lock — a segment can be
+ACKed between the callout firing and the lock being held. The syncache is
+separately locked and sized independently of the inpcb hash, so a SYN flood
+pressures the syncache, not the connection table.
 
-Example DTrace script to track retransmissions:
-```d
-tcp:::tcp-retransmit
-{
-    printf("Retransmit: src=%s:%d dst=%s:%d seq=0x%x
-",
-        execname, pid,
-        stringof(arg0->t_inpcb.inp_inc.inc_ie.ie_dependfaddr.id6_addr),
-        arg0->t_inpcb.inp_inc.inc_ie.ie_fport,
-        arg0->snd_nxt);
-}
-```
+**Performance.** The four-tuple hash is the hot path for every packet; keeping
+`in_conninfo` small and cache-line friendly (and not moving the first five
+32-bit words, per the header's warning) matters for the syncache's hash as much
+as for the inpcb's. TSO (`V_tcp_do_tso`) and the send-buffer autoscaling
+(`tcp_sndbuf_autoscale()`) exist to cut per-segment kernel work; the
+`udps_fastout` counter is the metric for UDP's low-overhead send path. The
+congestion controller is invoked on every ACK, so its `cc_data` is kept in a
+single cache line and the module's `cc_data_sz()` is deliberately small.
 
-### Performance Implications
+**Pitfalls.** A common mistake is to assume the `tcpcb` always exists for a
+listening socket — it does not; the syncache entry is the stand-in until the
+handshake completes, and SYN cookies mean even that can be absent. Another is to
+conflate `cc_algo` with the full modular stack: swapping a `cc_algo` changes
+only the window, while RACK/BBR via `tcp_function_block` change loss detection
+and retransmit policy as well, so a module written against the `cc_algo` KPI
+cannot express RACK's time-based loss detection without moving to the function
+block. Finally, the 2MSL `TIME_WAIT` hold is not a leak — it is required so that
+delayed segments from the old connection cannot be misread by the next one that
+reuses the four-tuple; tuning `tcp_msl` trades that safety for faster port
+reuse.
 
-**Hash bucket depth:** The `inpcbinfo` hash table depth directly impacts lookup latency. With many connections per bucket, lookups degrade from O(1) to O(n). FreeBSD uses a random hash seed (`in_pcbhashseed_init()`) to prevent hash collisions from being exploitable. The hash table is resized dynamically via `in_pcbrehash()` when the load factor exceeds a threshold.
-
-**TSO overhead:** When TSO is enabled, the stack sends large segments (up to 64KB) to the NIC, which handles segmentation. This reduces CPU usage but increases latency for individual packets. For low-latency applications, disable TSO via `net.inet.tcp.tso=0`.
-
-**Syncache limits:** During SYN floods, the syncache is the first line of defense. Monitor `net.inet.tcp.syncache.cachelimit` and `net.inet.tcp.syncookies`. When the cache is full, SYN cookies prevent memory exhaustion but add latency (the handshake is delayed until the client's ACK arrives).
-
-**Timer granularity:** TCP timers use the callout framework with millisecond granularity. On systems with high connection counts, timer coalescing (via `tcp_hpts` — High Precision Timer Scheduler) reduces timer overhead by batching timer events.
-
-### Race Conditions
-
-**inpcb reference counting:** The `inp_refcnt` field tracks passive references to an `inpcb`. When the reference count drops to zero, the `inpcb` can be freed. Care must be taken to avoid use-after-free: callers must hold a reference (`in_pcbref()`) while accessing the `inpcb`), and release it (`in_pcbrele()`) when done. The SMR (Safe Memory Reclamation) mechanism ensures that freed `inpcb` memory is not reclaimed until all readers have completed.
-
-**Syncache races:** The syncache lookup and insertion must be atomic to avoid duplicate entries. FreeBSD uses a per-bucket lock (`mtx_lock(&V_syncache.sch_lock)`) to protect the syncache hash. When multiple CPUs race to insert the same five-tuple, only one succeeds; the others either find the existing entry or generate a SYN cookie.
-
-**Timer races:** The callout framework ensures that timer callbacks are serialized per-`tcpcb`. However, a timer can fire while another callback is processing the same `tcpcb`. The `tcp_timer_stop()` function uses `callout_stop()` to cancel pending timers, but callbacks must check for cancellation before proceeding.
-
-### Connection to OS Theory
-
-FreeBSD's TCP implementation embodies several classic operating system concepts:
-
-**Resource management:** The syncache is a bounded resource allocator that limits kernel memory usage during connection establishment. This is analogous to a semaphore with a fixed count — each slot in the syncache is a token that must be acquired before a connection can proceed.
-
-**State machines:** The TCP state machine is a deterministic finite automaton with eleven states and well-defined transitions. FreeBSD implements this as a switch statement in `tcp_input()`, with each case handling the transitions for that state. The `tcp_outflags[]` array in `tcp_fsm.h` provides a lookup table for state-to-flags mapping.
-
-**Hash tables:** The `inpcbinfo` hash table is a classic example of a hash table with chaining for collision resolution. The hash function combines the five-tuple into a single value, and collisions are resolved by linear search through the bucket chain. FreeBSD uses SipHash for the hash function to prevent hash-flooding attacks.
-
-**Timer management:** FreeBSD's callout framework implements a classic timer wheel algorithm, where timers are scheduled in buckets based on their expiration time. This provides O(1) timer insertion and deletion, with O(n) scanning for expired timers (where n is the number of timers expiring in the same bucket).
-
-**Modular design:** The `cc_algo` KPI and `tcp_function_block` structure embody the principle of separation of concerns — the core TCP state machine is decoupled from congestion control and modular stack implementations. This allows researchers to experiment with new algorithms without modifying the core stack.
+**Theory connection.** The inpcb/tcpcb split is the classic "protocol
+independent / protocol dependent" PCB decomposition from the TCP/IP textbooks
+(e.g. Stevens, *TCP/IP Illustrated, Vol. 1*): the four-tuple and the
+demux hash are shared by every IP-port protocol, while the per-protocol state
+lives in a separate block. The syncache and SYN cookies are the standard
+defense against SYN-flood resource exhaustion (RFC 4987), and the pluggable
+`cc_algo`/`tcp_function_block` KPIs are FreeBSD's answer to the long-running
+problem that congestion control and loss detection evolve faster than the rest
+of the stack — making them replaceable modules rather than a fixed part of
+`tcp_input.c`.
 
 ## See Also
 - [Network Stack — Architecture and Packet Flow](../net/README.md)
@@ -594,14 +431,22 @@ FreeBSD's TCP implementation embodies several classic operating system concepts:
 
 
 
-- **IP Layer chapter:** [`sys/netinet/ip_input.c`](ip_input.c), [`sys/netinet6/ip6_input.c`](../netinet6/ip6_input.c) — where `tcp_input()` is called from
-- **mbuf chapter:** [`sys/sys/malloc.h`](../sys/malloc.h), [`sys/sys/mbuf.h`](../sys/mbuf.h) — mbuf chain management used throughout the stack
-- **Locking chapter:** [`sys/sys/lock.h`](../sys/lock.h), [`sys/sys/sx.h`](../sys/sx.h) — locking primitives used in `in_pcb.c`
-- **Virtual Memory chapter:** `vm/uma.h` — UMA keg allocation for `tcpcb` and `inpcb`
-- **FreeBSD man pages:** [`tcp_functions(9)`](../../share/man/man9/tcp_functions.9), `in_pcb(9)`, [`tcp(4)`](../../share/man/man4/tcp.4), [`udp(4)`](../../share/man/man4/udp.4)
-- **Source directories:** [`sys/netinet/`](.), [`sys/netinet6/`](../netinet6), [`sys/netinet/cc/`](cc), [`sys/netinet/tcp_stacks/`](tcp_stacks)
-- **Key files for further reading:** [`sys/netinet/in_pcb.c`](in_pcb.c), [`sys/netinet/tcp_input.c`](tcp_input.c), [`sys/netinet/tcp_output.c`](tcp_output.c), [`sys/netinet/tcp_timer.c`](tcp_timer.c), [`sys/netinet/tcp_syncache.c`](tcp_syncache.c), [`sys/netinet/udp_usrreq.c`](udp_usrreq.c), [`sys/netinet/tcp_subr.c`](tcp_subr.c)
+- IP Layer chapter — where `tcp_input()` and `udp_input()` are called from, RSS
+  steering, and IPsec; the v4-vs-v6 input differences.
+- mbuf chapter — mbuf chains, `m_pullup`, and `pkthdr`, which the TCP send/receive
+  paths build on.
+- [`sys/netinet/in_pcb.c`](in_pcb.c) and [`sys/netinet/in_pcb.h`](in_pcb.h) — the inpcb, its hash, and
+  the shared bind/lookup/free logic.
+- [`sys/netinet/tcp_input.c`](tcp_input.c), `tcp_output.c`, `tcp_timer.c`, `tcp_subr.c`,
+  `tcp_syncache.c` — the TCP state machine, send side, timers, and half-open
+  cache.
+- [`sys/netinet/cc/`](cc) — the `cc_algo` KPI (`cc.h`, `cc.c`) and the CUBIC, NewReno,
+  DCTCP, HTCP, CDG, Hamilton, and Vegas modules.
+- [`sys/netinet/tcp_stacks/`](tcp_stacks) — the `tcp_function_block` KPI and the RACK and BBR
+  modular stacks.
+- [`sys/netinet/udp_usrreq.c`](udp_usrreq.c) and `udp_var.h` — the thin UDP layer over inpcb.
+- Man pages: `in_pcb(9)`, [`mod_cc(9)`](../../share/man/man9/mod_cc.9), [`callout(9)`](../../share/man/man9/callout.9), [`tcp(4)`](../../share/man/man4/tcp.4), [`udp(4)`](../../share/man/man4/udp.4).
 
 ---
 
-> _Generated by [DaemonDocs](https://github.com/ocochard/DaemonDocs) on 2026-05-04 07:03 UTC using model `Qwen3.6-35B-A3B-UD-Q8_K_XL` (llama.cpp build `b8985-27aef3dd9`). AI-generated content — verify against source before relying on it._
+> _Generated by [DaemonDocs](https://github.com/ocochard/DaemonDocs) on 2026-09-01 07:38 UTC using model `Qwen3.8-27B-Q8_0` (llama.cpp build `b10553-cd26896c1`). AI-generated content — verify against source before relying on it._

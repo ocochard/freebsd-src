@@ -5,361 +5,260 @@
 **Navigation:**
   **Up:** [Kernel Core — Structure and Entry Point](../README.md) ▸ [Source Tree — Layout and Conventions](../../README_internals.md)
   **Related:** [Network Stack — Architecture and Packet Flow](../net/README.md) | [NIC Drivers — from if_vr to iflib to if_cxgbe](../dev/README_nic_drivers.md) | [Transport Protocols — inpcb, tcpcb, TCP State Machine, UDP](../netinet/README_transport.md) | [IP Layer — IPv4, IPv6, Forwarding, FIB, and nhop](../netinet/README_ip.md)
-  **All chapters:** [Source Tree — Layout and Conventions](../../README_internals.md) | [Boot Process — UEFI Bootloader to Kernel Handoff](../../stand/efi/loader/README.md) | [Kernel Core — Structure and Entry Point](../README.md) | [Build System — buildworld and buildkernel](../../share/mk/README.md) | [Virtual Memory Subsystem — vm_page, UMA, and Pagers](../vm/README.md) | [Process Management — Scheduling and Lifecycle](../kern/README_process.md) | [Locking Primitives — Mutexes, sx, rmlocks, and Atomics](../kern/README_locking.md) | [Buffer Cache — Block I/O Subsystem](../vm/README_bcache.md) ...
+  **All chapters:** [Source Tree — Layout and Conventions](../../README_internals.md) | [Boot Process — UEFI Bootloader to Kernel Handoff](../../stand/efi/loader/README.md) | [Kernel Core — Structure and Entry Point](../README.md) | [Build System — buildworld and buildkernel](../../share/mk/README.md) | [System Calls and Image Activation — Entry, sysent, and exec](../kern/README_syscall.md) | [Kernel Modules and the Linker — KLD, SYSINIT, and linker sets](../kern/README_kld.md) | [Virtual Memory Subsystem — vm_page, UMA, and Pagers](../vm/README.md) | [Process Management — Scheduling and Lifecycle](../kern/README_process.md) ...
 ---
+
 
 ## Quick Summary
 
-The mbuf is the fundamental data structure that carries every packet through FreeBSD's network stack. When a network interface receives a frame, the raw bytes are placed into one or more mbufs, which travel through protocol layers as headers are added or removed. When a socket sends data, the application's buffers are copied into mbufs before being handed to the network driver. Every byte that traverses the network stack is wrapped in an mbuf — it is the universal packet carrier.
+Every network packet in FreeBSD — an ARP reply, a TCP segment, an ICMP echo — rides through the kernel inside a *[mbuf](#glossary)*. The mbuf is the network stack's universal currency: a small, fixed-size header that describes a variable amount of payload, and the ability to link many of them together into a chain. If you can read an mbuf chain, you can read the network stack; nearly every protocol, driver, and firewall [hook](../netgraph/README.md#glossary) takes a `struct mbuf *` as its first argument and returns one. This chapter is the prerequisite the rest of the network stack reads against, so protocol chapters assume you already understand the invariants documented here.
 
-An mbuf is a small, fixed-size structure that can hold a modest amount of data inline. When packets are larger than the mbuf can contain, additional mbufs are chained together to form a chain — a linked list of mbufs that together represent a single packet. For large payloads, an mbuf can instead point to a "cluster" — a separately allocated block of memory that is much larger than the mbuf itself. This indirection allows the mbuf header to remain small while supporting arbitrarily large payloads.
+The core design problem is that packets vary wildly in size. A 64-byte ARP reply and a 1500-byte Ethernet frame both have to fit, but a single fixed-size buffer would waste memory on the small one and be too small for the large one. FreeBSD solves this by making the mbuf a small unit — a header plus a modest inline data area — and letting mbufs *chain*. A large packet is just several mbufs linked together; you allocate exactly as many as the payload needs. When the payload is too big even for one inline data area, the mbuf attaches a separate *[cluster](#glossary)* of a few kilobytes and points at it, so the header stays small no matter how large the buffer behind it is.
 
-The mbuf subsystem provides a family of allocator functions (`m_get`, `m_getcl`, `m_gethdr`, `m_getjcl`) that create mbufs from pre-allocated UMA zones. It also provides manipulation primitives (`m_pullup`, `m_copydata`, `m_adj`, `m_freem`) that protocol code uses to read headers, copy data, and adjust chain boundaries. A separate mechanism, `m_tag`, allows subsystems to attach protocol-specific metadata to packets without modifying the mbuf structure itself.
+On top of the buffer itself, the mbuf carries two orthogonal mechanisms. The `M_PKTHDR` flag marks the *first* mbuf of a packet, which reserves extra room for a `struct pkthdr` — the packet-wide metadata (receiving interface, total length, checksum offload [state](../netpfil/pf/README.md#glossary), and an optional list of tags) that belongs to the whole packet rather than one segment. The second mechanism is `m_tag`, a way for subsystems such as pf, ipsec, and LRO to [attach](../kern/README_driver.md#glossary) their own per-packet records without enlarging `struct mbuf` for everyone.
 
-Under load, the mbuf zones can become exhausted. FreeBSD handles this through a combination of allocation flags (`M_WAITOK` blocks until memory is available; `M_NOWAIT` returns NULL immediately) and a reclaim path (`mb_reclaim`) that frees mbufs from processes that have not yet released them. Understanding mbuf allocation and chaining is essential for any reader of the network stack, because every protocol function assumes the reader already knows how mbuf chains work.
+Finally, mbufs are allocated from a small set of [UMA](../vm/README_bcache.md#glossary) zones, one per size class, which keeps allocation fast and per-CPU. Because the total number of mbufs is bounded, allocation can fail. Callers choose between `M_NOWAIT` (fail immediately with `NULL` when the [zone](../vm/README.md#glossary) is empty — the only option in interrupt context) and `M_WAITOK` (sleep until one frees up). When allocation is failing, the kernel runs `mb_reclaim` to try to return memory to the mbuf pool. Understanding this exhaustion path is what lets a driver or protocol decide whether to drop a packet, sleep, or shed load.
+
+## Glossary
+
+**mbuf** — The variable-size kernel buffer that holds a network packet; a small header plus a data area, linkable into a chain.
+
+**cluster** — A separate, reference-counted buffer (typically `MCLBYTES`, 2048 bytes) attached to an mbuf via `M_EXT` so a large payload does not have to fit in the mbuf's inline data area.
+
+**jumbo cluster** — A larger cluster (4096, 9216, or 16184 bytes) used for high-throughput paths; allocated from its own UMA zone.
+
+**pkthdr** — The `struct pkthdr` embedded in the first mbuf of a packet (when `M_PKTHDR` is set); holds packet-wide metadata such as the receiving interface and total length.
+
+**m_tag** — A small, self-describing record a subsystem attaches to a packet to carry per-packet metadata without modifying `struct mbuf`.
+
+**UMA zone** — A per-CPU, fixed-size slab allocator (see `uma(9)`) used to hand out mbufs and clusters quickly; FreeBSD keeps one zone per mbuf size class.
+
+**M_NOWAIT / M_WAITOK** — Allocation flags: `M_NOWAIT` returns `NULL` immediately if the zone is empty (safe in interrupt context); `M_WAITOK` sleeps until an mbuf is available.
+
+**mb_reclaim** — The kernel path that runs when mbuf allocation is failing, attempting to free pages and return buffers to the mbuf pool.
 
 ## Architecture
 
-The mbuf subsystem lives in two primary source files: `sys/kern/uipc_mbuf.c` handles the core allocator functions and zone management, while `sys/kern/uipc_mbuf2.c` contains the chain manipulation functions (`m_pullup`, `m_copydata`, `m_adj`). The header `sys/sys/mbuf.h` defines the `struct mbuf`, `struct m_ext`, `struct pkthdr`, and `struct m_tag` types, along with the flag constants and accessor macros.
+The mbuf subsystem lives in three files. `sys/sys/mbuf.h` defines the structure, the size macros, the `M_` flags, the `EXT_` external-buffer types, and declares the entire public API. `sys/kern/uipc_mbuf.c` implements the allocator entry points (`m_get`, `m_getcl`, `m_gethdr`, `m_getjcl`), the chain-manipulation primitives (`m_freem`, `m_copypacket`, `m_split`, `m_defrag`, `m_dup`, `m_prepend`, `m_append`, `m_cat`, `m_length`, `m_getptr`), and the [UMA zone](#glossary) setup. `sys/kern/uipc_mbuf2.c` implements the data-access primitives that walk a chain — `m_pullup`, `m_copydata`, `m_adj`, `m_adj_decap` — plus the `m_tag` machinery. The reclaim path, `mb_reclaim`, lives in `sys/kern/kern_mbuf.c`.
 
-The allocator relies on UMA (Universal Memory Allocator) zones defined in `sys/kern/uipc_mbuf.c`. Five zones exist: `zone_mbuf` for standard mbufs, `zone_pack` for mbufs that include a pkthdr, and three jumbo zones (`zone_jumbop`, `zone_jumbo9`, `zone_jumbo16`) for mbufs backed by larger clusters. The jumbo zones exist to reduce the number of mbufs needed for large packets — a single jumbo9 mbuf can hold 9216 bytes of payload, versus the ~227 bytes available in a standard mbuf.
+The single most important fact about the layout is that the header size depends on whether the mbuf is a packet header. `sys/sys/mbuf.h` defines the header sizes with `offsetof`, which is the authoritative statement of where the data area begins:
 
-Clusters are reference-counted through the `m_ext` structure. When an mbuf with `M_EXT` flag set is freed, the `ext_free` callback is invoked if the reference count reaches zero. This allows clusters to be shared between multiple mbufs — for example, when a packet is duplicated for multiple consumers.
+```c
+/* From sys/sys/mbuf.h */
+struct mbuf;
+#define	MHSIZE		offsetof(struct mbuf, m_dat)
+#define	MPKTHSIZE	offsetof(struct mbuf, m_pktdat)
+#define	MLEN		((int)(MSIZE - MHSIZE))
+#define	MHLEN		((int)(MSIZE - MPKTHSIZE))
+```
 
-The `m_tag` mechanism (documented in `mbuf_tags.9`) uses a linked list attached to the first mbuf of a packet chain. Each tag contains a type identifier, a data payload, and a pointer to the next tag. Subsystems register tag types and attach metadata at specific positions in the chain. This allows out-of-band information (such as packet classification results, security associations, or offload hints) to travel with the packet without enlarging every mbuf.
+`MHSIZE` is the offset of `m_dat`, the start of the data area in a *regular* mbuf. `MPKTHSIZE` is the offset of `m_pktdat`, the start of the data area in a *header* mbuf — and it is larger, because a `struct pkthdr` is inserted between the common header and the data. Consequently `MLEN` (data that fits in a regular mbuf) is larger than `MHLEN` (data that fits in a header mbuf). This is the whole "header vs regular" distinction in one place: a header mbuf spends its extra space on the `pkthdr`, leaving less room for payload. `MSIZE` and `MCLBYTES` are defined in `sys/param.h`; the header comment in `mbuf.h` states that an mbuf "is of a single size, MSIZE, which includes overhead" and "may add a single mbuf cluster of size MCLBYTES, which has no additional overhead and is used instead of the internal data area; this is done when at least MINCLSIZE of data must be stored." `MINCLSIZE` is the minimum payload size at which a cluster is used instead of the inline data area.
 
-SDT (System Dynamic Tracing) probes are defined in `sys/kern/uipc_mbuf.c` for every major mbuf operation: `m__init`, `m__gethdr_raw`, `m__gethdr`, `m__get_raw`, `m__get`, `m__getcl`, `m__getjcl`, `m__clget`, `m__cljget`, `m__cljset`, `m__free`, `m__freem`, and `m__freemp`. These probes enable runtime monitoring of mbuf allocation and deallocation patterns.
+Two pointers give the mbuf its dual role, and the network stack needs both. `m_next` links the *segments of one packet* — the chain that makes up a single logical frame. `m_nextpkt` links *separate packets* waiting in a queue, for example the packets sitting in an interface's output queue or in a protocol's input queue. A chain is a unit of data; a queue is a unit of scheduling. The stack walks `m_next` to read or free a packet, and `m_nextpkt` to walk a queue of packets. Confusing the two is a classic source of use-after-free bugs, because freeing "one packet" means following `m_next` (not `m_nextpkt`) to the end of the chain.
+
+Large payloads use the `M_EXT` indirection. When a payload exceeds the inline data area, the mbuf sets `M_EXT` and stores a pointer to an external buffer (a cluster or [jumbo cluster](#glossary)) in the `m_ext` structure, rather than growing the header. The external buffer is reference-counted: it stays alive as long as any mbuf points at it, and is released by a free callback (`ext_free`) when the count drops to zero. This is what lets a payload be shared — for instance after `m_dup`, or when the same cluster is handed to a checksum-offload path and a driver — without copying the bytes.
+
+Per-packet metadata uses `m_tag`. Rather than add a field to `struct mbuf` for every subsystem that wants to remember something about a packet, each subsystem allocates a small `m_tag` record and links it into the packet's tag list (held on the `pkthdr`). Tags are allocated with `m_tag_alloc`, found with `m_tag_locate`, removed with `m_tag_delete`, and copied with `m_tag_copy`. The backing memory comes from a dedicated malloc type (a named bucket registered with `MALLOC_DEFINE`, the macro that registers a named [`malloc(9)`](../../share/man/man9/malloc.9) allocation type, in the kernel's [`malloc(9)`](../../share/man/man9/malloc.9) subsystem); `sys/kern/uipc_mbuf2.c` defines it as:
+
+```c
+/* From sys/kern/uipc_mbuf2.c */
+static MALLOC_DEFINE(M_PACKET_TAGS, MBUF_TAG_MEM_NAME,
+    "packet-attached information");
+```
+
+This keeps the common case — a packet with no tags — at the size of a plain mbuf, and only pays for the metadata a subsystem actually attaches.
 
 ## Key Data Structures
 
-### struct mbuf
+### struct mbuf and the size macros
 
-The mbuf is the core structure. Its layout, as defined in `sys/sys/mbuf.h`, includes:
+The `offsetof` macros above are the load-bearing definition of the layout. A regular mbuf's data area begins at `m_dat` (offset `MHSIZE`); a header mbuf's data area begins at `m_pktdat` (offset `MPKTHSIZE`), after the `pkthdr`. The common header always present in both forms carries the chain pointers and per-segment state:
+
+- `m_next` — next segment of the *same* packet (the chain).
+- `m_nextpkt` — next *packet* in a queue.
+- `m_data` — pointer to the first valid byte of this segment's data.
+- `m_len` — number of valid bytes in this segment.
+- `m_flags` — the `M_` flags below.
+- `m_type` — the `MT_` type of this segment (e.g. data, header, control).
+- `m_ext` — the external-buffer descriptor, valid when `M_EXT` is set.
+
+The header comment in `mbuf.h` is explicit that these offsets are sensitive to padding: "NB: These calculation do not take actual compiler-induced alignment and padding inside the complete struct mbuf into account. Appropriate attention is required when changing members of struct mbuf." Compile-time assertions in `uipc_mbuf.c` check that the resulting `MLEN`/`MHLEN` values are sensible.
+
+### The M_ flags
+
+These are the bits in `m_flags`. The two that drive the layout and the external-buffer machinery are quoted verbatim from `sys/sys/mbuf.h`:
 
 ```c
-struct mbuf {
-    union {
-        struct  pkthdr pkthdr;  /* M_PKTHDR set */
-        char    *mext;          /* M_EXT set */
-    } m_hdr;
-};
+/* From sys/sys/mbuf.h */
+#define	M_EXT		0x00000001 /* has associated external storage */
+#define	M_PKTHDR	0x00000002 /* start of record */
 ```
 
-The union provides either a `pkthdr` (when `M_PKTHDR` is set) or an `mext` pointer (when `M_EXT` is set). In practice, an mbuf can have both flags set simultaneously — the pkthdr occupies the first portion of the mbuf's data area, and if the mbuf also has `M_EXT`, the `m_ext` structure is stored immediately after the pkthdr.
-
-The header constants are defined in `sys/sys/mbuf.h`:
+`M_EXT` says "this mbuf points at external storage, use `m_ext` to find and free it." `M_PKTHDR` says "this is the first mbuf of a packet; a `pkthdr` is present." Three further bits are reserved for protocol use so a protocol can stash a small flag without a tag:
 
 ```c
-#define MHSIZE      offsetof(struct mbuf, m_dat)
-#define MPKTHSIZE   offsetof(struct mbuf, m_pktdat)
-#define MLEN        ((int)(MSIZE - MHSIZE))
-#define MHLEN       ((int)(MSIZE - MPKTHSIZE))
+/* From sys/sys/mbuf.h */
+#define	M_PROTO1	0x00002000 /* protocol-specific */
+#define	M_PROTO2	0x00004000 /* protocol-specific */
+#define	M_PROTO3	0x00008000 /* protocol-specific */
 ```
-
-`MHSIZE` is the size of the mbuf header up to the data area. `MPKTHSIZE` is the size up to the packet data area (which includes the pkthdr). `MLEN` is the usable data length in a plain mbuf. `MHLEN` is the usable data length in an mbuf that includes a pkthdr. On typical systems, `MLEN` is approximately 227 bytes and `MHLEN` is approximately 199 bytes.
 
 ### struct pkthdr
 
-When `M_PKTHDR` is set on the first mbuf of a chain, `pkthdr` carries packet-level metadata:
+The `pkthdr` is what a header mbuf carries that the rest of the chain does not. Per the [`mbuf(9)`](../../share/man/man9/mbuf.9) documentation, when `M_PKTHDR` is set the header "contains a pointer to the interface the packet has been received from and the total packet length. Optionally, it may also contain an attached list of packet tags," and "fields used in offloading checksum calculation to the hardware are kept in [the pkthdr] as well." The receiving-interface pointer is `rcvif`, a pointer to the packet's receiving `ifnet` (the network interface descriptor struct that represents a NIC); it is read, for example, by the `ip_input` SDT (Statically Defined Tracing) [probe](../kern/README_driver.md#glossary) as `m->m_pkthdr.rcvif`. Because the `pkthdr` holds packet-wide state — total length, not just this segment's `m_len` — only the head of the chain has one, and only the head is a header mbuf.
+
+### External buffer types (EXT_)
+
+When `M_EXT` is set, the `m_ext` descriptor records what kind of external buffer it points at, so the free path knows how to release it. The types are defined in the mbuf header and documented in [`mbuf(9)`](../../share/man/man9/mbuf.9):
 
 ```c
-struct pkthdr {
-    struct  ifnet *rcvif;       /* recv. interface */
-    int         len;            /* total packet length */
-    struct      m_tag *tags[1]; /* packet tags */
-};
+/* External buffer types (mbuf(9)) */
+#define	EXT_CLUSTER	1	/* mbuf cluster */
+#define	EXT_SFBUF	2	/* sendfile(2)'s sf_bufs */
+#define	EXT_JUMBOP	3	/* jumbo cluster 4096 bytes */
+#define	EXT_JUMBO9	4	/* jumbo cluster 9216 bytes */
+#define	EXT_JUMBO16	5	/* jumbo cluster 16184 bytes */
+#define	EXT_PACKET	6	/* mbuf+cluster from packet zone */
+#define	EXT_MBUF	7	/* external mbuf reference */
 ```
 
-The `rcvif` field records the receiving interface. The `len` field records the total packet length (sum of all mbuf data lengths in the chain). The `tags` array is the head of the m_tag linked list. These fields are only meaningful on the first mbuf of a packet chain — subsequent mbufs in the chain do not carry packet-level metadata.
-
-### struct m_ext
-
-When `M_EXT` is set, the mbuf points to an externally allocated buffer. The `m_ext` structure is defined in `sys/sys/mbuf.h`:
-
-```c
-struct m_ext {
-    caddr_t     ext_data;       /* pointer to external data */
-    void        (*ext_free)(caddr_t, caddr_t, int);  /* free callback */
-    u_long      ext_size;       /* size of external buffer */
-    int         ext_flags;      /* ext buffer flags */
-    int         ext_type;       /* ext buffer type */
-    refcount_t  ext_refcnt;     /* reference count */
-    void        *ext_cnt;       /* pointer to reference count (legacy) */
-    void        *ext_arg1;      /* first argument to ext_free */
-    void        *ext_arg2;      /* second argument to ext_free */
-    void        *ext_arg3;      /* third argument to ext_free */
-};
-```
-
-The `ext_free` callback is invoked when the reference count drops to zero. The `ext_size` field records the size of the external buffer. The `ext_refcnt` field tracks how many mbufs reference this cluster. The ext types are defined in `sys/sys/mbuf.h`:
-
-```c
-#define EXT_CLUSTER     1       /* mbuf cluster */
-#define EXT_SFBUF       2       /* sendfile(2)'s sf_bufs */
-#define EXT_JUMBOP      3       /* jumbo cluster 4096 bytes */
-#define EXT_JUMBO9      4       /* jumbo cluster 9216 bytes */
-#define EXT_JUMBO16     5       /* jumbo cluster 16184 bytes */
-#define EXT_PACKET      6       /* mbuf+cluster from packet zone */
-#define EXT_MBUF        7       /* external mbuf reference */
-```
+The three jumbo types map directly onto the three jumbo UMA zones: `EXT_JUMBOP` (4096 bytes), `EXT_JUMBO9` (9216 bytes), and `EXT_JUMBO16` (16184 bytes). The `m_ext` descriptor holds a pointer to the buffer (`ext_buf`), its size (`ext_size`), a reference count (`ext_cnt`), and a free callback of type `m_ext_free_t` (the field is `ext_free`). When `ext_cnt` reaches zero, `ext_free` is invoked to actually release the buffer — this is how a cluster's lifetime is decoupled from any single mbuf that references it.
 
 ### struct m_tag
 
-The `m_tag` structure allows attaching metadata to packets:
+An `m_tag` is a small record a subsystem attaches to a packet. Its fixed prefix identifies the tag and sizes its variable payload:
+
+- `mt_type` — the tag's type, identifying the subsystem that owns it.
+- `mt_id` — a per-type instance id, so a subsystem can have several distinct tag kinds.
+- `mt_len` — length of the tag including its data.
+- `mt_data` — the start of the tag's variable-length payload.
+
+Tags are linked into the packet's list (on the `pkthdr`) and are allocated from the `M_PACKET_TAGS` malloc type (a named MALLOC_DEFINE bucket) shown above. Subsystems look a tag up by `(mt_type, mt_id)` with `m_tag_locate`, and copy or delete it with `m_tag_copy` / `m_tag_delete`. Protocol-specific consumers — for example pf's per-packet state or ipsec's SA association — are out of scope here; they are just examples of subsystems that use this mechanism.
+
+### Allocator bookkeeping structs
+
+A few auxiliary structures round out the subsystem. `struct mbufprofile` (in `sys/kern/uipc_mbuf.c`) accumulates per-bucket accounting for mbuf usage:
 
 ```c
-struct m_tag {
-    TAILQ_ENTRY(m_tag) m_next;    /* next tag in chain */
-    u_int32_t      m_tag_id;      /* tag type identifier */
-    u_int32_t      m_tag_len;     /* data length */
-    /* data follows */
-};
+/* Fields of struct mbufprofile (sys/kern/uipc_mbuf.c) */
+wasted[MP_BUCKETS], used[MP_BUCKETS], segments[MP_BUCKETS]
 ```
 
-Tags are chained via the `m_next` field, which is a TAILQ entry. The `m_tag_id` identifies the subsystem that owns the tag. Tags are attached to the first mbuf's `pkthdr.tags` list. The `m_tag_len` field specifies the length of the data payload that follows the tag header.
-
-### struct mbufq
-
-The `mbufq` structure represents a queue of mbuf chains:
+`struct mbufq` and `struct mchain` (both in `sys/sys/mbuf.h`) describe a queue of packets and a chain of segments respectively, and are the return types of the queue-walking helpers:
 
 ```c
-struct mbufq {
-    struct mbuf    *mq_head;      /* head of chain list */
-    int             mq_len;       /* total number of chains */
-    int             mq_maxlen;    /* maximum queue length */
-};
+/* Fields of struct mbufq (sys/sys/mbuf.h) */
+mq_head, mq_len, mq_maxlen
+
+/* Fields of struct mchain (sys/sys/mbuf.h) */
+mc_q, mc_len, mc_mlen
 ```
 
-This is used by network interfaces and protocol layers to buffer multiple packets.
+`mbufq` mirrors the `m_nextpkt` dimension (a queue of packet heads, with a total byte length `mq_len` and a high-water mark `mq_maxlen`), while `mchain` mirrors the `m_next` dimension (a chain of segments, with `mc_mlen` counting the mbufs in it). These give the stack a way to pass a whole queue or chain around without re-walking it.
 
 ## Deep Dive
 
-### Mbuf Allocation: m_get, m_getcl, m_gethdr, m_getjcl
+### Allocation: m_get, m_gethdr, m_getcl, m_getjcl
 
-The mbuf allocator provides four entry points, each serving a different purpose:
+All four entry points in `sys/kern/uipc_mbuf.c` follow the same shape: pick a zone, ask UMA for an object, and (for the cluster forms) attach the cluster to the mbuf via `m_ext`. Each is wrapped in an SDT probe — `m__get`, `m__gethdr`, `m__getcl`, `m__getjcl` — so the allocation path is observable with DTrace (the dynamic tracing framework).
 
-**m_get** allocates a plain mbuf from `zone_mbuf`. It returns an mbuf with `M_PKTHDR` and `M_EXT` cleared. The caller must manually set flags and type as needed. This is the most basic allocation function, used when the caller needs fine-grained control over the mbuf's initial state.
+- `m_get(m, wait)` returns a *regular* mbuf, its data area sized to `MLEN` (offset `m_dat`).
+- `m_gethdr(m, wait)` returns a *header* mbuf with `M_PKTHDR` set, its data area sized to `MHLEN` (offset `m_pktdat`) and room for the `pkthdr`. This is what a driver calls when it receives a new packet, because the packet head must carry the `pkthdr`.
+- `m_getcl(m, wait, type, flags)` returns a regular mbuf *plus* a `MCLBYTES` cluster attached through `m_ext` (`EXT_CLUSTER`). It is used when a payload of at least `MINCLSIZE` bytes is expected, so the data lives in the cluster instead of the small inline area.
+- `m_getjcl(m, wait, type, len, flags)` is the jumbo variant: it chooses the right jumbo zone for `len` (4096, 9216, or 16184 bytes) and attaches it as `EXT_JUMBOP` / `EXT_JUMBO9` / `EXT_JUMBO16`. High-throughput drivers and the `m_copypacket` path use it to avoid chaining many small mbufs for a large frame.
 
-**m_gethdr** allocates an mbuf from `zone_pack` with `M_PKTHDR` set. This is the standard entry point for creating the first mbuf of a new packet. The returned mbuf has `M_EXT` cleared and a pkthdr initialized with `rcvif = NULL`, `len = 0`, and an empty tag list. Protocol code typically calls `m_gethdr` when beginning to construct a new packet.
+The `wait` argument is the `M_NOWAIT`/`M_WAITOK` flag. The allocator is built on UMA zones — one per size class — so the fast path is a per-CPU cache lookup with no global lock. The zones are created in `uipc_mbuf.c`; the mbuf zones are `zone_mbuf` (regular mbufs) and `zone_pack` (header mbufs, the larger `MPKTHSIZE` object), and the cluster zones are `zone_jumbop`, `zone_jumbo9`, and `zone_jumbo16` for the three jumbo sizes. Because UMA hands out fixed-size objects from per-CPU caches, an mbuf of a given class is byte-for-byte identical every time, which is why the `offsetof`-based size macros are stable and why the layout is so tightly coupled to padding.
 
-**m_getcl** allocates an mbuf from `zone_pack` with both `M_PKTHDR` and `M_EXT` set, and attaches a cluster of size `MCLBYTES` (typically 2048 bytes). The cluster is allocated from the UMA zone associated with the allocation flags. When `M_WAITOK` is specified, the allocator blocks until a cluster is available. When `M_NOWAIT` is specified and no cluster is available, the function returns NULL. This is the standard entry point for receiving packets — the network driver allocates an mbuf+cluster, DMA's the frame into the cluster, and passes the chain up the stack.
+### Freeing: m_freem and the external-buffer refcount
 
-**m_getjcl** is a variant of `m_getcl` that accepts additional flags for selecting jumbo cluster sizes. It can allocate from `zone_jumbop` (4096 bytes), `zone_jumbo9` (9216 bytes), or `zone_jumbo16` (16184 bytes) depending on the flags passed. Jumbo clusters reduce the number of mbufs needed for large packets, which improves cache efficiency and reduces pointer-chasing overhead.
+`m_freem` (declared in `sys/sys/mbuf.h`, implemented in `sys/kern/uipc_mbuf.c`) frees a whole chain. It walks the chain with `m_next`, and for each mbuf: if `M_EXT` is set, it decrements the external buffer's reference count and, when it reaches zero, calls the buffer's `ext_free` callback; then it returns the mbuf object itself to its UMA zone. The `m__freem` SDT probe fires on the head. This is the only correct way to free a packet — it is what makes the `m_next`-versus-`m_nextpkt` distinction matter, because `m_freem` deliberately follows only `m_next`, so it frees exactly one packet and leaves the queue linkage (`m_nextpkt`) for the queue owner.
 
-The allocator functions follow a common pattern: they first attempt to allocate from the per-CPU cache of the appropriate UMA zone. If the per-CPU cache is empty, they fall back to allocating a new slab. If allocation fails and `M_WAITOK` is set, the allocator may invoke `mb_reclaim` to free mbufs from other processes before retrying.
+### Reading data: m_pullup, m_copydata, m_adj
 
-### Mbuf Chains: m_next vs m_nextpkt
+The data-access primitives in `sys/kern/uipc_mbuf2.c` are the ones protocol code calls most often.
 
-FreeBSD uses two distinct chaining mechanisms:
+`m_pullup(m, len)` is the workhorse for reading a header that may straddle a chain boundary. Its own comment states the contract: "ensure that [off, off + len) is contiguous on the mbuf chain m. packet chain before off is kept untouched." If the first `len` bytes already live contiguously in the head mbuf's data area, `m_pullup` returns immediately. Otherwise it allocates a new head mbuf (or cluster), copies the leading bytes into it, and re-links the chain so the caller can now `mtod(m, ...)` the header — `mtod` is the macro that casts an mbuf's data pointer to a C type so a header can be read as a struct. Protocol code *must* call `m_pullup` before reading a header whose length exceeds the head's `m_len`; reading past `m_len` into the next segment's bytes is undefined because the data may not be physically contiguous.
 
-- **m_next** chains segments of a single packet. When a packet's payload exceeds the data capacity of one mbuf, additional mbufs are appended via `m_next`. The first mbuf of the chain has `M_PKTHDR` set (if the packet has a header), and subsequent mbufs have neither `M_PKTHDR` nor `M_EXT` set. The total packet length is tracked in `m_pkthdr.len` and updated as segments are added or removed.
+`m_copydata(m, off, len, buf)` copies `len` bytes starting at offset `off` from the chain into a caller buffer. It walks the chain segment by segment, copying the overlapping slice of each, so it works across boundaries without the caller having to reason about where the data lives. It is the safe read for a fragment that is not a whole header.
 
-- **m_nextpkt** chains multiple complete packets in a queue. This is used by network interfaces and protocol layers to buffer several packets before processing them. Each mbuf in an `m_nextpkt` chain is a complete packet (with `M_PKTHDR` set on its first mbuf). The `m_nextpkt` pointer is only meaningful on the first mbuf of each packet.
+`m_adj(m, len)` advances the start of the chain by `len` bytes, discarding that many bytes. It is the inverse of `m_prepend` and is how a protocol consumes a header it has already parsed: after `m_pullup` and a `mtod` read, `m_adj(m, hlen)` drops the header and leaves the payload. If `len` exceeds the head's `m_len`, `m_adj` frees head segments until the offset is satisfied. `m_adj_decap` is a variant used when decapsulating (e.g. stripping a tunnel header) that also fixes up the `pkthdr` length.
 
-The distinction is critical: `m_next` represents a single packet that has been fragmented across multiple mbufs, while `m_nextpkt` represents multiple independent packets waiting for processing. Confusing the two leads to incorrect packet boundary detection and data corruption.
+### Copying and splitting
 
-### m_pullup: Consolidating Chain Segments
+`m_copypacket` (in `uipc_mbuf.c`) makes a deep copy of a chain, allocating fresh mbufs/clusters and copying the data — used when a packet must be delivered to more than one destination (broadcast, or a firewall that inspects a copy). `m_split(m, off, wait)` cuts a chain at offset `off`, returning the first part and leaving the rest in `m`; it is how a protocol separates a header from a payload, or a payload from a trailer. `m_defrag(m, wait)` is the opposite: it coalesces a chain into as few large segments as possible (using clusters), which is what a driver wants before handing a packet to the NIC. `m_dup` makes a *shallow* copy — it increments reference counts on the shared external buffers rather than copying the bytes — which is why the `m_ext` refcount exists at all.
 
-The `m_pullup` function consolidates the first `len` bytes of an mbuf chain into a single contiguous buffer. It is called when protocol code needs to read a header that may span multiple mbuf segments. For example, when processing an IP packet, the code needs to read the IP header (20 bytes for IPv4, 40 bytes for IPv6) as a contiguous block. If the first mbuf does not contain enough data, `m_pullup` allocates a new mbuf, copies the required data from the chain, and returns the new mbuf. The original chain is freed.
+### m_tag in action
 
-```c
-/* Conceptual behavior of m_pullup */
-struct mbuf *m_pullup(struct mbuf *m, int len)
-{
-    /* If first mbuf has enough data, return it */
-    if (m->m_len >= len)
-        return m;
-
-    /* Allocate a new mbuf with pkthdr */
-    struct mbuf *n = m_gethdr(M_NOWAIT, MT_DATA);
-    if (n == NULL)
-        return NULL;
-
-    /* Copy len bytes from the chain */
-    if (m_copydata(m, 0, len, mtod(n, caddr_t)) != 0) {
-        m_freem(n);
-        return NULL;
-    }
-
-    /* Free the original chain */
-    m_freem(m);
-    return n;
-}
-```
-
-Protocol code must call `m_pullup` (or `m_pulldown` for data at the end of the chain) before accessing headers that may straddle segment boundaries. Failure to do so can result in reading uninitialized memory or crossing mbuf boundaries incorrectly.
-
-### m_copydata: Safe Data Extraction
-
-The `m_copydata` function copies `len` bytes from offset `off` in an mbuf chain into a user-supplied buffer. It handles chain traversal internally, copying data from each segment as needed. This is the standard way to read packet data without modifying the chain.
-
-```c
-int m_copydata(struct mbuf *m, int off, int len, caddr_t cp);
-```
-
-The function returns 0 on success and non-zero if the requested data extends beyond the end of the chain. Protocol code uses `m_copydata` to extract headers, payload data, and option bytes from received packets.
-
-### m_adj: Adjusting Chain Offsets
-
-The `m_adj` function removes `len` bytes from the beginning of an mbuf chain. It advances the data pointer and decrements the length of each mbuf in the chain until `len` bytes have been removed. If an mbuf's data is fully consumed, it is skipped and the next mbuf is used. This is used by protocol code to strip headers as they are processed.
-
-```c
-void m_adj(struct mbuf *m, int len);
-```
-
-For example, after processing an Ethernet header, the code calls `m_adj(m, ETHER_HDR_LEN)` to advance past the header. After processing the IP header, it calls `m_adj(m, ip_hl * 4)` to advance past the IP header. The chain remains intact, but the data pointer advances and the total packet length in `pkthdr.len` is updated.
-
-### m_freem: Freeing an Mbuf Chain
-
-The `m_freem` function frees all mbufs in a chain, including any clusters they reference. It traverses the `m_nextpkt` chain (for queued packets) and the `m_next` chain (for packet segments), freeing each mbuf and releasing any associated clusters. When freeing a cluster, the reference count is decremented, and the `ext_free` callback is invoked if the count reaches zero.
-
-```c
-void m_freem(struct mbuf *m);
-```
-
-Protocol code calls `m_freem` when a packet is discarded (e.g., due to an error) or after the packet has been fully processed and transmitted.
-
-### m_tag: Attaching Metadata
-
-The `m_tag` mechanism allows subsystems to attach metadata to packets without modifying the mbuf structure. Tags are stored in a linked list attached to the first mbuf's `pkthdr.tags` field. Each tag has a type identifier (`m_tag_id`) that indicates the owning subsystem.
-
-```c
-struct m_tag *m_tag_prepend(struct mbuf *m, struct m_tag *t);
-struct m_tag *m_tag_append(struct mbuf *m, struct m_tag *t);
-struct m_tag *m_tag_locate(struct mbuf *m, u_int32_t type, u_int32_t id);
-void m_tag_delete(struct mbuf *m, struct m_tag *t);
-void m_tag_delete_chain(struct mbuf *m);
-```
-
-Tags can be prepended (added to the front of the chain) or appended (added to the end). The `m_tag_locate` function searches for a tag of a specific type and ID. Tags are automatically freed when the packet is freed via `m_freem`.
-
-Subsystems use tags to carry information across protocol layers. For example, a firewall module might attach a tag containing the packet's classification result, which subsequent layers can inspect to make forwarding decisions. The tags travel with the packet from input to output, attached to the first mbuf of each chain.
-
-### UMA Zones and Cluster Management
-
-The mbuf subsystem uses five UMA zones:
-
-1. **zone_mbuf**: Standard mbufs without pkthdr. Used for data mbufs in the middle of a chain.
-2. **zone_pack**: Mbufs with pkthdr. Used for the first mbuf of a packet.
-3. **zone_jumbop**: Jumbo clusters of 4096 bytes. Selected via `M_PKTHDR | M_EXT | M_JUMBOP`.
-4. **zone_jumbo9**: Jumbo clusters of 9216 bytes. Selected via `M_PKTHDR | M_EXT | M_JUMBO9`.
-5. **zone_jumbo16**: Jumbo clusters of 16184 bytes. Selected via `M_PKTHDR | M_EXT | M_JUMBO16`.
-
-Clusters are reference-counted through the `ext_refcnt` field in `struct m_ext`. When multiple mbufs reference the same cluster (e.g., after `m_dup`), the reference count is incremented. When an mbuf is freed, the count is decremented, and the `ext_free` callback is invoked when the count reaches zero. This allows clusters to be shared safely between multiple consumers.
-
-The jumbo zones exist to reduce the number of mbufs needed for large packets. A standard mbuf can hold approximately 227 bytes of data, so a 1500-byte Ethernet frame requires at least 7 mbufs. A jumbo9 mbuf can hold 9216 bytes, reducing the count to one. This improves cache efficiency and reduces pointer-chasing overhead during packet processing.
-
-### Mbuf Exhaustion and Reclaim
-
-When the mbuf zones are exhausted, allocation behavior depends on the flags passed to the allocator:
-
-- **M_WAITOK**: The allocator blocks and retries. If the zone remains empty, it invokes `mb_reclaim` to free mbufs from other processes. The reclaim path iterates through all processes, selecting mbufs for reclamation based on heuristics (e.g., mbufs that are not currently being processed, mbufs with low reference counts). Reclaimed mbufs are freed and returned to their respective zones.
-
-- **M_NOWAIT**: The allocator returns NULL immediately if no mbuf is available. Protocol code must handle NULL returns gracefully, typically by logging an error and discarding the packet.
-
-The `mb_reclaim` function is a critical safety valve that prevents the system from hanging when mbufs are exhausted. It is invoked automatically by the allocator when `M_WAITOK` is specified and no mbufs are available. The reclaim path is designed to be non-disruptive: it preferentially reclaims mbufs from processes that are not actively processing packets, minimizing the impact on throughput.
+A subsystem that wants per-packet state does not touch `struct mbuf`. It calls `m_tag_alloc(type, id, len, wait)` to get a `m_tag` (backed by the `M_PACKET_TAGS` malloc type), fills `mt_data`, and links it into the packet. Later, `m_tag_locate(m, type, id, ...)` finds it again by `(mt_type, mt_id)`, and `m_tag_delete` / `m_tag_copy` remove or duplicate it. Because the tag list lives on the `pkthdr`, only the head mbuf is touched, and a packet that no subsystem tags costs nothing. The tag mechanism is the reason pf, ipsec, and LRO can each remember their own per-packet state on the same packet without any of them knowing about the others.
 
 ## Flow / Diagram
 
 ```mermaid
 classDiagram
-    class mbuf {
-        +union {
-            +pkthdr pkthdr
-            +m_ext *mext
-        }
-    }
-    class pkthdr {
-        +struct ifnet *rcvif
-        +int len
-        +struct m_tag *tags
-    }
-    class m_ext {
-        +caddr_t ext_data
-        +void ext_free(caddr_t, caddr_t, int)
-        +u_long ext_size
-        +int ext_flags
-        +int ext_type
-        +refcount_t ext_refcnt
-    }
-    class m_tag {
-        +TAILQ_ENTRY m_next
-        +u_int32_t m_tag_id
-        +u_int32_t m_tag_len
-    }
-    class mbufq {
-        +struct mbuf *mq_head
-        +int mq_len
-        +int mq_maxlen
-    }
-    pkthdr --> m_tag : points to chain
-    mbuf o-- mbuf : m_next (segments)
-    mbuf o-- mbuf : m_nextpkt (queued packets)
-    mbufq o-- mbuf : contains chain
+  class mbuf {
+    +mbuf m_next
+    +mbuf m_nextpkt
+    +char m_data
+    +int m_len
+    +int m_flags
+    +int m_type
+    +m_ext m_ext
+  }
+  class pkthdr {
+    +ifnet rcvif
+    +int total_len
+    +int hdr_len
+    +m_tag tags
+  }
+  class m_ext {
+    +void ext_buf
+    +int ext_size
+    +int ext_cnt
+    +m_ext_free_t ext_free
+  }
+  class m_tag {
+    +int mt_type
+    +int mt_id
+    +int mt_len
+    +char mt_data
+  }
+  class cluster {
+    +char data
+  }
+  mbuf o-- pkthdr : M_PKTHDR head
+  mbuf o-- m_ext : M_EXT
+  m_ext --> cluster : ext_buf
+  pkthdr o-- m_tag : tag list
+  mbuf --> mbuf : m_next same packet
+  mbuf --> mbuf : m_nextpkt queue
 ```
 
-## Comparison
-
-FreeBSD's mbuf system differs significantly from Linux's sk_buff. The Linux sk_buff is a larger, more complex structure that embeds protocol-specific pointers directly within the structure. FreeBSD's approach of keeping the mbuf small and using separate structures (pkthdr, m_ext, m_tag) for variable-length data allows the mbuf to remain compact while supporting extensibility. The m_tag mechanism in FreeBSD is more flexible than Linux's sk_buff extensions, which rely on fixed fields or sk_buff_data_t offsets.
-
-Linux uses SLUB for mbuf (sk_buff) allocation, while FreeBSD uses UMA with per-CPU caches. UMA's per-CPU design provides better scalability on SMP systems by reducing lock contention. The FreeBSD mbuf zones are pre-allocated at boot time, while Linux's sk_buff cache is dynamically sized. FreeBSD's UMA zones also support NUMA-aware allocation policies, which Linux's SLUB supports through its own node-local allocation mechanisms.
-
-FreeBSD's two-level chaining (m_next for segments, m_nextpkt for queued packets) is more explicit than Linux's single-chain approach, where sk_buffs use a linked list for both packet segmentation and queuing. FreeBSD's separation makes it clearer which pointer represents which relationship, reducing the risk of bugs. Linux's approach is more compact but requires careful tracking of whether a list represents packet segments or queued packets.
+There is a single `struct mbuf` type; the "header mbuf" and "regular mbuf" are the same struct with or without `M_PKTHDR` set. When `M_PKTHDR` is set, the head mbuf's data area begins at `m_pktdat` (after the embedded `pkthdr`) instead of `m_dat`, which is why `MPKTHSIZE > MHSIZE` and `MHLEN < MLEN`. Any mbuf in the chain — head or not — may carry an `m_ext` descriptor when `M_EXT` is set; that descriptor points at a cluster or jumbo cluster whose lifetime is governed by `ext_cnt` and released by `ext_free`. The `m_tag` list hangs off the head's `pkthdr`. `m_next` binds the segments of one packet; `m_nextpkt` binds the packets of a queue. Reading a packet follows `m_next` to the end of the chain; walking a queue follows `m_nextpkt` from packet head to packet head.
 
 ## Advanced Notes
 
-### Debugging with DTrace
+### Observability
 
-FreeBSD's SDT probes provide detailed visibility into mbuf allocation and deallocation. The following DTrace scripts can help diagnose mbuf-related issues:
+The entire allocation path is instrumented with SDT probes, defined in `sys/kern/uipc_mbuf.c`: `m__init`, `m__get`, `m__gethdr`, `m__getcl`, `m__getjcl`, `m__clget`, `m__cljget`, `m__cljset`, `m__free`, `m__freem`, and `m__freemp`. Each `m__get*` probe fires with the allocation flags and the resulting mbuf, so a DTrace one-liner can count how often `m_getcl` falls back to a cluster, or how many `M_NOWAIT` allocations return `NULL` (the probe still fires with a null mbuf). This is the fastest way to find out whether a load is mbuf-bound before reaching for `sysctl`. The `mbufprofile` counters (`wasted`, `used`, `segments` per bucket) are exposed for the same purpose and let you see the distribution of chain lengths and the bytes wasted in trailing mbufs.
 
-```d
-/* Track mbuf allocations */
-sdt:::m__gethdr
-{
-    printf("m_gethdr: type=%d flags=%d
-", arg1, arg2);
-}
+### Performance: why the zones are split
 
-/* Track mbuf frees */
-sdt:::m__freem
-{
-    printf("m_freem: mbuf=%p
-", arg0);
-}
+The allocator is per-CPU and lock-free on the fast path because it is built on UMA zones, one per size class. Splitting into `zone_mbuf`, `zone_pack`, `zone_jumbop`, `zone_jumbo9`, and `zone_jumbo16` means a small packet and a jumbo frame never contend for the same cache line, and a driver that only ever allocates 2048-byte clusters never touches the jumbo16 cache. The trade-off is that a burst of one size can exhaust its zone while other zones sit full; the reclaim path (below) is what lets the kernel move memory between them. `m_defrag` and `m_getjcl` are the two levers that change the size mix: defragmenting a chain into clusters reduces the number of mbufs in flight, and allocating jumbo clusters up front reduces the number of small mbufs needed per packet.
 
-/* Track cluster allocations */
-sdt:::m__getcl
-{
-    printf("m_getcl: type=%d flags=%d ext_type=%d
-", arg1, arg2, arg3);
-}
-```
+### Exhaustion and mb_reclaim
 
-These probes can be used to identify allocation hotspots, track cluster reference counts, and diagnose exhaustion issues.
+When a zone is empty, the behavior depends on the `wait` flag. With `M_NOWAIT`, the allocator returns `NULL` immediately — this is the only legal choice in interrupt context, where sleeping is forbidden — and the caller must drop the packet or defer it. With `M_WAITOK`, the caller is put to sleep on a zone-specific wait channel until a free happens. Before the allocator gives up, it calls `mb_reclaim` (in `sys/kern/kern_mbuf.c`), which attempts to return memory to the pool: it can force the page daemon to reclaim freeable pages, and it can drop mbufs that are held only by a slow consumer (e.g. a socket buffer that is not making progress). The reclaim path is what makes `M_WAITOK` allocation eventually succeed under sustained load, and it is also the path that can drop data if the system is truly out of memory. A driver that sees repeated `M_NOWAIT` failures should treat that as a signal to shed load (drop, or coalesce) rather than retry in a tight loop, because retrying `M_NOWAIT` in interrupt context cannot make the zone non-empty.
 
-### Performance Implications
+### Common pitfalls
 
-The mbuf design has several performance implications:
+- **Reading past `m_len`.** The single most common mbuf bug is treating a header as contiguous when it is not. If a header's length exceeds the head mbuf's `m_len`, the bytes continue in the next segment, and reading them as a C struct is undefined. Always `m_pullup(m, hlen)` before `mtod(m, ...)` when `hlen` may exceed the head's `m_len`.
+- **Confusing `m_next` and `m_nextpkt`.** Freeing a packet means following `m_next` to the end of the chain (`m_freem` does this). Following `m_nextpkt` walks *other packets* in a queue; freeing along `m_nextpkt` destroys packets you do not own. Conversely, a queue-walker that follows `m_next` instead of `m_nextpkt` will run off the end of one packet into the next.
+- **Forgetting the `pkthdr` is only on the head.** Only the first mbuf of a packet has `M_PKTHDR` set and a valid `pkthdr`. Code that assumes every segment has a `pkthdr` (e.g. to read the total length) will read garbage on the tail segments; use the head's `pkthdr` total length, not a per-segment field.
+- **Dangling `m_ext` after a shallow copy.** `m_dup` shares external buffers by incrementing `ext_cnt`; the buffer is freed only when the last reference is dropped. Code that frees the underlying buffer directly without going through the refcount (or that assumes it owns the cluster) will corrupt the other sharers.
 
-1. **Cache efficiency**: Small mbufs fit well in cache lines, but excessive chaining (many mbufs per packet) increases cache misses during traversal. Jumbo clusters reduce the number of mbufs per packet, improving cache efficiency.
+### Theory connection
 
-2. **Pointer chasing**: Each mbuf adds a pointer indirection. Packet processing that traverses chains (e.g., header parsing, data copying) pays a cost for each mbuf in the chain. Protocols that minimize chain depth (e.g., by using jumbo clusters) achieve better throughput.
-
-3. **Cluster sharing**: Reference-counted clusters allow multiple mbufs to share the same underlying buffer. This is useful for packet duplication (e.g., for monitoring or replication) but adds complexity to the free path.
-
-4. **UMA per-CPU caches**: The per-CPU design reduces lock contention but can lead to imbalanced allocation when traffic is concentrated on a single CPU. The UMA subsystem handles this through cache migration and slab allocation.
-
-### Common Pitfalls
-
-1. **Confusing m_next and m_nextpkt**: Using m_next to traverse a queue of packets (instead of m_nextpkt) will skip packets and process chain segments as independent packets. Conversely, using m_nextpkt to traverse packet segments will only see the first segment.
-
-2. **Forgetting m_pullup**: Accessing headers that may span multiple mbufs without calling m_pullup first can read uninitialized memory or cross boundaries incorrectly. Always call m_pullup (or m_pulldown) before reading headers.
-
-3. **Leaking mbufs**: Failing to call m_freem on error paths leaks mbufs and can eventually exhaust the zones. Every allocation path must have a corresponding free path.
-
-4. **Modifying mbuf data without adjusting m_len**: Writing data to an mbuf without updating m_len and pkthdr.len will cause protocol code to read stale data or miss new data. Always update lengths when modifying mbuf contents.
-
-5. **Assuming mbuf data is contiguous**: Only the first mbuf of a chain is guaranteed to be contiguous. Data beyond m_len in the first mbuf is in subsequent mbufs. Use m_copydata or m_pullup to access data safely.
+The mbuf is a textbook example of the *descriptor* pattern from OS design: a fixed-size control block that describes a variable-size resource, decoupled from it so that the control structure's cost does not scale with the payload. The `M_EXT`/`m_ext` indirection is the same idea as a file's `vnode` pointing at a `vm_object` — a small, cheap handle that stands in for a large, expensive object, with a reference count mediating lifetime. The `m_tag` mechanism is the network analogue of an out-of-band *annotation* or *property bag*: it lets independent subsystems attach data to a shared object without a central schema, at the cost of a linear search by `(type, id)`. The `m_next`/`m_nextpkt` split is the distinction between a *linked list of a record's fields* and a *queue of records*, a distinction that recurs in every kernel buffer manager (e.g. the difference between a bio (block-I/O descriptor) segment list and a device's request queue).
 
 ## See Also
 - [Network Stack — Architecture and Packet Flow](../net/README.md)
@@ -369,13 +268,15 @@ The mbuf design has several performance implications:
 
 
 
-- FreeBSD man9: [mbuf(9)](../../share/man/man9/mbuf.9), [mbchain(9)](../../share/man/man9/mbchain.9), [mbuf_tags(9)](../../share/man/man9/mbuf_tags.9), [zone(9)](../../share/man/man9/zone.9)
-
-Source files:
-- [`sys/sys/mbuf.h`](mbuf.h) — mbuf structure definitions, flags, and macros
-- [`sys/kern/uipc_mbuf.c`](../kern/uipc_mbuf.c) — allocator functions, UMA zone management, SDT probes
-- [`sys/kern/uipc_mbuf2.c`](../kern/uipc_mbuf2.c) — chain manipulation functions (m_pullup, m_copydata, m_adj)
+- [`mbuf(9)`](../../share/man/man9/mbuf.9) — the kernel API reference for the mbuf structure and all the functions covered here.
+- [`mbchain(9)`](../../share/man/man9/mbchain.9) and [`mdchain(9)`](../../share/man/man9/mdchain.9) — helpers for walking and dumping mbuf chains.
+- `m_tag(9)` (see [`mbuf_tags(9)`](../../share/man/man9/mbuf_tags.9)) — the tag allocation and lookup API.
+- `uma(9)` — the per-CPU slab allocator that backs the mbuf zones.
+- [`refcount(9)`](../../share/man/man9/refcount.9) — the atomic (lock-free, indivisible read-modify-write) reference-count primitives used by `m_ext`.
+- `sdt(9)` — the SDT probe framework used to instrument the allocation path.
+- Source: [`sys/sys/mbuf.h`](mbuf.h), [`sys/kern/uipc_mbuf.c`](../kern/uipc_mbuf.c), [`sys/kern/uipc_mbuf2.c`](../kern/uipc_mbuf2.c), [`sys/kern/kern_mbuf.c`](../kern/kern_mbuf.c).
+- Related chapters: Network Stack (how mbufs flow through `ifnet` and netisr (the network interrupt service routine, which defers soft-interrupt work)), Transport Protocols (how TCP reads and writes mbuf chains), and IP Layer (how `ip_input` consumes a packet via `m_pullup` and `m_adj`).
 
 ---
 
-> _Generated by [DaemonDocs](https://github.com/ocochard/DaemonDocs) on 2026-05-01 14:42 UTC using model `Qwen3.6-35B-A3B-UD-Q4_K_XL` (llama.cpp build `b8985-27aef3dd9`). AI-generated content — verify against source before relying on it._
+> _Generated by [DaemonDocs](https://github.com/ocochard/DaemonDocs) on 2026-09-03 07:00 UTC using model `Qwen3.8-27B-Q8_0` (llama.cpp build `b10553-cd26896c1`). AI-generated content — verify against source before relying on it._
