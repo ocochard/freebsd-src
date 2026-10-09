@@ -1184,16 +1184,30 @@ prepend_header:
 	}
 
 	/*
-	 * Send trailers.
+	 * Send the header, if the loop did not run because there was no
+	 * file data to send it with, and trailers.
 	 */
-	if (trl_uio != NULL) {
-		ssize_t cnt;
+	if ((hdr_uio != NULL && hdr_uio->uio_resid > 0) || trl_uio != NULL) {
+		ssize_t cnt, len;
 
 		SOCK_IO_SEND_UNLOCK(so);
 		CURVNET_RESTORE();
-		error = kern_filewrite(td, sockfd, sock_fp, trl_uio, 0, &cnt);
-		/* A socket write counts what it sent, error or not. */
-		sbytes += cnt;
+		if (hdr_uio != NULL && (len = hdr_uio->uio_resid) > 0) {
+			hdr_uio->uio_td = td;
+			hdr_uio->uio_rw = UIO_WRITE;
+			error = kern_filewrite(td, sockfd, sock_fp, hdr_uio, 0,
+			    &cnt);
+			sbytes += cnt;
+			/* Do not send trailers after a partial header. */
+			if (error != 0 || cnt != len)
+				goto out;
+		}
+		if (trl_uio != NULL) {
+			error = kern_filewrite(td, sockfd, sock_fp, trl_uio, 0,
+			    &cnt);
+			/* A socket write counts what it sent, error or not. */
+			sbytes += cnt;
+		}
 		goto out;
 	}
 
