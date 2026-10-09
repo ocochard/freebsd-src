@@ -1264,6 +1264,43 @@ ATF_TC_BODY(sbytes_partial_trailer, tc)
 	atf_utils_wait(pid, 0, "", "");
 }
 
+ATF_TC_WITHOUT_HEAD(hdtr_without_file_data);
+ATF_TC_BODY(hdtr_without_file_data, tc)
+{
+	struct iovec hdr = { .iov_base = "HEAD", .iov_len = 4 };
+	struct iovec trl = { .iov_base = "TAIL", .iov_len = 4 };
+	struct sf_hdtr hdtr = { &hdr, 1, &trl, 1 };
+	struct sf_hdtr hdr_only = { &hdr, 1, NULL, 0 };
+	char buf[64];
+	off_t sbytes;
+	int empty, fd;
+
+	atf_utils_create_file(SOURCE_FILE, "%s", SMALL_FILE);
+	fd = open(SOURCE_FILE, O_RDONLY);
+	ATF_REQUIRE_MSG(fd != -1, "open failed: %s", strerror(errno));
+	atf_utils_create_file("empty", "%s", "");
+	empty = open("empty", O_RDONLY);
+	ATF_REQUIRE_MSG(empty != -1, "open failed: %s", strerror(errno));
+
+	/* At or past the end of file, only the header and trailer go out. */
+	sendfile_pair(fd, strlen(SMALL_FILE), 0, &hdtr, &sbytes, buf,
+	    sizeof(buf));
+	ATF_CHECK_STREQ(buf, "HEADTAIL");
+	ATF_CHECK_EQ(sbytes, 8);
+	sendfile_pair(fd, 2 * strlen(SMALL_FILE), 0, &hdtr, &sbytes, buf,
+	    sizeof(buf));
+	ATF_CHECK_STREQ(buf, "HEADTAIL");
+	ATF_CHECK_EQ(sbytes, 8);
+	sendfile_pair(empty, 0, 0, &hdtr, &sbytes, buf, sizeof(buf));
+	ATF_CHECK_STREQ(buf, "HEADTAIL");
+	ATF_CHECK_EQ(sbytes, 8);
+	sendfile_pair(empty, 0, 0, &hdr_only, &sbytes, buf, sizeof(buf));
+	ATF_CHECK_STREQ(buf, "HEAD");
+	ATF_CHECK_EQ(sbytes, 4);
+	(void)close(empty);
+	(void)close(fd);
+}
+
 ATF_TP_ADD_TCS(tp)
 {
 
@@ -1303,6 +1340,7 @@ ATF_TP_ADD_TCS(tp)
 	ATF_TP_ADD_TC(tp, s_negative_udp_socket_v6);
 	ATF_TP_ADD_TC(tp, nbytes_past_off_max);
 	ATF_TP_ADD_TC(tp, sbytes_partial_trailer);
+	ATF_TP_ADD_TC(tp, hdtr_without_file_data);
 
 	return (atf_no_error());
 }
