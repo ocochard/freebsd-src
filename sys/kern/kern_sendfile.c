@@ -1192,8 +1192,8 @@ prepend_header:
 		SOCK_IO_SEND_UNLOCK(so);
 		CURVNET_RESTORE();
 		error = kern_filewrite(td, sockfd, sock_fp, trl_uio, 0, &cnt);
-		if (error == 0)
-			sbytes += cnt;
+		/* A socket write counts what it sent, error or not. */
+		sbytes += cnt;
 		goto out;
 	}
 
