@@ -732,7 +732,7 @@ vn_sendfile(struct file *fp, int sockfd, struct uio *hdr_uio,
 	struct sf_buf *sf;
 	struct shmfd *shmfd;
 	struct vattr va;
-	off_t off, sbytes, rem, obj_size, nobj_size;
+	off_t end, off, sbytes, rem, obj_size, nobj_size;
 	int error, ext_pgs_idx, hdrlen, max_pgs, softerr;
 #ifdef KERN_TLS
 	int tls_enq_cnt;
@@ -767,7 +767,16 @@ vn_sendfile(struct file *fp, int sockfd, struct uio *hdr_uio,
 	SFSTAT_INC(sf_syscalls);
 	SFSTAT_ADD(sf_rhpages_requested, SF_READAHEAD(flags));
 
-	rem = nbytes ? omin(nbytes, obj_size - offset) : obj_size - offset;
+	/*
+	 * Send up to the end of the file if nbytes is 0, or if it reaches
+	 * past the largest offset: it is a size_t, which an off_t does not
+	 * hold, and offset + nbytes may not either.
+	 */
+	if (nbytes == 0 || nbytes > (size_t)(OFF_MAX - offset))
+		end = OFF_MAX;
+	else
+		end = offset + nbytes;
+	rem = omin(end, obj_size) - offset;
 
 	/*
 	 * Protect against multiple writers to the socket.
@@ -860,9 +869,7 @@ vn_sendfile(struct file *fp, int sockfd, struct uio *hdr_uio,
 			}
 			if (nobj_size != obj_size) {
 				obj_size = nobj_size;
-				rem = nbytes ? omin(nbytes + offset, obj_size) :
-				    obj_size;
-				rem -= off;
+				rem = omin(end, obj_size) - off;
 			}
 		}
 
