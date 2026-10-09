@@ -35,6 +35,7 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <paths.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1166,6 +1167,56 @@ ATF_TC_BODY(s_negative_udp_socket_v6, tc)
 	s_negative_udp_socket_test(AF_INET6);
 }
 
+#define	SMALL_FILE	"0123456789"
+
+/*
+ * Send fd over one end of a stream socket pair and return what the other end
+ * read, up to len bytes, NUL terminated.
+ */
+static ssize_t
+sendfile_pair(int fd, off_t offset, size_t nbytes, struct sf_hdtr *hdtr,
+    off_t *sbytes, char *buf, size_t len)
+{
+	ssize_t n, total;
+	int error, sv[2];
+
+	ATF_REQUIRE_MSG(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0,
+	    "socketpair failed: %s", strerror(errno));
+	error = sendfile(fd, sv[0], offset, nbytes, hdtr, sbytes, 0);
+	ATF_REQUIRE_MSG(error == 0, "sendfile failed: %s", strerror(errno));
+	(void)close(sv[0]);
+	total = 0;
+	while (total < (ssize_t)len - 1 &&
+	    (n = read(sv[1], buf + total, len - 1 - total)) > 0)
+		total += n;
+	buf[total] = '\0';
+	(void)close(sv[1]);
+	return (total);
+}
+
+ATF_TC_WITHOUT_HEAD(nbytes_past_off_max);
+ATF_TC_BODY(nbytes_past_off_max, tc)
+{
+	size_t nbytes[] = { SIZE_MAX, (size_t)INT64_MAX + 1 };
+	char buf[64];
+	off_t sbytes;
+	int fd, i;
+
+	atf_utils_create_file(SOURCE_FILE, "%s", SMALL_FILE);
+	fd = open(SOURCE_FILE, O_RDONLY);
+	ATF_REQUIRE_MSG(fd != -1, "open failed: %s", strerror(errno));
+
+	/* An nbytes past what an off_t holds means up to the end of file. */
+	for (i = 0; i < (int)nitems(nbytes); i++) {
+		sbytes = -1;
+		ATF_CHECK_EQ(sendfile_pair(fd, 0, nbytes[i], NULL, &sbytes,
+		    buf, sizeof(buf)), (ssize_t)strlen(SMALL_FILE));
+		ATF_CHECK_EQ(sbytes, (off_t)strlen(SMALL_FILE));
+		ATF_CHECK_STREQ(buf, SMALL_FILE);
+	}
+	(void)close(fd);
+}
+
 ATF_TP_ADD_TCS(tp)
 {
 
@@ -1203,6 +1254,7 @@ ATF_TP_ADD_TCS(tp)
 	ATF_TP_ADD_TC(tp, s_negative_not_socket_file_descriptor);
 	ATF_TP_ADD_TC(tp, s_negative_udp_socket_v4);
 	ATF_TP_ADD_TC(tp, s_negative_udp_socket_v6);
+	ATF_TP_ADD_TC(tp, nbytes_past_off_max);
 
 	return (atf_no_error());
 }
