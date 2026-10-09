@@ -35,6 +35,7 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <paths.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1217,6 +1218,52 @@ ATF_TC_BODY(nbytes_past_off_max, tc)
 	(void)close(fd);
 }
 
+ATF_TC_WITHOUT_HEAD(sbytes_partial_trailer);
+ATF_TC_BODY(sbytes_partial_trailer, tc)
+{
+	static char big[1024 * 1024];
+	struct iovec trl = { .iov_base = big, .iov_len = sizeof(big) };
+	struct sf_hdtr hdtr = { NULL, 0, &trl, 1 };
+	char buf[4096];
+	off_t sbytes;
+	ssize_t n, total;
+	pid_t pid;
+	int error, fd, sv[2];
+
+	atf_utils_create_file(SOURCE_FILE, "%s", SMALL_FILE);
+	fd = open(SOURCE_FILE, O_RDONLY);
+	ATF_REQUIRE_MSG(fd != -1, "open failed: %s", strerror(errno));
+	ATF_REQUIRE_MSG(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0,
+	    "socketpair failed: %s", strerror(errno));
+	ATF_REQUIRE(signal(SIGPIPE, SIG_IGN) != SIG_ERR);
+
+	/* The peer reads the file and a little of the trailer, then goes away. */
+	pid = atf_utils_fork();
+	if (pid == 0) {
+		(void)close(sv[0]);
+		total = 0;
+		while (total < (ssize_t)(strlen(SMALL_FILE) + sizeof(buf)) &&
+		    (n = read(sv[1], buf, sizeof(buf))) > 0)
+			total += n;
+		_exit(0);
+	}
+	(void)close(sv[1]);
+
+	/*
+	 * The trailer write fails with EPIPE after part of it went out, and
+	 * that part counts in sbytes.
+	 */
+	sbytes = -1;
+	error = sendfile(fd, sv[0], 0, 0, &hdtr, &sbytes, 0);
+	ATF_CHECK_EQ(error, -1);
+	ATF_CHECK_EQ(errno, EPIPE);
+	ATF_CHECK_MSG(sbytes > (off_t)strlen(SMALL_FILE),
+	    "sbytes %jd leaves out the partial trailer", (intmax_t)sbytes);
+	(void)close(sv[0]);
+	(void)close(fd);
+	atf_utils_wait(pid, 0, "", "");
+}
+
 ATF_TP_ADD_TCS(tp)
 {
 
@@ -1255,6 +1302,7 @@ ATF_TP_ADD_TCS(tp)
 	ATF_TP_ADD_TC(tp, s_negative_udp_socket_v4);
 	ATF_TP_ADD_TC(tp, s_negative_udp_socket_v6);
 	ATF_TP_ADD_TC(tp, nbytes_past_off_max);
+	ATF_TP_ADD_TC(tp, sbytes_partial_trailer);
 
 	return (atf_no_error());
 }
