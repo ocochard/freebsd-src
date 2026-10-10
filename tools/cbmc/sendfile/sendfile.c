@@ -42,25 +42,32 @@
  *			against the manual page
  *   proof_send		vn_sendfile() on a cached regular file and a
  *			blocking stream socket, against the manual page
- *   proof_nodiskio	the same with SF_NODISKIO, pages partly or not
- *			cached, and grabs that can stop short: only bytes
- *			read from the file are sent
+ *   proof_read		the same with pages partly valid or not at all,
+ *			which the pager reads
+ *   proof_nodiskio	the same with SF_NODISKIO, pages partly valid but
+ *			none needing a read, and grabs that can stop
+ *			short: only bytes read from the file are sent
  *
- * proof_send and proof_nodiskio watch the socket through the protocol's
- * pr_send() and the trailer's kern_filewrite(), which record the byte
- * stream: header bytes, then file bytes in file order from the offset,
- * then trailer bytes.  A file byte is identified by its page and its
- * offset in it, so a byte that is sent twice, skipped, or sent from a
- * page that was never read is caught where it is queued.
+ * The vn_sendfile() proofs watch the socket through the protocol's
+ * pr_send() and through kern_filewrite(), which record the byte stream:
+ * header bytes, then file bytes in file order from the offset, then
+ * trailer bytes.  A file byte is identified by its page and its offset in
+ * it, so a byte that is sent twice, skipped, or sent from a page that was
+ * never read is caught where it is queued, and so is a chain longer than
+ * the room the socket reported.
  *
  * The bounds are lengths: a file of at most MAXFILE bytes, a header and a
- * trailer of at most MAXHDR, and a socket that accepts at least MINSPACE
- * bytes per wait.  The offset and nbytes are left free over their whole
- * types, which is where arithmetic goes wrong.
+ * trailer of at most MAXHDR, a socket that reports between MINSPACE and
+ * MAXSPACE bytes of room per wait, and MAXWAITS iterations of the send
+ * loop, which run.sh picks so that they are enough.  The offset is free up
+ * to past the end of the file and nbytes over all of size_t, which is
+ * where the arithmetic goes wrong.
  */
 
 #include SOURCE
 
+static void *sfio_malloc(size_t, struct malloc_type *, int);
+#define	CBMC_MALLOC_HOOK	sfio_malloc
 #include "kern.h"
 
 #ifndef MAXFILE
@@ -74,6 +81,10 @@
 #endif
 #ifndef MAXSPACE
 #define	MAXSPACE	(2 * PAGE_SIZE)
+#endif
+
+#ifndef MAXWAITS
+#define	MAXWAITS	1	/* send loop iterations */
 #endif
 
 #define	NPAGES		(howmany(MAXFILE, PAGE_SIZE) + 1)
@@ -95,12 +106,14 @@ static char		g_data[NPAGES * PAGE_SIZE];	/* the pages' bytes */
 vm_page_t bogus_page = &g_bogus;
 static bool		g_nowait_fails;	/* SF_NODISKIO may grab short */
 static bool		g_noloop;	/* the send loop is not entered */
+static bool		g_cached;	/* every page is cached and valid */
+static bool		g_noio;		/* no page needs reading */
 
 /* The socket. */
 static struct protosw	g_proto;
 static struct socket	g_so;
 static struct file	g_sock_fp;
-static struct thread	g_td;
+#define	g_td		cbmc_thread
 
 /* The byte stream the socket received, see above. */
 static size_t		g_hdr_seen;
@@ -108,10 +121,11 @@ static off_t		g_file_next;
 static off_t		g_file_seen;
 static size_t		g_trl_seen;
 static int		g_phase;	/* 0 header, 1 file, 2 trailer */
+static int		g_room;		/* room the last wait reported */
+static int		g_waits;	/* send loop iterations so far */
 static struct uio	*g_hdr_uio;
 static bool		g_short;	/* a write stopped short, returning 0 */
 
-#define	M_CBMC_HDR	M_PROTO1	/* marks a header mbuf */
 
 static vm_page_bits_t
 page_bits(int base, int size)
@@ -120,6 +134,32 @@ page_bits(int base, int size)
 		return (0);
 	return (((vm_page_bits_t)2 << ((base + size - 1) >> DEV_BSHIFT)) -
 	    ((vm_page_bits_t)1 << (base >> DEV_BSHIFT)));
+}
+
+/*
+ * An sf_io, typed: allocated as sizeof(struct sf_io) plus room for the
+ * page pointers, which cbmc reads as the structure with its flexible
+ * array sized.  A generic block would hold its fields as untyped words,
+ * and cbmc could then tell neither sfio->so nor pa[i] from any pointer,
+ * which sent an indirect call through sfio->so to every function of a
+ * matching type.  The pointers start as INVARIANTS junk, see malloc().
+ */
+#define	SFIO_PAGES	(NPAGES + 1)
+
+static void *
+sfio_malloc(size_t size, struct malloc_type *type, int flags)
+{
+	struct sf_io *sfio;
+
+	if (type != M_SENDFILE)
+		return (NULL);
+	__CPROVER_assert(size <= sizeof(struct sf_io) +
+	    SFIO_PAGES * sizeof(vm_page_t), "model: sf_io fits");
+	sfio = __CPROVER_allocate(sizeof(struct sf_io) +
+	    SFIO_PAGES * sizeof(vm_page_t), 0);
+	for (int i = 0; i < SFIO_PAGES; i++)
+		sfio->pa[i] = (vm_page_t)0xdeadc0dedeadc0deUL;
+	return (sfio);
 }
 
 /* VM model. */
@@ -138,8 +178,11 @@ vm_page_grab_pages_unlocked(vm_object_t object, vm_pindex_t pindex,
 		grabbed = nondet_int();
 		__CPROVER_assume(grabbed >= 0 && grabbed <= count);
 	}
-	for (int i = 0; i < grabbed; i++)
+	for (int i = 0; i < grabbed; i++) {
 		ma[i] = g_pages[pindex + i];
+		if ((allocflags & VM_ALLOC_WIRED) != 0)
+			ma[i]->ref_count++;
+	}
 	return (grabbed);
 }
 
@@ -150,6 +193,13 @@ vm_page_is_valid(vm_page_t m, int base, int size)
 
 	__CPROVER_assert(base >= 0 && size >= 0 && base + size <= PAGE_SIZE,
 	    "vm_page_is_valid() range inside the page");
+	/*
+	 * Said outright rather than read from the page: cbmc cannot see
+	 * through the pointer that every page holds the same bits, and the
+	 * paging path it then explored was most of the formula.
+	 */
+	if (g_cached)
+		return (1);
 	bits = page_bits(base, size);
 	return (m->valid != 0 && (m->valid & bits) == bits);
 }
@@ -163,8 +213,18 @@ vm_page_valid(vm_page_t m)
 void pmap_zero_page(vm_page_t m) { }
 void vm_page_xunbusy_hard(vm_page_t m) { }
 void vm_page_xunbusy_hard_unchecked(vm_page_t m) { }
-void vm_page_unwire(vm_page_t m, uint8_t nqueue) { }
-void vm_page_release(vm_page_t m, int flags) { }
+void
+vm_page_unwire(vm_page_t m, uint8_t nqueue)
+{
+	__CPROVER_assert(m->ref_count > 0, "unwires a wired page");
+	m->ref_count--;
+}
+
+void
+vm_page_release(vm_page_t m, int flags)
+{
+	vm_page_unwire(m, PQ_INACTIVE);
+}
 void vm_object_pip_add(vm_object_t object, short i) { }
 void vm_object_pip_wakeup(vm_object_t object) { }
 void vm_object_reference_locked(vm_object_t object) { }
@@ -187,6 +247,8 @@ cbmc_vm_pager_has_page(vm_object_t object, vm_pindex_t pindex, int *before,
     int *after)
 {
 	__CPROVER_assert(object == &g_obj, "asks the file's pager");
+	/* proof_nodiskio: only the calls where no page needs reading. */
+	__CPROVER_assume(!g_noio);
 	if (after != NULL) {
 		*after = nondet_int();
 		__CPROVER_assume(*after >= 0 && *after < NPAGES);
@@ -245,8 +307,20 @@ sendfile_wait(struct socket *so, off_t need, int *space)
 	__CPROVER_assert(need > 0, "waits only for bytes to send");
 	/* proof_noloop: only the calls that queue no file page. */
 	__CPROVER_assume(!g_noloop);
+	/*
+	 * The bounds give the socket room for the whole transfer in
+	 * MAXWAITS iterations.  One more is a property: were it reachable,
+	 * the loop would be spinning.  Then it is cut here, at the top of
+	 * the loop, because cbmc cannot rule it out on its own and unrolled
+	 * it whole, which cost more than the iterations proven.
+	 */
+	__CPROVER_assert(g_waits < MAXWAITS,
+	    "no more send loop iterations than the room needs");
+	__CPROVER_assume(g_waits < MAXWAITS);
+	g_waits++;
 	*space = nondet_int();
 	__CPROVER_assume(*space >= MINSPACE && *space <= MAXSPACE);
+	g_room = *space;
 	return (0);
 }
 
@@ -290,7 +364,6 @@ m_uiotombuf(struct uio *uio, int how, int len, int lspace, int flags)
 	if (len > 0 && len < n)
 		n = len;
 	m = m_get(how, MT_DATA);
-	m->m_flags |= M_CBMC_HDR;
 	m->m_len = n;
 	uio->uio_resid -= n;
 	return (m);
@@ -304,8 +377,15 @@ pr_send(struct socket *so, int flags, struct mbuf *m0, struct sockaddr *a,
 	vm_page_t pg;
 	size_t inpage;
 
+	__CPROVER_assert(m_length(m0, NULL) <= (u_int)g_room,
+	    "queues no more than the socket has room for");
 	for (m = m0; m != NULL; m = m->m_next) {
-		if ((m->m_flags & M_CBMC_HDR) != 0) {
+		/*
+		 * Header mbufs are the ones m_uiotombuf() makes, with no
+		 * external storage; every page mbuf has some.  No flag marks
+		 * them: M_PROTO1 was tried, and it is M_NOTREADY.
+		 */
+		if ((m->m_flags & M_EXT) == 0) {
 			__CPROVER_assert(g_phase == 0,
 			    "header bytes come before file bytes");
 			g_hdr_seen += m->m_len;
@@ -338,6 +418,13 @@ static int
 pr_ready(struct socket *so, struct mbuf *m, int count)
 {
 	return (0);
+}
+
+/* Reached on an I/O error, which the pager model does not report. */
+static void
+pr_abort(struct socket *so)
+{
+	__CPROVER_assert(0, "model: pr_abort() on a read that cannot fail");
 }
 
 int
@@ -396,6 +483,7 @@ setup(struct uio *hdr, struct uio *trl, bool *has_hdr, bool *has_trl,
 {
 	off_t size;
 
+	g_cached = cached;
 	size = nondet_off_t();
 	__CPROVER_assume(size >= 0 && size <= MAXFILE);
 	for (int i = 0; i < NPAGES; i++) {
@@ -420,6 +508,7 @@ setup(struct uio *hdr, struct uio *trl, bool *has_hdr, bool *has_trl,
 	g_proto.pr_protocol = IPPROTO_TCP;
 	g_proto.pr_send = pr_send;
 	g_proto.pr_ready = pr_ready;
+	g_proto.pr_abort = pr_abort;
 	g_proto.pr_sendfile_wait = sendfile_wait;
 	g_so.so_type = SOCK_STREAM;
 	g_so.so_proto = &g_proto;
@@ -521,6 +610,34 @@ proof_noloop(void)
 	send(0);
 }
 
+/*
+ * The paging path: pages partly valid or not at all, read by the pager,
+ * whose I/O completes at once.  The whole contract of proof_send holds.
+ */
+void
+proof_read(void)
+{
+	struct uio hdr, trl;
+	bool has_hdr, has_trl;
+	off_t offset, sent, size;
+	size_t nbytes;
+	ssize_t hlen, tlen;
+	int error;
+
+	g_nowait_fails = false;
+	size = setup(&hdr, &trl, &has_hdr, &has_trl, false);
+	hlen = has_hdr ? hdr.uio_resid : 0;
+	tlen = has_trl ? trl.uio_resid : 0;
+	offset = nondet_off_t();
+	__CPROVER_assume(offset >= 0 && offset <= MAXFILE + 1);
+	nbytes = nondet_size_t();
+	g_file_next = offset;
+
+	error = vn_sendfile(&g_fp, 0, has_hdr ? &hdr : NULL,
+	    has_trl ? &trl : NULL, offset, nbytes, &sent, 0, &g_td);
+	check_stream(error, sent, offset, nbytes, size, hlen, tlen);
+}
+
 void
 proof_send(void)
 {
@@ -539,9 +656,12 @@ proof_nodiskio(void)
 
 	/*
 	 * Only the bytes queued are checked: SF_NODISKIO stops at the
-	 * first page it cannot grab, with EBUSY.
+	 * first page it cannot grab, with EBUSY.  The pages may be partly
+	 * valid, but none so little that it needs reading: the pager is
+	 * not asked, which keeps the paging path out of the formula.
 	 */
 	g_nowait_fails = true;
+	g_noio = true;
 	(void)setup(&hdr, &trl, &has_hdr, &has_trl, false);
 	offset = nondet_off_t();
 	__CPROVER_assume(offset >= 0 && offset <= MAXFILE + 1);

@@ -32,8 +32,19 @@ set -eu
 
 top=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 here="$top/tools/cbmc"
-JOBS=${JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 1)}
-CBMC_MEM=${CBMC_MEM:-8192}
+# Each job runs under a CBMC_MEM megabyte limit, so that a proof that
+# blows up fails as one proof rather than taking the host with it; the
+# send loop proofs need most of it.  By default JOBS is the core count,
+# bounded so that every job at its limit still fits in half the memory.
+CBMC_MEM=${CBMC_MEM:-40960}
+if [ -z "${JOBS:-}" ]; then
+	JOBS=$(sysctl -n hw.ncpu 2>/dev/null || echo 1)
+	mem=$(($(sysctl -n hw.physmem 2>/dev/null || echo 0) / 1048576))
+	if [ $((mem / 2 / CBMC_MEM)) -lt "$JOBS" ]; then
+		JOBS=$((mem / 2 / CBMC_MEM))
+	fi
+	[ "$JOBS" -ge 1 ] || JOBS=1
+fi
 
 for t in cbmc goto-cc goto-instrument; do
 	if ! command -v $t >/dev/null 2>&1; then
@@ -47,9 +58,22 @@ done
 replace="vm_pager_has_page:cbmc_vm_pager_has_page
 	sf_buf_kva:cbmc_sf_buf_kva
 	counter_u64_add:cbmc_counter_u64_add
+	__curthread:cbmc_curthread
 	refcount_acquire:cbmc_refcount_acquire
 	refcount_release:cbmc_refcount_release
 	refcount_release_if_not_last:cbmc_refcount_release_if_not_last"
+
+# The targets of each indirect call, which goto-instrument would otherwise
+# resolve to every function of a compatible type: pr_abort() through an
+# sf_io went to malloc_init() and sendfile_free_mext(), and that alone
+# made a one page proof time out where it now takes seconds.
+restrict="vn_sendfile.function_pointer_call.1/sendfile_wait
+	vn_sendfile.function_pointer_call.2/pr_send
+	vn_sendfile.function_pointer_call.3/pr_send
+	sendfile_iodone.function_pointer_call.1/pr_abort
+	sendfile_iodone.function_pointer_call.2/pr_ready
+	vm_pager_get_pages_async.function_pointer_call.1/sendfile_iodone
+	fo_sendfile.function_pointer_call.1/vn_sendfile"
 
 # A worker, which is this script run by xargs below: build and check job N
 # of the queue in WORK, leaving cbmc's status beside its log -- 0 proved,
@@ -68,6 +92,9 @@ if [ "${1:-}" = "--job" ]; then
 	rflags=
 	for r in $replace; do
 		rflags="$rflags --replace-calls $r"
+	done
+	for r in $restrict; do
+		rflags="$rflags --restrict-function-pointer $r"
 	done
 	# shellcheck disable=SC2086
 	{
@@ -199,6 +226,65 @@ if want sendfile; then
 	    's/if (i == n - 1 \&\& ((off + len) \& PAGE_MASK) > 0)/if (i == n - 1)/'
 	mutant sendfile_fixspace_first "$h" "$s" proof_fixspace "" "$ua" \
 	    's/\*space -= xfsize(0, old, off, \*space);/*space -= PAGE_SIZE;/'
+fi
+
+#
+# sendfile(2), the send loop.  Every loop a proof runs is bounded below,
+# in iterations plus one, for runs of up to three pages.
+#
+ul="vn_sendfile.11:4,sendfile_swapin.12:4,sendfile_swapin.0:4"
+ul="$ul,sendfile_swapin.5:4,sendfile_swapin.8:4,setup.0:5,sfio_malloc.0:6"
+ul="$ul,vm_page_grab_pages_unlocked.0:4,vm_pager_get_pages_async.0:4"
+ul="$ul,pr_send.0:6,m_freem.0:6,m_length.0:6,fixspace.0:4,fixspace.1:4"
+for l in 0 1 2 3 4 5 6 7 9; do
+	ul="$ul,sendfile_iodone.$l:4"
+done
+# One iteration over a cached file of three pages and a byte, so a run
+# has a first, a middle and a last page: the socket has room for the
+# header and all of it, and a byte more, or the loop trims the run to a
+# page boundary and goes round again.
+dsend="-DMAXFILE=(2*PAGE_SIZE+1) -DMAXHDR=4 -DMINSPACE=(2*PAGE_SIZE+6)"
+dsend="$dsend -DMAXSPACE=(3*PAGE_SIZE)"
+# Two iterations: room for at least half of a two page file each time,
+# and never more than a page, so the run is never trimmed.
+dtwo="-DMAXFILE=(PAGE_SIZE+1) -DMAXHDR=4 -DMINSPACE=(PAGE_SIZE/2+5)"
+dtwo="$dtwo -DMAXSPACE=PAGE_SIZE -DMAXWAITS=2"
+# The pager reading pages of a two page file, partly valid or not.
+dread="-DMAXFILE=(PAGE_SIZE+1) -DMAXHDR=4 -DMINSPACE=(PAGE_SIZE+6)"
+dread="$dread -DMAXSPACE=(2*PAGE_SIZE)"
+# SF_NODISKIO stopping short in a three page run, with no header.
+dndio="-DMAXFILE=(2*PAGE_SIZE+1) -DMAXHDR=0 -DMINSPACE=(2*PAGE_SIZE+2)"
+dndio="$dndio -DMAXSPACE=(3*PAGE_SIZE)"
+
+if want sendfile; then
+	proof sendfile_send "$h" "$s" proof_send "$dsend" "vn_sendfile.14:2,$ul"
+	proof sendfile_twice "$h" "$s" proof_send "$dtwo" "vn_sendfile.14:3,$ul"
+	proof sendfile_read "$h" "$s" proof_read "$dread" "vn_sendfile.14:2,$ul"
+	proof sendfile_nodiskio "$h" "$s" proof_nodiskio "$dndio" \
+	    "vn_sendfile.14:2,$ul"
+
+	# Each mbuf maps its bytes at their offset in the page.
+	mutant sendfile_send_mdata "$h" "$s" proof_send "$dsend" \
+	    "vn_sendfile.14:2,$ul" \
+	    '/m0->m_data = (char \*)sf_buf_kva(sf) +/{n;s/(vmoff(i, off) \& PAGE_MASK)/0/;}'
+	# A run starting inside a page spans one more page.
+	mutant sendfile_send_npages "$h" "$s" proof_send "$dsend" \
+	    "vn_sendfile.14:2,$ul" \
+	    's/npages = howmany(space + (off \& PAGE_MASK), PAGE_SIZE);/npages = howmany(space, PAGE_SIZE);/'
+	# No more than what is left is sent.
+	mutant sendfile_send_clamp "$h" "$s" proof_send "$dsend" \
+	    "vn_sendfile.14:2,$ul" 's/if (space > rem)$/if (0)/'
+	# The header takes its room out of the socket's.
+	mutant sendfile_twice_hdrspace "$h" "$s" proof_send "$dtwo" \
+	    "vn_sendfile.14:3,$ul" 's/space -= hdrlen;/;/'
+	# An invalid page is read before it is sent.
+	mutant sendfile_read_valid "$h" "$s" proof_read "$dread" \
+	    "vn_sendfile.14:2,$ul" \
+	    's/if (vm_page_is_valid(pa\[i\], vmoff(i, off) \& PAGE_MASK,$/if (1 || vm_page_is_valid(pa[i], vmoff(i, off) \& PAGE_MASK,/'
+	# The fix of 2026 to sendfile_swapin(), taken back.
+	mutant sendfile_nodiskio_short "$h" "$s" proof_nodiskio "$dndio" \
+	    "vn_sendfile.14:2,$ul" \
+	    's/xfsize(i, sfio->npages, off, len)/xfsize(i, npages, off, len)/'
 fi
 
 [ "$njobs" -gt 0 ] || { echo "run.sh: nothing selected" >&2; exit 2; }

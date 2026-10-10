@@ -71,21 +71,66 @@ printf(const char *fmt, ...)
 	return (0);
 }
 
+/*
+ * The one thread the proofs run in.  __curthread() reads %gs; run.sh
+ * replaces calls to it with cbmc_curthread().
+ */
+struct thread cbmc_thread;
+
+struct thread *
+cbmc_curthread(void)
+{
+	return (&cbmc_thread);
+}
+
 /* Memory. */
+
+/*
+ * malloc(9) hands out a block of a fixed size, CBMC_MALLOC_BUCKET bytes of
+ * pointer-sized words, whatever the size asked for, as malloc(9) rounds a
+ * request up to its bucket.  A block whose size depends on the input would
+ * be an opaque array to cbmc, and every read from it unknown: with sfio,
+ * sized by the page count, that left every branch on its pages open and
+ * the formula out of reach.  Words rather than bytes, because cbmc reads
+ * an untyped object byte by byte.  An overrun inside the bucket goes
+ * unseen, as it does on a kernel without KASAN.
+ */
+#ifndef CBMC_MALLOC_BUCKET
+#define	CBMC_MALLOC_BUCKET	256
+#endif
+/*
+ * The word type: cbmc keeps reads and writes of a word as values only when
+ * they are of its type, so a harness sets it to the type of the array the
+ * code under proof allocates (vm_page_t for sendfile's sf_io).
+ */
+#ifndef CBMC_MALLOC_WORD
+#define	CBMC_MALLOC_WORD	void *
+#endif
 
 void *
 (malloc)(size_t size, struct malloc_type *type, int flags)
 {
-	void *p;
+	CBMC_MALLOC_WORD (*p)[CBMC_MALLOC_BUCKET / sizeof(CBMC_MALLOC_WORD)];
 
+#ifdef CBMC_MALLOC_HOOK
+	/* A harness allocating a type of its own, typed, see sendfile.c. */
+	void *q;
+
+	if ((q = CBMC_MALLOC_HOOK(size, type, flags)) != NULL)
+		return (q);
+#endif
+	__CPROVER_assert(size <= CBMC_MALLOC_BUCKET,
+	    "model: allocation fits the modelled bucket");
+	p = __CPROVER_allocate(sizeof(*p), (flags & M_ZERO) != 0);
 	/*
-	 * An object of pointer-sized words rather than of bytes: cbmc reads
-	 * an untyped object byte by byte, and kernel structures are mostly
-	 * pointers.  The size rounds up to a word, as malloc(9) rounds it up
-	 * to a bucket, so an overrun inside the last word goes unseen.
+	 * Without M_ZERO, the junk INVARIANTS fills a new item with
+	 * (trash_ctor()): a word read before it is written is no page and
+	 * no NULL, which lets cbmc settle those comparisons itself, and a
+	 * pointer read from it is caught as invalid.
 	 */
-	p = __CPROVER_allocate(howmany(size, sizeof(void *)) *
-	    sizeof(void *), (flags & M_ZERO) != 0);
+	if ((flags & M_ZERO) == 0)
+		__CPROVER_array_set(*p,
+		    (CBMC_MALLOC_WORD)0xdeadc0dedeadc0deUL);
 	if ((flags & M_WAITOK) == 0 && nondet_bool())
 		return (NULL);
 	return (p);
