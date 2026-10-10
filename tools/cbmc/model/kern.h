@@ -76,6 +76,7 @@ printf(const char *fmt, ...)
  * replaces calls to it with cbmc_curthread().
  */
 struct thread cbmc_thread;
+struct proc cbmc_proc;
 
 struct thread *
 cbmc_curthread(void)

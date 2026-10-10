@@ -626,6 +626,11 @@ setup(struct uio *hdr, struct uio *trl, bool *has_hdr, bool *has_trl,
 	g_sock_fp.f_type = DTYPE_SOCKET;
 	g_sock_fp.f_data = &g_so;
 
+	/* A signal may be pending on the thread, unmasked or not. */
+	g_td.td_proc = &cbmc_proc;
+	g_td.td_siglist.__bits[0] = nondet_u_int();
+	g_td.td_sigmask.__bits[0] = nondet_u_int();
+
 	*has_hdr = nondet_bool();
 	*has_trl = nondet_bool();
 	g_hdr_uio = *has_hdr ? hdr : NULL;
@@ -646,18 +651,13 @@ check_stream(int error, off_t sent, off_t offset, size_t nbytes, off_t size,
 
 	__CPROVER_assert(sent == (off_t)(g_hdr_seen + g_file_seen +
 	    g_trl_seen), "sbytes is what the socket received");
-#ifdef SPEC_SHORT_WRITE
 	/*
 	 * sendfile.2: on a non-blocking socket "sendfile() may send fewer
 	 * bytes than requested.  In this case ... the error EAGAIN is
-	 * returned", and EINTR on a signal.  A header or trailer write cut
-	 * short returns 0 instead, sousrsend() clearing the error; whether
-	 * the manual or the code is right is an open question, so this is
-	 * only checked on request.
+	 * returned", and EINTR when a signal interrupted it.
 	 */
-	__CPROVER_assert(!g_short || error != 0,
-	    "a short write makes sendfile(2) fail");
-#endif
+	__CPROVER_assert(!g_short || error == EINTR || error == EAGAIN,
+	    "a short write makes sendfile(2) fail with EINTR or EAGAIN");
 	if (error != 0 || g_short)
 		return;
 	__CPROVER_assert(g_pending == NULL, "every chain queued is readied");
