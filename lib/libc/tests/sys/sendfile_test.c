@@ -1347,6 +1347,52 @@ ATF_TC_BODY(trailer_after_truncation, tc)
 	(void)close(fd);
 }
 
+ATF_TC_WITHOUT_HEAD(hdtr_short_nonblocking);
+ATF_TC_BODY(hdtr_short_nonblocking, tc)
+{
+	static char big[1024 * 1024];
+	struct iovec iov = { .iov_base = big, .iov_len = sizeof(big) };
+	struct sf_hdtr trl_only = { NULL, 0, &iov, 1 };
+	struct sf_hdtr hdr_only = { &iov, 1, NULL, 0 };
+	off_t sbytes;
+	int empty, error, fd, sv[2];
+
+	atf_utils_create_file(SOURCE_FILE, "%s", SMALL_FILE);
+	fd = open(SOURCE_FILE, O_RDONLY);
+	ATF_REQUIRE_MSG(fd != -1, "open failed: %s", strerror(errno));
+	atf_utils_create_file("empty", "%s", "");
+	empty = open("empty", O_RDONLY);
+	ATF_REQUIRE_MSG(empty != -1, "open failed: %s", strerror(errno));
+
+	/*
+	 * Nobody reads: a trailer, or a header with no file data, larger
+	 * than the socket buffer goes out in part, and sendfile fails with
+	 * EAGAIN, counting the part in sbytes.
+	 */
+	ATF_REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+	ATF_REQUIRE(fcntl(sv[0], F_SETFL, O_NONBLOCK) == 0);
+	sbytes = -1;
+	error = sendfile(fd, sv[0], 0, 0, &trl_only, &sbytes, 0);
+	ATF_CHECK_EQ(error, -1);
+	ATF_CHECK_EQ(errno, EAGAIN);
+	ATF_CHECK(sbytes > (off_t)strlen(SMALL_FILE) &&
+	    sbytes < (off_t)(strlen(SMALL_FILE) + sizeof(big)));
+	(void)close(sv[0]);
+	(void)close(sv[1]);
+
+	ATF_REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+	ATF_REQUIRE(fcntl(sv[0], F_SETFL, O_NONBLOCK) == 0);
+	sbytes = -1;
+	error = sendfile(empty, sv[0], 0, 0, &hdr_only, &sbytes, 0);
+	ATF_CHECK_EQ(error, -1);
+	ATF_CHECK_EQ(errno, EAGAIN);
+	ATF_CHECK(sbytes > 0 && sbytes < (off_t)sizeof(big));
+	(void)close(sv[0]);
+	(void)close(sv[1]);
+	(void)close(empty);
+	(void)close(fd);
+}
+
 ATF_TP_ADD_TCS(tp)
 {
 
@@ -1388,6 +1434,7 @@ ATF_TP_ADD_TCS(tp)
 	ATF_TP_ADD_TC(tp, sbytes_partial_trailer);
 	ATF_TP_ADD_TC(tp, hdtr_without_file_data);
 	ATF_TP_ADD_TC(tp, trailer_after_truncation);
+	ATF_TP_ADD_TC(tp, hdtr_short_nonblocking);
 
 	return (atf_no_error());
 }
