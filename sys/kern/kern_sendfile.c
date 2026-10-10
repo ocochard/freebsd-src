@@ -405,10 +405,18 @@ sendfile_swapin(vm_object_t obj, struct sf_io *sfio, int *nios, off_t off,
 		rhpages = 0;
 	}
 
+	/*
+	 * The validity checks below use the page count of the whole run,
+	 * sfio->npages, and not the number of pages grabbed: vn_sendfile()
+	 * sends the last page grabbed whole when the grab stopped short, so
+	 * that page must be valid over all of it, not only over the bytes
+	 * the run would have used in it had it ended there.
+	 */
+
 	for (i = 0; i < npages;) {
 		/* Skip valid pages. */
 		if (vm_page_is_valid(pa[i], vmoff(i, off) & PAGE_MASK,
-		    xfsize(i, npages, off, len))) {
+		    xfsize(i, sfio->npages, off, len))) {
 			vm_page_xunbusy(pa[i]);
 			SFSTAT_INC(sf_pages_valid);
 			i++;
@@ -463,7 +471,7 @@ sendfile_swapin(vm_object_t obj, struct sf_io *sfio, int *nios, off_t off,
 		count1 = count;
 		for (j = i + count - 1; j > i; j--) {
 			if (vm_page_is_valid(pa[j], vmoff(j, off) & PAGE_MASK,
-			    xfsize(j, npages, off, len))) {
+			    xfsize(j, sfio->npages, off, len))) {
 				vm_page_xunbusy(pa[j]);
 				SFSTAT_INC(sf_pages_valid);
 				count--;
@@ -481,7 +489,7 @@ sendfile_swapin(vm_object_t obj, struct sf_io *sfio, int *nios, off_t off,
 		MPASS(pa[i + count - 1]->valid != VM_PAGE_BITS_ALL);
 		for (j = i + 1; j < i + count - 1; j++) {
 			if (vm_page_is_valid(pa[j], vmoff(j, off) & PAGE_MASK,
-			    xfsize(j, npages, off, len))) {
+			    xfsize(j, sfio->npages, off, len))) {
 				vm_page_xunbusy(pa[j]);
 				SFSTAT_INC(sf_pages_valid);
 				SFSTAT_INC(sf_pages_bogus);
