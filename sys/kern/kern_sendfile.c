@@ -873,7 +873,20 @@ vn_sendfile(struct file *fp, int sockfd, struct uio *hdr_uio,
 			}
 			if (off >= nobj_size) {
 				VOP_UNLOCK(vp);
-				goto done;
+				/*
+				 * The file shrank below the offset.  As when the
+				 * offset starts past the end of the file, send
+				 * what is left of the header and the trailers:
+				 * a header copied above goes out alone, as when
+				 * it fills the socket buffer, and the loop ends.
+				 */
+				if (mh == NULL)
+					break;
+				rem = 0;
+				space = 0;
+				sfio = NULL;
+				nios = 0;
+				goto prepend_header;
 			}
 			if (nobj_size != obj_size) {
 				obj_size = nobj_size;
