@@ -340,6 +340,22 @@ The
 .Fa offset
 argument
 is negative.
+.It Bq Er EINVAL
+The
+.Fa hdr_cnt
+or
+.Fa trl_cnt
+member of
+.Fa hdtr
+is greater than
+.Dv IOV_MAX ,
+or the lengths of the iovecs it describes add up to more than
+.Dv SSIZE_MAX
+(or more than
+.Dv INT_MAX ,
+if the sysctl
+.Va debug.iosize_max_clamp
+is non-zero).
 .It Bq Er EIO
 An error occurred while reading from
 .Fa fd .
@@ -372,6 +388,16 @@ does not support
 .It Bq Er EPIPE
 The socket peer has closed the connection.
 .El
+.Pp
+In addition,
+.Fn sendfile
+fails with an error pending on the socket
+.Fa s ,
+such as
+.Er ECONNRESET
+or
+.Er ETIMEDOUT ,
+which it clears.
 .Sh SEE ALSO
 .Xr netstat 1 ,
 .Xr open 2 ,
