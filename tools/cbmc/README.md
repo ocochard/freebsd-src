@@ -8,7 +8,7 @@ against the kernel's own source for every input within the bounds,
 not a sample of inputs as a test or a fuzzer would.
 
     pkg install cbmc
-    tools/cbmc/run.sh            # every proof, about 20 minutes
+    tools/cbmc/run.sh            # every proof, about 30 minutes
     SLOW=1 tools/cbmc/run.sh     # and the ones over half an hour
     tools/cbmc/run.sh sendfile   # one system call
 
@@ -91,6 +91,9 @@ Proven:
 - all of the above again with unmapped mbufs (`mb_use_ext_pgs`, the
   default for TCP on amd64), plus a six-page run that fills one unmapped
   mbuf (`MBUF_PEXT_MAX_PGS` is 5) and starts another;
+- the file truncated or extended by another thread during the call,
+  modelled as a new size, up to the bounds, each time `vn_sendfile()`
+  takes the object lock to read it, over one and two iterations;
 - with the paging path, what `sbready()` expects of `pr_ready()`: the
   pages queued `M_NOTREADY`, counted one per mapped mbuf and
   `m_epg_nrdy` per unmapped one, are exactly those readied.  For mapped
@@ -139,11 +142,23 @@ Found by the loop proofs, fixed on this branch, not yet reported:
   is an 8193-byte file whose third page is busy and whose second page
   has its first `DEV_BSIZE` chunk valid but not its fourth.
 
+Found by the resize proofs, fixed on this branch, waiting for the
+developer to say whether this is the intended behaviour, since the
+manual says nothing of a file that changes size during the call:
+
+- `sendfile: Send the header and trailers when the file shrinks`: when
+  the file shrinks below the offset during the call, `vn_sendfile()`
+  takes `goto done`.  That drops a header copied in the same iteration
+  and skips the trailers, and the call returns 0.  When the offset is
+  past the end of the file from the start, the header and trailers are
+  sent.  Reproduced on 16.0-CURRENT: a 1 MiB file truncated while a
+  blocking `sendfile()` waits for room returns 0 without its trailer.
+  The regression test is `trailer_after_truncation`.
+
 Not proven yet:
 
 - KTLS (`KERN_TLS` is off in the build), and `SF_NOCACHE`, whose
   effect, the pages' release policy, the model does not observe.
-- An I/O error from the pager, and a file that shrinks during the call
-  (suspected: that `goto done` drops a header built in the same
-  iteration and skips the trailer, returning 0).
+- An I/O error from the pager.  Truncation is modelled through the size
+  alone: the pages past the new end stay, as sendfile has them wired.
 - Shared memory objects (`DTYPE_SHM`) and `vn_getsize_locked()` objects.

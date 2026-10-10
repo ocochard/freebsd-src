@@ -47,6 +47,8 @@
  *   proof_send_extpg	proof_send, proof_read and proof_nodiskio with
  *   proof_read_extpg	unmapped mbufs (mb_use_ext_pgs), what TCP uses
  *   proof_nodiskio_extpg on amd64
+ *   proof_resize	proof_send with the file truncated or extended
+ *			during the call
  *   proof_nodiskio	the same with SF_NODISKIO, pages partly valid but
  *			none needing a read, and grabs that can stop
  *			short: only bytes read from the file are sent
@@ -71,6 +73,8 @@
 
 static void *sfio_malloc(size_t, struct malloc_type *, int);
 #define	CBMC_MALLOC_HOOK	sfio_malloc
+static void resize(volatile uintptr_t *);
+#define	CBMC_RW_RLOCK_HOOK	resize
 #include "kern.h"
 
 #ifndef MAXFILE
@@ -111,6 +115,9 @@ static bool		g_nowait_fails;	/* SF_NODISKIO may grab short */
 static bool		g_noloop;	/* the send loop is not entered */
 static bool		g_cached;	/* every page is cached and valid */
 static bool		g_noio;		/* no page needs reading */
+static bool		g_resize;	/* the file size may change */
+static bool		g_resized;	/* and it did */
+static off_t		g_size_max;	/* the largest size it had */
 
 /* The socket. */
 static struct protosw	g_proto;
@@ -164,6 +171,30 @@ sfio_malloc(size_t size, struct malloc_type *type, int flags)
 	for (int i = 0; i < SFIO_PAGES; i++)
 		sfio->pa[i] = (vm_page_t)0xdeadc0dedeadc0deUL;
 	return (sfio);
+}
+
+/*
+ * proof_resize: another thread truncating or extending the file, which
+ * changes the pager's size, vnp_size, under the object lock.  Each time
+ * vn_sendfile() takes that lock to read the size, the size may have
+ * changed to any length the bounds allow.  The pages stay as they were:
+ * truncation would free the ones past the end, but sendfile has them
+ * wired.
+ */
+static void
+resize(volatile uintptr_t *c)
+{
+	off_t size;
+
+	if (!g_resize || c != &g_obj.lock.rw_lock || nondet_bool())
+		return;
+	size = nondet_off_t();
+	__CPROVER_assume(size >= 0 && size <= MAXFILE);
+	if (size != g_obj.un_pager.vnp.vnp_size)
+		g_resized = true;
+	g_obj.un_pager.vnp.vnp_size = size;
+	if (size > g_size_max)
+		g_size_max = size;
 }
 
 /* VM model. */
@@ -318,7 +349,8 @@ sendfile_wait(struct socket *so, off_t need, int *space)
 	 * the loop, because cbmc cannot rule it out on its own and unrolled
 	 * it whole, which cost more than the iterations proven.
 	 */
-	__CPROVER_assert(g_waits < MAXWAITS,
+	/* A file growing under the loop legitimately takes more. */
+	__CPROVER_assert(g_resize || g_waits < MAXWAITS,
 	    "no more send loop iterations than the room needs");
 	__CPROVER_assume(g_waits < MAXWAITS);
 	g_waits++;
@@ -574,6 +606,7 @@ setup(struct uio *hdr, struct uio *trl, bool *has_hdr, bool *has_trl,
 	g_obj.type = OBJT_VNODE;
 	g_obj.flags = 0;
 	g_obj.un_pager.vnp.vnp_size = size;
+	g_size_max = size;
 	g_vnode.v_type = VREG;
 	g_vnode.v_object = &g_obj;
 	g_vop.vop_unlock = vop_unlock;
@@ -635,13 +668,27 @@ check_stream(int error, off_t sent, off_t offset, size_t nbytes, off_t size,
 	 * file", and "Should offset fall beyond the end of file, the system
 	 * will return success and report 0 bytes sent".
 	 */
-	want = offset >= size ? 0 : size - offset;
-	if (nbytes != 0 && (uintmax_t)nbytes < (uintmax_t)want)
-		want = nbytes;
 	__CPROVER_assert(g_hdr_seen == (size_t)hlen,
 	    "the whole header is sent");
-	__CPROVER_assert(g_file_seen == want,
-	    "the file bytes asked for are sent");
+	if (g_resized) {
+		/*
+		 * With the size changing under it, sendfile.2 says nothing of
+		 * how much of the file goes out; what is sent is file data,
+		 * no more than asked for.  The header and trailer, as past
+		 * the end of the file, go out in full.
+		 */
+		__CPROVER_assert(nbytes == 0 ||
+		    (uintmax_t)g_file_seen <= (uintmax_t)nbytes,
+		    "no more file bytes than asked for");
+		__CPROVER_assert(offset + g_file_seen <= g_size_max ||
+		    g_file_seen == 0, "only bytes the file had are sent");
+	} else {
+		want = offset >= size ? 0 : size - offset;
+		if (nbytes != 0 && (uintmax_t)nbytes < (uintmax_t)want)
+			want = nbytes;
+		__CPROVER_assert(g_file_seen == want,
+		    "the file bytes asked for are sent");
+	}
 	__CPROVER_assert(g_trl_seen == (size_t)tlen,
 	    "the whole trailer is sent");
 }
@@ -737,6 +784,15 @@ proof_nodiskio_extpg(void)
 {
 	mb_use_ext_pgs = true;
 	proof_nodiskio();
+}
+
+/* proof_send with the file truncated or extended during the call. */
+void
+proof_resize(void)
+{
+	g_resize = true;
+	g_nowait_fails = false;
+	send(0);
 }
 
 void

@@ -297,6 +297,19 @@ if want sendfile; then
 	slow mutant sendfile_read_notready "$h" "$s" proof_read "$dread" \
 	    "vn_sendfile.14:2,$ul" \
 	    's/^\([[:space:]]*\)m0->m_flags |= M_NOTREADY;$/\1;/'
+	# The file truncated or extended under the call.
+	proof sendfile_resize "$h" "$s" proof_resize "$dsend" \
+	    "vn_sendfile.14:2,$ul"
+	proof sendfile_resize_twice "$h" "$s" proof_resize "$dtwo" \
+	    "vn_sendfile.14:3,$ul"
+	# Past the new end of file, the trailers still go out ...
+	mutant sendfile_resize_trailer "$h" "$s" proof_resize "$dsend" \
+	    "vn_sendfile.14:2,$ul" \
+	    '/if (mh == NULL)$/{n;s/break;/goto done;/;}'
+	# ... and so does a header copied in the same iteration.
+	mutant sendfile_resize_header "$h" "$s" proof_resize "$dsend" \
+	    "vn_sendfile.14:2,$ul" \
+	    '/^[[:space:]]*rem = 0;$/,/goto prepend_header;/s/goto prepend_header;/goto done;/'
 	# The fix of 2026 to sendfile_swapin(), taken back.
 	mutant sendfile_nodiskio_short "$h" "$s" proof_nodiskio "$dndio" \
 	    "vn_sendfile.14:2,$ul" \

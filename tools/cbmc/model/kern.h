@@ -314,7 +314,18 @@ void __mtx_unlock_flags(volatile uintptr_t *c, int opts, const char *file,
     int line) { }
 void __mtx_assert(const volatile uintptr_t *c, int what, const char *file,
     int line) { }
-void __rw_rlock(volatile uintptr_t *c, const char *file, int line) { }
+/*
+ * A harness modelling another thread that changes what a lock protects
+ * defines CBMC_RW_RLOCK_HOOK, called on each read lock taken: whatever it
+ * changes, it changes while the lock was not held.
+ */
+void
+__rw_rlock(volatile uintptr_t *c, const char *file, int line)
+{
+#ifdef CBMC_RW_RLOCK_HOOK
+	CBMC_RW_RLOCK_HOOK(c);
+#endif
+}
 void _rw_runlock_cookie(volatile uintptr_t *c, const char *file,
     int line) { }
 void __rw_assert(const volatile uintptr_t *c, int what, const char *file,
