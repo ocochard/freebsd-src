@@ -8,7 +8,8 @@ against the kernel's own source for every input within the bounds,
 not a sample of inputs as a test or a fuzzer would.
 
     pkg install cbmc
-    tools/cbmc/run.sh            # every proof, about 2 seconds
+    tools/cbmc/run.sh            # every proof, about 20 minutes
+    SLOW=1 tools/cbmc/run.sh     # and the ones over half an hour
     tools/cbmc/run.sh sendfile   # one system call
 
 ## Method
@@ -86,7 +87,14 @@ Proven:
   with the header split across the socket's room;
 - the paging path: pages partly valid or not at all, read by the pager;
 - `SF_NODISKIO` with page grabs that stop short, on runs of up to three
-  pages: only bytes read from the file are sent.
+  pages: only bytes read from the file are sent;
+- all of the above again with unmapped mbufs (`mb_use_ext_pgs`, the
+  default for TCP on amd64), plus a six-page run that fills one unmapped
+  mbuf (`MBUF_PEXT_MAX_PGS` is 5) and starts another;
+- with the paging path, what `sbready()` expects of `pr_ready()`: the
+  pages queued `M_NOTREADY`, counted one per mapped mbuf and
+  `m_epg_nrdy` per unmapped one, are exactly those readied.  For mapped
+  mbufs this takes 36 minutes and runs only with `SLOW=1`.
 
 Against the manual page, every vn_sendfile() proof checks the
 following.  The socket receives the whole header, then the file bytes
@@ -95,7 +103,7 @@ received.  No chain is longer than the room the socket reported.  Every
 `KASSERT()` holds, and there is no invalid memory access.  `offset` is
 free, `nbytes` ranges over all of `size_t`, and the header and trailer
 take up to 4 or 8 bytes.  The page-content arithmetic (`xfsize()`) is
-proven for any run.  Each loop proof takes 1 to 6 minutes.
+proven for any run.  Each loop proof takes up to 6 minutes.
 
 Found and fixed on this branch.  Each fix adds a regression test to
 `lib/libc/tests/sys/sendfile_test.c`.  In a bhyve guest, the three
@@ -133,8 +141,8 @@ Found by the loop proofs, fixed on this branch, not yet reported:
 
 Not proven yet:
 
-- The unmapped mbuf path (`mb_use_ext_pgs`, the default for TCP on
-  amd64) and KTLS: the model has `mb_use_ext_pgs` off.
+- KTLS (`KERN_TLS` is off in the build), and `SF_NOCACHE`, whose
+  effect, the pages' release policy, the model does not observe.
 - An I/O error from the pager, and a file that shrinks during the call
   (suspected: that `goto done` drops a header built in the same
   iteration and skips the trailer, returning 0).

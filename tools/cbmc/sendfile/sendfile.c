@@ -44,6 +44,9 @@
  *			blocking stream socket, against the manual page
  *   proof_read		the same with pages partly valid or not at all,
  *			which the pager reads
+ *   proof_send_extpg	proof_send, proof_read and proof_nodiskio with
+ *   proof_read_extpg	unmapped mbufs (mb_use_ext_pgs), what TCP uses
+ *   proof_nodiskio_extpg on amd64
  *   proof_nodiskio	the same with SF_NODISKIO, pages partly valid but
  *			none needing a read, and grabs that can stop
  *			short: only bytes read from the file are sent
@@ -124,6 +127,7 @@ static int		g_phase;	/* 0 header, 1 file, 2 trailer */
 static int		g_room;		/* room the last wait reported */
 static int		g_waits;	/* send loop iterations so far */
 static struct uio	*g_hdr_uio;
+static struct mbuf	*g_pending;	/* chain queued not ready */
 static bool		g_short;	/* a write stopped short, returning 0 */
 
 
@@ -369,13 +373,30 @@ m_uiotombuf(struct uio *uio, int how, int len, int lspace, int flags)
 	return (m);
 }
 
+/* A file byte at OFF in page PG, LEN of them: in order, and read. */
+static void
+file_bytes(vm_page_t pg, size_t inpage, int len)
+{
+	__CPROVER_assert(len > 0, "no empty page in an mbuf");
+	__CPROVER_assert(inpage + len <= PAGE_SIZE,
+	    "mbuf data inside its page");
+	__CPROVER_assert(IDX_TO_OFF(pg->pindex) + inpage == g_file_next,
+	    "file bytes in file order, none skipped");
+	__CPROVER_assert((pg->valid & page_bits(inpage, len)) ==
+	    page_bits(inpage, len),
+	    "only file bytes read from the file are sent");
+	g_file_next += len;
+	g_file_seen += len;
+}
+
 static int
 pr_send(struct socket *so, int flags, struct mbuf *m0, struct sockaddr *a,
     struct mbuf *c, struct thread *td)
 {
 	struct mbuf *m;
 	vm_page_t pg;
-	size_t inpage;
+	vm_paddr_t pa;
+	int len, sum;
 
 	__CPROVER_assert(m_length(m0, NULL) <= (u_int)g_room,
 	    "queues no more than the socket has room for");
@@ -391,32 +412,88 @@ pr_send(struct socket *so, int flags, struct mbuf *m0, struct sockaddr *a,
 			g_hdr_seen += m->m_len;
 			continue;
 		}
+		g_phase = 1;
+		if ((m->m_flags & M_EXTPG) != 0) {
+			/*
+			 * Unmapped: pages by physical address, the first from
+			 * m_epg_1st_off, the last m_epg_last_len long.
+			 */
+			__CPROVER_assert(m->m_epg_npgs > 0 &&
+			    m->m_epg_npgs <= MBUF_PEXT_MAX_PGS,
+			    "unmapped mbuf page count in range");
+			sum = 0;
+			for (int i = 0; i < m->m_epg_npgs; i++) {
+				pa = m->m_epg_pa[i];
+				__CPROVER_assert(pa % PAGE_SIZE == 0 &&
+				    pa / PAGE_SIZE >= 1 &&
+				    pa / PAGE_SIZE <= NPAGES,
+				    "unmapped mbuf holds a page of the file");
+				pg = g_pages[pa / PAGE_SIZE - 1];
+				len = m_epg_pagelen(m, i,
+				    i == 0 ? m->m_epg_1st_off : 0);
+				file_bytes(pg, i == 0 ? m->m_epg_1st_off : 0,
+				    len);
+				sum += len;
+			}
+			__CPROVER_assert(sum == m->m_len,
+			    "unmapped mbuf length is its pages'");
+			continue;
+		}
 		__CPROVER_assert(m->m_ext.ext_type == EXT_SFBUF,
 		    "file bytes come from a page");
-		__CPROVER_assert(m->m_len > 0, "no empty page mbuf");
-		g_phase = 1;
 		pg = sf_buf_page(m->m_ext.ext_arg1);
 		__CPROVER_assert(m->m_ext.ext_buf ==
 		    &g_data[pg->pindex * PAGE_SIZE],
 		    "mbuf maps the page it holds");
-		inpage = m->m_data - m->m_ext.ext_buf;
-		__CPROVER_assert(inpage + m->m_len <= PAGE_SIZE,
-		    "mbuf data inside its page");
-		__CPROVER_assert(IDX_TO_OFF(pg->pindex) + inpage ==
-		    g_file_next, "file bytes in file order, none skipped");
-		__CPROVER_assert((pg->valid & page_bits(inpage, m->m_len)) ==
-		    page_bits(inpage, m->m_len),
-		    "only file bytes read from the file are sent");
-		g_file_next += m->m_len;
-		g_file_seen += m->m_len;
+		file_bytes(pg, m->m_data - m->m_ext.ext_buf, m->m_len);
 	}
-	m_freem(m0);
+	/*
+	 * A chain queued not ready stays until pr_ready() readies it.
+	 * NO_READY_CHECK leaves that out: with a mapped mbuf per page it
+	 * makes proof_read six times slower.
+	 */
+#ifndef NO_READY_CHECK
+	if ((flags & PRUS_NOTREADY) != 0) {
+		__CPROVER_assert(g_pending == NULL,
+		    "one chain not ready at a time");
+		g_pending = m0;
+	} else
+#endif
+		m_freem(m0);
 	return (0);
 }
 
+/*
+ * What sbready() expects: from m on, count not-ready pages, one per
+ * mapped mbuf and m_epg_nrdy per unmapped one, every mbuf among them not
+ * ready.  sendfile readies all the pages of a chain at once, so none of
+ * it may be left not ready.
+ */
 static int
 pr_ready(struct socket *so, struct mbuf *m, int count)
 {
+#ifdef NO_READY_CHECK
+	return (0);
+#endif
+	__CPROVER_assert(g_pending != NULL, "readies a chain queued not ready");
+	__CPROVER_assert(count > 0, "readies at least one page");
+	while (count > 0) {
+		__CPROVER_assert(m != NULL, "readies no more pages than queued");
+		__CPROVER_assert((m->m_flags & M_NOTREADY) != 0,
+		    "readies only mbufs queued not ready");
+		if ((m->m_flags & M_EXTPG) != 0 && m->m_epg_npgs != 0) {
+			__CPROVER_assert(count >= m->m_epg_nrdy,
+			    "readies every page of an unmapped mbuf");
+			count -= m->m_epg_nrdy;
+		} else
+			count--;
+		m = m->m_next;
+	}
+	for (; m != NULL; m = m->m_next)
+		__CPROVER_assert((m->m_flags & M_NOTREADY) == 0,
+		    "every page queued not ready is readied");
+	m_freem(g_pending);
+	g_pending = NULL;
 	return (0);
 }
 
@@ -550,6 +627,7 @@ check_stream(int error, off_t sent, off_t offset, size_t nbytes, off_t size,
 #endif
 	if (error != 0 || g_short)
 		return;
+	__CPROVER_assert(g_pending == NULL, "every chain queued is readied");
 
 	/*
 	 * sendfile.2: "nbytes ... how many bytes of the file should be
@@ -636,6 +714,29 @@ proof_read(void)
 	error = vn_sendfile(&g_fp, 0, has_hdr ? &hdr : NULL,
 	    has_trl ? &trl : NULL, offset, nbytes, &sent, 0, &g_td);
 	check_stream(error, sent, offset, nbytes, size, hlen, tlen);
+}
+
+/* proof_send and proof_read with unmapped mbufs, as TCP uses on amd64. */
+void
+proof_send_extpg(void)
+{
+	mb_use_ext_pgs = true;
+	g_nowait_fails = false;
+	send(0);
+}
+
+void
+proof_read_extpg(void)
+{
+	mb_use_ext_pgs = true;
+	proof_read();
+}
+
+void
+proof_nodiskio_extpg(void)
+{
+	mb_use_ext_pgs = true;
+	proof_nodiskio();
 }
 
 void

@@ -169,6 +169,34 @@ uma_zfree_arg(uma_zone_t zone, void *item, void *udata)
 	__CPROVER_deallocate(item);
 }
 
+/*
+ * An unmapped mbuf, as mb_alloc_ext_pgs() in kern_mbuf.c sets it up, with
+ * no pages in it yet.
+ */
+struct mbuf *
+mb_alloc_ext_pgs(int how, m_ext_free_t ext_free, int flags)
+{
+	struct mbuf *m;
+
+	m = m_get(how, MT_DATA);
+	m->m_epg_npgs = 0;
+	m->m_epg_nrdy = 0;
+	m->m_epg_1st_off = 0;
+	m->m_epg_last_len = 0;
+	m->m_epg_flags = 0;
+	m->m_epg_hdrlen = 0;
+	m->m_epg_trllen = 0;
+	m->m_epg_tls = NULL;
+	m->m_epg_so = NULL;
+	m->m_data = NULL;
+	m->m_flags |= M_EXT | M_EXTPG | flags;
+	m->m_ext.ext_flags = EXT_FLAG_EMBREF;
+	m->m_ext.ext_count = 1;
+	m->m_ext.ext_size = 0;
+	m->m_ext.ext_free = ext_free;
+	return (m);
+}
+
 /* Counters: statistics only. */
 
 counter_u64_t

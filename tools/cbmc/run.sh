@@ -169,6 +169,14 @@ mutant()
 	queue mutant "$1" "$2" "$dst" "$4" "$5" "$6"
 }
 
+# slow KIND NAME ...: a proof or mutant that takes over half an hour,
+# queued only with SLOW=1.
+slow()
+{
+	[ "${SLOW:-0}" = 1 ] || return 0
+	"$@"
+}
+
 # question NAME HARNESS SOURCE PROOF DEFS UNWINDSET: the manual and the
 # code disagree and it is not settled which is right; the proof fails
 # until it is, and is reported without failing the run.
@@ -235,7 +243,8 @@ fi
 ul="vn_sendfile.11:4,sendfile_swapin.12:4,sendfile_swapin.0:4"
 ul="$ul,sendfile_swapin.5:4,sendfile_swapin.8:4,setup.0:5,sfio_malloc.0:6"
 ul="$ul,vm_page_grab_pages_unlocked.0:4,vm_pager_get_pages_async.0:4"
-ul="$ul,pr_send.0:6,m_freem.0:6,m_length.0:6,fixspace.0:4,fixspace.1:4"
+ul="$ul,pr_send.0:6,pr_send.1:6,pr_ready.0:6,pr_ready.1:6"
+ul="$ul,m_freem.0:6,m_length.0:6,fixspace.0:4,fixspace.1:4"
 for l in 0 1 2 3 4 5 6 7 9; do
 	ul="$ul,sendfile_iodone.$l:4"
 done
@@ -259,7 +268,10 @@ dndio="$dndio -DMAXSPACE=(3*PAGE_SIZE)"
 if want sendfile; then
 	proof sendfile_send "$h" "$s" proof_send "$dsend" "vn_sendfile.14:2,$ul"
 	proof sendfile_twice "$h" "$s" proof_send "$dtwo" "vn_sendfile.14:3,$ul"
-	proof sendfile_read "$h" "$s" proof_read "$dread" "vn_sendfile.14:2,$ul"
+	proof sendfile_read "$h" "$s" proof_read "$dread -DNO_READY_CHECK" \
+	    "vn_sendfile.14:2,$ul"
+	slow proof sendfile_read_ready "$h" "$s" proof_read "$dread" \
+	    "vn_sendfile.14:2,$ul"
 	proof sendfile_nodiskio "$h" "$s" proof_nodiskio "$dndio" \
 	    "vn_sendfile.14:2,$ul"
 
@@ -278,13 +290,60 @@ if want sendfile; then
 	mutant sendfile_twice_hdrspace "$h" "$s" proof_send "$dtwo" \
 	    "vn_sendfile.14:3,$ul" 's/space -= hdrlen;/;/'
 	# An invalid page is read before it is sent.
-	mutant sendfile_read_valid "$h" "$s" proof_read "$dread" \
+	mutant sendfile_read_valid "$h" "$s" proof_read "$dread -DNO_READY_CHECK" \
 	    "vn_sendfile.14:2,$ul" \
 	    's/if (vm_page_is_valid(pa\[i\], vmoff(i, off) \& PAGE_MASK,$/if (1 || vm_page_is_valid(pa[i], vmoff(i, off) \& PAGE_MASK,/'
+	# A mapped page queued while it is being read is marked not ready.
+	slow mutant sendfile_read_notready "$h" "$s" proof_read "$dread" \
+	    "vn_sendfile.14:2,$ul" \
+	    's/^\([[:space:]]*\)m0->m_flags |= M_NOTREADY;$/\1;/'
 	# The fix of 2026 to sendfile_swapin(), taken back.
 	mutant sendfile_nodiskio_short "$h" "$s" proof_nodiskio "$dndio" \
 	    "vn_sendfile.14:2,$ul" \
 	    's/xfsize(i, sfio->npages, off, len)/xfsize(i, npages, off, len)/'
+fi
+
+#
+# sendfile(2) with unmapped mbufs (mb_use_ext_pgs), what TCP uses on
+# amd64.  One such mbuf holds MBUF_PEXT_MAX_PGS pages, five here, so the
+# six page run fills one and starts another.
+#
+dsix="-DMAXFILE=(5*PAGE_SIZE+1) -DMAXHDR=0 -DMINSPACE=(5*PAGE_SIZE+2)"
+dsix="$dsix -DMAXSPACE=(6*PAGE_SIZE)"
+usix=$(echo "$ul" | sed 's/:4/:8/g; s/:5/:9/g; s/:6/:10/g')
+
+if want sendfile; then
+	proof sendfile_send_extpg "$h" "$s" proof_send_extpg "$dsend" \
+	    "vn_sendfile.14:2,$ul"
+	proof sendfile_six_extpg "$h" "$s" proof_send_extpg "$dsix" \
+	    "vn_sendfile.14:2,$usix"
+	proof sendfile_twice_extpg "$h" "$s" proof_send_extpg "$dtwo" \
+	    "vn_sendfile.14:3,$ul"
+	proof sendfile_read_extpg "$h" "$s" proof_read_extpg "$dread" \
+	    "vn_sendfile.14:2,$ul"
+	proof sendfile_nodiskio_extpg "$h" "$s" proof_nodiskio_extpg \
+	    "$dndio" "vn_sendfile.14:2,$ul"
+
+	# The first page starts at the run's offset in it.
+	mutant sendfile_extpg_1st_off "$h" "$s" proof_send_extpg "$dsend" \
+	    "vn_sendfile.14:2,$ul" \
+	    's/^\([[:space:]]*\)vmoff(i, off) \& PAGE_MASK;$/\10;/'
+	# The last page is as long as the run uses of it.
+	mutant sendfile_extpg_last_len "$h" "$s" proof_send_extpg "$dsend" \
+	    "vn_sendfile.14:2,$ul" \
+	    's/m0->m_epg_last_len = xfs;/m0->m_epg_last_len = PAGE_SIZE;/'
+	# The mbuf is as long as its pages' bytes.
+	mutant sendfile_extpg_len "$h" "$s" proof_send_extpg "$dsend" \
+	    "vn_sendfile.14:2,$ul" \
+	    's/mtail->m_len += xfs;/mtail->m_len += PAGE_SIZE;/'
+	# A full mbuf is followed by a fresh one from its first slot.
+	mutant sendfile_extpg_wrap "$h" "$s" proof_send_extpg "$dsix" \
+	    "vn_sendfile.14:2,$usix" \
+	    's/^\([[:space:]]*\)ext_pgs_idx = 0;$/\1ext_pgs_idx = 1;/'
+	# Each page being read counts in m_epg_nrdy for sbready().
+	mutant sendfile_extpg_nrdy "$h" "$s" proof_read_extpg "$dread" \
+	    "vn_sendfile.14:2,$ul" \
+	    's/^\([[:space:]]*\)m0->m_epg_nrdy++;$/\1;/'
 fi
 
 [ "$njobs" -gt 0 ] || { echo "run.sh: nothing selected" >&2; exit 2; }
@@ -306,7 +365,11 @@ while read -r kind name; do
 		echo "ok   proof  $name"
 		;;
 	mutant:10)
-		why=$(grep -m1 ': FAILURE$' "$work/$name.log" |
+		# The property that caught it, rather than a loop bound
+		# the mutant ran past, when there is one.
+		why=$( (grep ': FAILURE$' "$work/$name.log" |
+		    grep -v 'unwinding assertion'; grep -m1 ': FAILURE$' \
+		    "$work/$name.log") | head -1 |
 		    sed 's/^\[[^]]*\] //; s/: FAILURE$//')
 		echo "ok   mutant $name: caught by $why"
 		;;
