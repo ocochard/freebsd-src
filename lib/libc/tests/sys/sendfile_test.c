@@ -1301,6 +1301,52 @@ ATF_TC_BODY(hdtr_without_file_data, tc)
 	(void)close(fd);
 }
 
+ATF_TC_WITHOUT_HEAD(trailer_after_truncation);
+ATF_TC_BODY(trailer_after_truncation, tc)
+{
+	static char block[1024 * 1024];
+	struct iovec trl = { .iov_base = "TAIL", .iov_len = 4 };
+	struct sf_hdtr hdtr = { NULL, 0, &trl, 1 };
+	char buf[65536], last[4];
+	ssize_t n, total;
+	off_t sbytes;
+	pid_t pid;
+	int error, fd, sv[2];
+
+	fd = open(SOURCE_FILE, O_RDWR | O_CREAT | O_TRUNC, 0644);
+	ATF_REQUIRE_MSG(fd != -1, "open failed: %s", strerror(errno));
+	memset(block, 'x', sizeof(block));
+	ATF_REQUIRE(write(fd, block, sizeof(block)) == sizeof(block));
+	ATF_REQUIRE_MSG(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0,
+	    "socketpair failed: %s", strerror(errno));
+
+	/*
+	 * The peer truncates the file while sendfile waits for room in the
+	 * socket, then reads everything: the trailer must still come last.
+	 */
+	pid = atf_utils_fork();
+	if (pid == 0) {
+		(void)close(sv[0]);
+		sleep(1);
+		if (ftruncate(fd, 0) != 0)
+			_exit(2);
+		total = 0;
+		while ((n = read(sv[1], buf, sizeof(buf))) > 0) {
+			if (n >= 4)
+				memcpy(last, buf + n - 4, 4);
+			total += n;
+		}
+		_exit(total >= 4 && memcmp(last, "TAIL", 4) == 0 ? 0 : 1);
+	}
+	(void)close(sv[1]);
+
+	error = sendfile(fd, sv[0], 0, 0, &hdtr, &sbytes, 0);
+	ATF_CHECK_EQ_MSG(error, 0, "sendfile failed: %s", strerror(errno));
+	(void)close(sv[0]);
+	atf_utils_wait(pid, 0, "", "");
+	(void)close(fd);
+}
+
 ATF_TP_ADD_TCS(tp)
 {
 
@@ -1341,6 +1387,7 @@ ATF_TP_ADD_TCS(tp)
 	ATF_TP_ADD_TC(tp, nbytes_past_off_max);
 	ATF_TP_ADD_TC(tp, sbytes_partial_trailer);
 	ATF_TP_ADD_TC(tp, hdtr_without_file_data);
+	ATF_TP_ADD_TC(tp, trailer_after_truncation);
 
 	return (atf_no_error());
 }
