@@ -255,6 +255,10 @@ cbmc_atomic_fetchadd_int(volatile u_int *p, u_int v)
 int
 cbmc_atomic_cmpset_rel_int(volatile u_int *p, u_int cmp, u_int v)
 {
+#ifdef CBMC_CMPSET_HOOK
+	/* A harness tracking the busy state as ghost state, see sendfile.c. */
+	CBMC_CMPSET_HOOK(p);
+#endif
 	return (1);
 }
 

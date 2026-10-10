@@ -204,7 +204,7 @@ s="$top/sys/kern/kern_sendfile.c"
 # page and end inside another; header and trailer up to 8 bytes.
 d="-DMAXFILE=(2*PAGE_SIZE+1) -DMAXHDR=8"
 u="setup.0:5,deliver.0:4,deliver.1:6,m_freem.0:4,m_length.0:4"
-u="$u,sigsetmasked.0:5,__sigisempty.0:5"
+u="$u,sigsetmasked.0:5,__sigisempty.0:5,all_unbusied.0:6"
 # The page arithmetic, for runs up to two pages.
 ua="proof_xfsize.0:4,proof_fixspace.0:4,fixspace.0:4,fixspace.1:4"
 
@@ -249,7 +249,8 @@ ul="$ul,sendfile_swapin.5:4,sendfile_swapin.8:4,setup.0:5,sfio_malloc.0:6"
 ul="$ul,vm_page_grab_pages_unlocked.0:4"
 ul="$ul,deliver.0:6,deliver.1:6,notready_pages.0:6,notready_pages.1:6"
 ul="$ul,io_complete.0:4,io_flush.0:3,sendfile_swapin.9:4,sendfile_swapin.10:4"
-ul="$ul,sendfile_swapin.11:4"
+ul="$ul,sendfile_swapin.11:4,unbusy.0:6,all_unbusied.0:6"
+ul="$ul,vm_pager_get_pages_async.0:4"
 ul="$ul,m_freem.0:6,m_length.0:6,fixspace.0:4,fixspace.1:4"
 ul="$ul,sigsetmasked.0:5,__sigisempty.0:5"
 for l in 0 1 2 3 4 5 6 7 9; do
@@ -275,7 +276,9 @@ dndio="$dndio -DMAXSPACE=(3*PAGE_SIZE)"
 if want sendfile; then
 	proof sendfile_send "$h" "$s" proof_send "$dsend" "vn_sendfile.14:2,$ul"
 	proof sendfile_twice "$h" "$s" proof_send "$dtwo" "vn_sendfile.14:3,$ul"
-	proof sendfile_read "$h" "$s" proof_read "$dread -DNO_READY_CHECK" \
+	# Mapped mbufs on the paging path, with the busy state, take 36
+	# minutes; the unmapped proof below covers the same paging code.
+	slow proof sendfile_read "$h" "$s" proof_read "$dread -DNO_READY_CHECK" \
 	    "vn_sendfile.14:2,$ul"
 	slow proof sendfile_read_ready "$h" "$s" proof_read "$dread" \
 	    "vn_sendfile.14:2,$ul"
@@ -297,7 +300,7 @@ if want sendfile; then
 	mutant sendfile_twice_hdrspace "$h" "$s" proof_send "$dtwo" \
 	    "vn_sendfile.14:3,$ul" 's/space -= hdrlen;/;/'
 	# An invalid page is read before it is sent.
-	mutant sendfile_read_valid "$h" "$s" proof_read "$dread -DNO_READY_CHECK" \
+	mutant sendfile_read_valid "$h" "$s" proof_read_extpg "$dread" \
 	    "vn_sendfile.14:2,$ul" \
 	    's/if (vm_page_is_valid(pa\[i\], vmoff(i, off) \& PAGE_MASK,$/if (1 || vm_page_is_valid(pa[i], vmoff(i, off) \& PAGE_MASK,/'
 	# A mapped page queued while it is being read is marked not ready.
@@ -352,6 +355,22 @@ if want sendfile; then
 	mutant sendfile_ioerror_abort "$h" "$s" proof_ioerror_extpg "$dread" \
 	    "vn_sendfile.14:2,$ul" \
 	    's/so->so_proto->pr_abort(so);/if (0) so->so_proto->pr_abort(so);/'
+	# The pages of a failed run, unbusied by the completion, are not
+	# unbusied again ...
+	mutant sendfile_busy_double "$h" "$s" proof_ioerror_extpg "$dread" \
+	    "vn_sendfile.14:2,$ul" 's/if (j >= i + count1)/if (j >= i + count)/'
+	# ... and every page busied is unbusied: by the completion, ...
+	mutant sendfile_busy_iodone "$h" "$s" proof_ioerror_extpg "$dread" \
+	    "vn_sendfile.14:2,$ul" \
+	    's/^\([[:space:]]*\)vm_page_xunbusy_unchecked(pa\[i\]);/\1;/'
+	# ... when skipped as valid, ...
+	mutant sendfile_busy_skip "$h" "$s" proof_ioerror_extpg "$dread" \
+	    "vn_sendfile.14:2,$ul" \
+	    '/Skip valid pages/,/continue;/s/vm_page_xunbusy(pa\[i\]);/;/'
+	# ... or trimmed off the end of a run.
+	mutant sendfile_busy_trim "$h" "$s" proof_ioerror_extpg "$dread" \
+	    "vn_sendfile.14:2,$ul" \
+	    '/for (j = i + count - 1; j > i; j--) {/,/count--;/s/vm_page_xunbusy(pa\[j\]);/;/'
 	# ... and freeing exactly the pages queued not ready.
 	mutant sendfile_ioerror_free "$h" "$s" proof_ioerror_extpg "$dread" \
 	    "vn_sendfile.14:2,$ul" \

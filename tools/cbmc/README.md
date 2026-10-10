@@ -8,7 +8,7 @@ against the kernel's own source for every input within the bounds,
 not a sample of inputs as a test or a fuzzer would.
 
     pkg install cbmc
-    tools/cbmc/run.sh            # every proof, about 35 minutes
+    tools/cbmc/run.sh            # every proof, about 55 minutes
     SLOW=1 tools/cbmc/run.sh     # and the ones over half an hour
     tools/cbmc/run.sh sendfile   # one system call
 
@@ -105,6 +105,14 @@ Proven:
   pages queued not ready are freed, never delivered.  With unmapped
   mbufs, in 6 minutes; with reads completing after the call returns, in
   33 minutes (`SLOW=1`);
+- the busy state of the pages, on every path above, error paths
+  included: every page the grab busies is unbusied exactly once, none
+  is left busy when the call and its reads are done, no page is
+  delivered while still busy, and what `vm_pager_assert_in()` requires
+  of a read holds (consecutive pages, real ones at both ends, each real
+  one busied and not all valid).  Busy state lives in
+  `sendfile_swapin()` and `sendfile_iodone()`, whatever the mbufs; the
+  paging proof with mapped mbufs, at 36 minutes, runs with `SLOW=1`;
 - with the paging path, what `sbready()` expects of `pr_ready()`: the
   pages queued `M_NOTREADY`, counted one per mapped mbuf and
   `m_epg_nrdy` per unmapped one, are exactly those readied.  For mapped
@@ -172,8 +180,9 @@ Not proven yet:
 - KTLS (`KERN_TLS` is off in the build), and `SF_NOCACHE`, whose
   effect, the pages' release policy, the model does not observe.
 - I/O errors with mapped mbufs: the proof did not finish within an
-  hour (`SLOW=1` runs it).  Page busy state is not modelled: a page left
-  busy, or unbusied twice, on the error paths would go unseen.
+  hour (`SLOW=1` runs it).  Busy state is tracked for this call's own
+  pages only; another thread holding a page busy is modelled only as a
+  grab that stops short (`SF_NODISKIO`).
 - Truncation is modelled through the size alone: the pages past the new
   end stay, as sendfile has them wired.
 - Shared memory objects (`DTYPE_SHM`) and `vn_getsize_locked()` objects.

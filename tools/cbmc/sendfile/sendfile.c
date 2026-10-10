@@ -77,6 +77,8 @@ static void *sfio_malloc(size_t, struct malloc_type *, int);
 #define	CBMC_MALLOC_HOOK	sfio_malloc
 static void resize(volatile uintptr_t *);
 #define	CBMC_RW_RLOCK_HOOK	resize
+static void unbusy(volatile u_int *);
+#define	CBMC_CMPSET_HOOK	unbusy
 #include "kern.h"
 
 #ifndef MAXFILE
@@ -110,6 +112,7 @@ static struct file	g_fp;
  * formula.
  */
 static vm_page_t	g_pages[NPAGES];
+static bool		g_busy[NPAGES];	/* busied by this call */
 static struct vm_page	g_bogus;
 static char		g_data[NPAGES * PAGE_SIZE];	/* the pages' bytes */
 vm_page_t bogus_page = &g_bogus;
@@ -217,6 +220,38 @@ resize(volatile uintptr_t *c)
 		g_size_max = size;
 }
 
+/*
+ * The busy state of the pages, as ghost state: the grab busies each page
+ * it returns, and vm_page_xunbusy() and vm_page_xunbusy_unchecked(), both
+ * an atomic_cmpset_rel_int() on the page's busy_lock, unbusy one.  The
+ * model of that compare-and-set calls this.
+ */
+static void
+unbusy(volatile u_int *p)
+{
+	bool found;
+
+	found = false;
+	for (int k = 0; k < NPAGES; k++) {
+		if (p == &g_pages[k]->busy_lock) {
+			__CPROVER_assert(g_busy[k],
+			    "unbusies only a page it holds busy");
+			g_busy[k] = false;
+			found = true;
+		}
+	}
+	__CPROVER_assert(found, "unbusies a page of the file");
+}
+
+/* When the call is done, no page it busied is still busy. */
+static void
+all_unbusied(void)
+{
+	for (int k = 0; k < NPAGES; k++)
+		__CPROVER_assert(!g_busy[k],
+		    "leaves no page busy");
+}
+
 /* VM model. */
 
 int
@@ -234,6 +269,9 @@ vm_page_grab_pages_unlocked(vm_object_t object, vm_pindex_t pindex,
 		__CPROVER_assume(grabbed >= 0 && grabbed <= count);
 	}
 	for (int i = 0; i < grabbed; i++) {
+		__CPROVER_assert(!g_busy[pindex + i],
+		    "grabs no page it holds busy already");
+		g_busy[pindex + i] = true;
 		ma[i] = g_pages[pindex + i];
 		if ((allocflags & VM_ALLOC_WIRED) != 0)
 			ma[i]->ref_count++;
@@ -360,6 +398,22 @@ vm_pager_get_pages_async(vm_object_t object, vm_page_t *m, int count,
 	int error;
 
 	__CPROVER_assert(iodone == sendfile_iodone, "completes to sendfile");
+	/*
+	 * What vm_pager_assert_in() checks: consecutive pages, the first
+	 * and the last real ones, each real one busied and not all valid.
+	 */
+	__CPROVER_assert(count > 0 && m[0] != bogus_page &&
+	    m[count - 1] != bogus_page, "pager run ends on real pages");
+	for (int i = 0; i < count; i++) {
+		if (m[i] == bogus_page)
+			continue;
+		__CPROVER_assert(m[i]->pindex == m[0]->pindex + i,
+		    "pager run of consecutive pages");
+		__CPROVER_assert(g_busy[m[i]->pindex],
+		    "pager reads only busied pages");
+		__CPROVER_assert(m[i]->valid != VM_PAGE_BITS_ALL,
+		    "pager reads no page already valid");
+	}
 	error = 0;
 	if (g_ioerror && nondet_bool()) {
 		error = EIO;
@@ -491,10 +545,13 @@ file_bytes(vm_page_t pg, size_t inpage, int len, int how)
 		g_file_next += len;
 		g_file_seen += len;
 	}
-	if ((how & READY) != 0)
+	if ((how & READY) != 0) {
 		__CPROVER_assert((pg->valid & page_bits(inpage, len)) ==
 		    page_bits(inpage, len),
 		    "only file bytes read from the file are sent");
+		__CPROVER_assert(!g_busy[pg->pindex],
+		    "delivers no page still busy");
+	}
 }
 
 /* The bytes of a chain: header, then file bytes; HOW as file_bytes(). */
@@ -765,6 +822,7 @@ check_stream(int error, off_t sent, off_t offset, size_t nbytes, off_t size,
 {
 	off_t want;
 
+	all_unbusied();
 	__CPROVER_assert(sent == (off_t)(g_hdr_seen + g_file_seen +
 	    g_trl_seen), "sbytes is what the socket received");
 	/*
@@ -918,6 +976,7 @@ proof_ioerror(void)
 	error = vn_sendfile(&g_fp, 0, has_hdr ? &hdr : NULL,
 	    has_trl ? &trl : NULL, offset, nbytes, &sent, 0, &g_td);
 	io_flush();		/* the reads still in flight complete */
+	all_unbusied();
 	__CPROVER_assert(!g_syncerr || error == EIO,
 	    "a read failing at once fails sendfile(2) with EIO");
 	if (g_aborted) {
@@ -994,6 +1053,7 @@ proof_nodiskio(void)
 	    has_trl ? &trl : NULL, offset, nbytes, &sent, SF_NODISKIO, &g_td);
 	__CPROVER_assert(error == 0 || error == EBUSY,
 	    "SF_NODISKIO fails only with EBUSY");
+	all_unbusied();
 	__CPROVER_assert(sent == (off_t)(g_hdr_seen + g_file_seen +
 	    g_trl_seen), "sbytes is what the socket received");
 }
