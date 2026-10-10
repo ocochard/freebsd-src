@@ -33,7 +33,8 @@ not a sample of inputs as a test or a fuzzer would.
   silently prove the unmutated file again.
 - An "open question" is a proof of the manual's wording where it and
   the code disagree and nobody has yet said which one is right.  It is
-  expected to fail, and does not fail the run.
+  expected to fail, and does not fail the run.  There is none at the
+  moment.
 
 ## Model choices forced by cbmc 6.11
 
@@ -119,17 +120,18 @@ the branch's kernel, and the other 24 cases are unchanged:
 | `sendfile: Count a partial trailer in sbytes` | a trailer cut short by EPIPE was left out of `*sbytes` |
 | `sendfile: Send the header when there is no file data` | with `offset` at or past EOF, or an empty file, the header was dropped but the trailer sent; regression from 2bab0c553588 |
 
-Manual and code disagree, waiting for a developer's answer:
+Manual and code disagreed; settled with the developer:
 
-- A header or trailer write cut short returns 0 (`sousrsend()` clears
-  EAGAIN and EINTR once some bytes went out).  The manual says
-  `sendfile()` returns EAGAIN (`run.sh` question
-  `sendfile_short_write`).
-- Readahead: the manual says the larger of the application's value and
-  the internal one is used.  The code adds the two.
-- Not in ERRORS: a pending socket error such as ECONNRESET, returned
-  from `so_error`; and EINVAL for `hdr_cnt` or `trl_cnt` above
-  `IOV_MAX`.
+- A header or trailer write cut short returned 0, `sousrsend()`
+  clearing EAGAIN and EINTR once some bytes went out, where the manual
+  says `sendfile()` fails: a code bug, fixed by `sendfile: Fail when a
+  header or trailer write is cut short`.
+- Readahead: the manual said the larger of the application's value and
+  the internal one is used, the code adds the two: the manual's
+  wording, fixed by `sendfile.2: Say that readahead adds ...`.
+- ERRORS lacked a pending socket error, such as ECONNRESET, and EINVAL
+  for header or trailer iovecs that `copyinuio()` refuses: missing
+  documentation, fixed by `sendfile.2: Document two more errors`.
 
 Found by the loop proofs, fixed on this branch, not yet reported:
 

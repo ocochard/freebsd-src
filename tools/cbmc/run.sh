@@ -204,7 +204,8 @@ s="$top/sys/kern/kern_sendfile.c"
 # The file spans three pages and a byte, so a run can start inside one
 # page and end inside another; header and trailer up to 8 bytes.
 d="-DMAXFILE=(2*PAGE_SIZE+1) -DMAXHDR=8"
-u="setup.0:5,pr_send.0:4,m_freem.0:4,m_length.0:4"
+u="setup.0:5,pr_send.0:4,pr_send.1:6,m_freem.0:4,m_length.0:4"
+u="$u,sigsetmasked.0:5,__sigisempty.0:5"
 # The page arithmetic, for runs up to two pages.
 ua="proof_xfsize.0:4,proof_fixspace.0:4,fixspace.0:4,fixspace.1:4"
 
@@ -213,8 +214,12 @@ if want sendfile; then
 	proof sendfile_fixspace "$h" "$s" proof_fixspace "" "$ua"
 	proof sendfile_noloop "$h" "$s" proof_noloop "$d" "$u"
 
-	question sendfile_short_write "$h" "$s" proof_noloop \
-	    "$d -DSPEC_SHORT_WRITE" "$u"
+	# A short trailer write makes sendfile(2) fail.
+	mutant sendfile_short_trailer "$h" "$s" proof_noloop "$d" "$u" \
+	    '/len = trl_uio->uio_resid;/,/goto out;/s/error = sendfile_short_write(td);/;/'
+	# So does a short header write.
+	mutant sendfile_short_header "$h" "$s" proof_noloop "$d" "$u" \
+	    '/Do not send trailers after a partial header/,/goto out;/s/if (error != 0)$/if (error != 0 || cnt != len)/;/hdr_uio, 0,$/,/Do not send/s/error = sendfile_short_write(td);/;/'
 
 	# The three fixes of 2026, taken back one at a time.
 	mutant sendfile_nbytes_offmax "$h" "$s" proof_noloop \
@@ -228,7 +233,7 @@ if want sendfile; then
 	    's/if ((hdr_uio != NULL \&\& hdr_uio->uio_resid > 0) || trl_uio != NULL) {/if (trl_uio != NULL) {/'
 	# A partial header must not be followed by the trailer.
 	mutant sendfile_header_partial "$h" "$s" proof_noloop "$d" "$u" \
-	    's/if (error != 0 || cnt != len)/if (error != 0)/'
+	    '/hdr_uio, 0,$/,/Do not send/s/error = sendfile_short_write(td);/;/'
 	# The page split: the last page of a run, and the first.
 	mutant sendfile_xfsize_last "$h" "$s" proof_xfsize "" "$ua" \
 	    's/if (i == n - 1 \&\& ((off + len) \& PAGE_MASK) > 0)/if (i == n - 1)/'
@@ -245,6 +250,7 @@ ul="$ul,sendfile_swapin.5:4,sendfile_swapin.8:4,setup.0:5,sfio_malloc.0:6"
 ul="$ul,vm_page_grab_pages_unlocked.0:4,vm_pager_get_pages_async.0:4"
 ul="$ul,pr_send.0:6,pr_send.1:6,pr_ready.0:6,pr_ready.1:6"
 ul="$ul,m_freem.0:6,m_length.0:6,fixspace.0:4,fixspace.1:4"
+ul="$ul,sigsetmasked.0:5,__sigisempty.0:5"
 for l in 0 1 2 3 4 5 6 7 9; do
 	ul="$ul,sendfile_iodone.$l:4"
 done
