@@ -47,6 +47,8 @@
  *   proof_send_extpg	proof_send, proof_read and proof_nodiskio with
  *   proof_read_extpg	unmapped mbufs (mb_use_ext_pgs), what TCP uses
  *   proof_nodiskio_extpg on amd64
+ *   proof_ioerror	proof_read with reads that fail, at once or
+ *			later, and complete after the call
  *   proof_resize	proof_send with the file truncated or extended
  *			during the call
  *   proof_nodiskio	the same with SF_NODISKIO, pages partly valid but
@@ -135,6 +137,24 @@ static int		g_room;		/* room the last wait reported */
 static int		g_waits;	/* send loop iterations so far */
 static struct uio	*g_hdr_uio;
 static struct mbuf	*g_pending;	/* chain queued not ready */
+static bool		g_ioerror;	/* reads may fail */
+static bool		g_aborted;	/* pr_abort() was called */
+static bool		g_syncerr;	/* a read failed at once */
+
+/* Reads whose completion the pager model holds until after the call. */
+#ifndef MAXIO
+#define	MAXIO		2		/* reads held at once */
+#endif
+#ifndef IODEFER
+#define	IODEFER		0		/* reads may complete after the call */
+#endif
+static struct {
+	void		*arg;
+	vm_page_t	*m;
+	int		count;
+	int		error;
+} g_io[MAXIO];
+static int		g_nio;
 static bool		g_short;	/* a write stopped short, returning 0 */
 
 
@@ -306,15 +326,60 @@ cbmc_sf_buf_kva(struct sf_buf *sf)
 	return (&g_data[pg->pindex * PAGE_SIZE]);
 }
 
-/* The pager reads the run, and the I/O completes at once. */
+/*
+ * The pager reads the run.  The read completes now, or is held until
+ * after vn_sendfile() returns, as an asynchronous read does.  With
+ * g_ioerror it may fail, either later, through the completion, or at
+ * once; then, as vnode_pager_local_getpages_async() and ZFS do, the
+ * completion runs with the error before the error is returned, which is
+ * what restores the pages sendfile_swapin() replaced with bogus_page.
+ */
+static void
+io_complete(void *arg, vm_page_t *m, int count, int error)
+{
+	if (error == 0)
+		for (int i = 0; i < count; i++)
+			if (m[i] != bogus_page)
+				m[i]->valid = VM_PAGE_BITS_ALL;
+	sendfile_iodone(arg, m, count, error);
+}
+
+static void
+io_flush(void)
+{
+	for (int i = 0; i < g_nio; i++)
+		io_complete(g_io[i].arg, g_io[i].m, g_io[i].count,
+		    g_io[i].error);
+	g_nio = 0;
+}
+
 int
 vm_pager_get_pages_async(vm_object_t object, vm_page_t *m, int count,
     int *rbehind, int *rahead, pgo_getpages_iodone_t iodone, void *arg)
 {
-	for (int i = 0; i < count; i++)
-		if (m[i] != bogus_page)
-			m[i]->valid = VM_PAGE_BITS_ALL;
-	iodone(arg, m, count, 0);
+	int error;
+
+	__CPROVER_assert(iodone == sendfile_iodone, "completes to sendfile");
+	error = 0;
+	if (g_ioerror && nondet_bool()) {
+		error = EIO;
+		if (!IODEFER && nondet_bool()) {
+			/* Failing at once: what is pending completes first. */
+			g_syncerr = true;
+			io_flush();
+			io_complete(arg, m, count, error);
+			return (VM_PAGER_ERROR);
+		}
+	}
+	/* IODEFER: every read completes after the call, the async case. */
+	if (IODEFER && g_ioerror && g_nio < MAXIO) {
+		g_io[g_nio].arg = arg;
+		g_io[g_nio].m = m;
+		g_io[g_nio].count = count;
+		g_io[g_nio].error = error;
+		g_nio++;
+	} else
+		io_complete(arg, m, count, error);
 	return (VM_PAGER_OK);
 }
 
@@ -405,33 +470,42 @@ m_uiotombuf(struct uio *uio, int how, int len, int lspace, int flags)
 	return (m);
 }
 
-/* A file byte at OFF in page PG, LEN of them: in order, and read. */
+/*
+ * LEN file bytes at INPAGE in page PG.  The socket buffer delivers in the
+ * order data is queued, so their order is checked when they are queued
+ * (QUEUED); that they were read from the file is checked when they can be
+ * delivered (READY), at once or when pr_ready() readies them.
+ */
+#define	QUEUED		0x1
+#define	READY		0x2
+
 static void
-file_bytes(vm_page_t pg, size_t inpage, int len)
+file_bytes(vm_page_t pg, size_t inpage, int len, int how)
 {
-	__CPROVER_assert(len > 0, "no empty page in an mbuf");
-	__CPROVER_assert(inpage + len <= PAGE_SIZE,
-	    "mbuf data inside its page");
-	__CPROVER_assert(IDX_TO_OFF(pg->pindex) + inpage == g_file_next,
-	    "file bytes in file order, none skipped");
-	__CPROVER_assert((pg->valid & page_bits(inpage, len)) ==
-	    page_bits(inpage, len),
-	    "only file bytes read from the file are sent");
-	g_file_next += len;
-	g_file_seen += len;
+	if ((how & QUEUED) != 0) {
+		__CPROVER_assert(len > 0, "no empty page in an mbuf");
+		__CPROVER_assert(inpage + len <= PAGE_SIZE,
+		    "mbuf data inside its page");
+		__CPROVER_assert(IDX_TO_OFF(pg->pindex) + inpage ==
+		    g_file_next, "file bytes in file order, none skipped");
+		g_file_next += len;
+		g_file_seen += len;
+	}
+	if ((how & READY) != 0)
+		__CPROVER_assert((pg->valid & page_bits(inpage, len)) ==
+		    page_bits(inpage, len),
+		    "only file bytes read from the file are sent");
 }
 
-static int
-pr_send(struct socket *so, int flags, struct mbuf *m0, struct sockaddr *a,
-    struct mbuf *c, struct thread *td)
+/* The bytes of a chain: header, then file bytes; HOW as file_bytes(). */
+static void
+deliver(struct mbuf *m0, int how)
 {
 	struct mbuf *m;
 	vm_page_t pg;
 	vm_paddr_t pa;
 	int len, sum;
 
-	__CPROVER_assert(m_length(m0, NULL) <= (u_int)g_room,
-	    "queues no more than the socket has room for");
 	for (m = m0; m != NULL; m = m->m_next) {
 		/*
 		 * Header mbufs are the ones m_uiotombuf() makes, with no
@@ -439,12 +513,15 @@ pr_send(struct socket *so, int flags, struct mbuf *m0, struct sockaddr *a,
 		 * them: M_PROTO1 was tried, and it is M_NOTREADY.
 		 */
 		if ((m->m_flags & M_EXT) == 0) {
-			__CPROVER_assert(g_phase == 0,
-			    "header bytes come before file bytes");
-			g_hdr_seen += m->m_len;
+			if ((how & QUEUED) != 0) {
+				__CPROVER_assert(g_phase == 0,
+				    "header bytes come before file bytes");
+				g_hdr_seen += m->m_len;
+			}
 			continue;
 		}
-		g_phase = 1;
+		if ((how & QUEUED) != 0)
+			g_phase = 1;
 		if ((m->m_flags & M_EXTPG) != 0) {
 			/*
 			 * Unmapped: pages by physical address, the first from
@@ -464,10 +541,11 @@ pr_send(struct socket *so, int flags, struct mbuf *m0, struct sockaddr *a,
 				len = m_epg_pagelen(m, i,
 				    i == 0 ? m->m_epg_1st_off : 0);
 				file_bytes(pg, i == 0 ? m->m_epg_1st_off : 0,
-				    len);
+				    len, how);
 				sum += len;
 			}
-			__CPROVER_assert(sum == m->m_len,
+			__CPROVER_assert((how & QUEUED) == 0 ||
+			    sum == m->m_len,
 			    "unmapped mbuf length is its pages'");
 			continue;
 		}
@@ -477,29 +555,66 @@ pr_send(struct socket *so, int flags, struct mbuf *m0, struct sockaddr *a,
 		__CPROVER_assert(m->m_ext.ext_buf ==
 		    &g_data[pg->pindex * PAGE_SIZE],
 		    "mbuf maps the page it holds");
-		file_bytes(pg, m->m_data - m->m_ext.ext_buf, m->m_len);
+		file_bytes(pg, m->m_data - m->m_ext.ext_buf, m->m_len, how);
 	}
+}
+
+static int
+pr_send(struct socket *so, int flags, struct mbuf *m0, struct sockaddr *a,
+    struct mbuf *c, struct thread *td)
+{
+	__CPROVER_assert(m_length(m0, NULL) <= (u_int)g_room,
+	    "queues no more than the socket has room for");
 	/*
-	 * A chain queued not ready stays until pr_ready() readies it.
-	 * NO_READY_CHECK leaves that out: with a mapped mbuf per page it
-	 * makes proof_read six times slower.
+	 * A chain queued not ready takes its place in the stream now, and
+	 * can be delivered once pr_ready() readies it; until then it stays.
+	 * NO_READY_CHECK treats it as ready now: with a mapped mbuf per
+	 * page, holding it makes proof_read six times slower.
 	 */
 #ifndef NO_READY_CHECK
 	if ((flags & PRUS_NOTREADY) != 0) {
 		__CPROVER_assert(g_pending == NULL,
 		    "one chain not ready at a time");
+		deliver(m0, QUEUED);
 		g_pending = m0;
-	} else
+		return (0);
+	}
 #endif
-		m_freem(m0);
+	deliver(m0, QUEUED | READY);
+	m_freem(m0);
 	return (0);
 }
 
 /*
- * What sbready() expects: from m on, count not-ready pages, one per
- * mapped mbuf and m_epg_nrdy per unmapped one, every mbuf among them not
- * ready.  sendfile readies all the pages of a chain at once, so none of
- * it may be left not ready.
+ * Walk COUNT not-ready pages from M, one per mapped mbuf and m_epg_nrdy
+ * per unmapped one, as sbready() and mb_free_notready() do; the mbufs
+ * after them must all be ready.
+ */
+static void
+notready_pages(struct mbuf *m, int count)
+{
+	__CPROVER_assert(count > 0, "at least one page");
+	while (count > 0) {
+		__CPROVER_assert(m != NULL, "no more pages than queued");
+		__CPROVER_assert((m->m_flags & M_NOTREADY) != 0,
+		    "only mbufs queued not ready");
+		if ((m->m_flags & M_EXTPG) != 0 && m->m_epg_npgs != 0) {
+			__CPROVER_assert(count >= m->m_epg_nrdy,
+			    "every page of an unmapped mbuf");
+			count -= m->m_epg_nrdy;
+		} else
+			count--;
+		m = m->m_next;
+	}
+	for (; m != NULL; m = m->m_next)
+		__CPROVER_assert((m->m_flags & M_NOTREADY) == 0,
+		    "every page queued not ready is accounted for");
+}
+
+/*
+ * What sbready() expects: from m on, count not-ready pages.  sendfile
+ * readies all the pages of a chain at once.  The chain is then
+ * delivered.
  */
 static int
 pr_ready(struct socket *so, struct mbuf *m, int count)
@@ -508,32 +623,33 @@ pr_ready(struct socket *so, struct mbuf *m, int count)
 	return (0);
 #endif
 	__CPROVER_assert(g_pending != NULL, "readies a chain queued not ready");
-	__CPROVER_assert(count > 0, "readies at least one page");
-	while (count > 0) {
-		__CPROVER_assert(m != NULL, "readies no more pages than queued");
-		__CPROVER_assert((m->m_flags & M_NOTREADY) != 0,
-		    "readies only mbufs queued not ready");
-		if ((m->m_flags & M_EXTPG) != 0 && m->m_epg_npgs != 0) {
-			__CPROVER_assert(count >= m->m_epg_nrdy,
-			    "readies every page of an unmapped mbuf");
-			count -= m->m_epg_nrdy;
-		} else
-			count--;
-		m = m->m_next;
-	}
-	for (; m != NULL; m = m->m_next)
-		__CPROVER_assert((m->m_flags & M_NOTREADY) == 0,
-		    "every page queued not ready is readied");
+	notready_pages(m, count);
+	deliver(g_pending, READY);
 	m_freem(g_pending);
 	g_pending = NULL;
 	return (0);
 }
 
-/* Reached on an I/O error, which the pager model does not report. */
+/*
+ * On a failed read, sendfile_iodone() aborts the socket, which frees
+ * the ready mbufs, and frees the not-ready ones itself: none of the
+ * chain is delivered.
+ */
+void
+mb_free_notready(struct mbuf *m, int count)
+{
+	__CPROVER_assert(g_aborted, "frees not-ready mbufs on abort only");
+	__CPROVER_assert(g_pending != NULL, "frees a chain queued not ready");
+	notready_pages(m, count);
+	m_freem(g_pending);
+	g_pending = NULL;
+}
+
 static void
 pr_abort(struct socket *so)
 {
-	__CPROVER_assert(0, "model: pr_abort() on a read that cannot fail");
+	__CPROVER_assert(g_ioerror, "pr_abort() only on a failed read");
+	g_aborted = true;
 }
 
 int
@@ -770,6 +886,55 @@ proof_send_extpg(void)
 	mb_use_ext_pgs = true;
 	g_nowait_fails = false;
 	send(0);
+}
+
+/*
+ * proof_read with reads that fail, at once or through their completion,
+ * which may come after vn_sendfile() has returned.  sendfile.2: "[EIO]
+ * An error occurred while reading from fd"; when the read fails after
+ * the data was queued not ready, the call has returned already, and the
+ * socket is torn down with EIO instead (sendfile_iodone()).
+ */
+void
+proof_ioerror(void)
+{
+	struct uio hdr, trl;
+	bool has_hdr, has_trl;
+	off_t offset, sent, size;
+	size_t nbytes;
+	ssize_t hlen, tlen;
+	int error;
+
+	g_nowait_fails = false;
+	g_ioerror = true;
+	size = setup(&hdr, &trl, &has_hdr, &has_trl, false);
+	hlen = has_hdr ? hdr.uio_resid : 0;
+	tlen = has_trl ? trl.uio_resid : 0;
+	offset = nondet_off_t();
+	__CPROVER_assume(offset >= 0 && offset <= MAXFILE + 1);
+	nbytes = nondet_size_t();
+	g_file_next = offset;
+
+	error = vn_sendfile(&g_fp, 0, has_hdr ? &hdr : NULL,
+	    has_trl ? &trl : NULL, offset, nbytes, &sent, 0, &g_td);
+	io_flush();		/* the reads still in flight complete */
+	__CPROVER_assert(!g_syncerr || error == EIO,
+	    "a read failing at once fails sendfile(2) with EIO");
+	if (g_aborted) {
+		__CPROVER_assert(g_so.so_error == EIO,
+		    "a read failing later leaves EIO on the socket");
+		__CPROVER_assert(g_pending == NULL,
+		    "the data queued not ready is freed, not delivered");
+		return;
+	}
+	check_stream(error, sent, offset, nbytes, size, hlen, tlen);
+}
+
+void
+proof_ioerror_extpg(void)
+{
+	mb_use_ext_pgs = true;
+	proof_ioerror();
 }
 
 void

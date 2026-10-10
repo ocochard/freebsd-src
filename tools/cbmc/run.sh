@@ -72,7 +72,6 @@ restrict="vn_sendfile.function_pointer_call.1/sendfile_wait
 	vn_sendfile.function_pointer_call.3/pr_send
 	sendfile_iodone.function_pointer_call.1/pr_abort
 	sendfile_iodone.function_pointer_call.2/pr_ready
-	vm_pager_get_pages_async.function_pointer_call.1/sendfile_iodone
 	fo_sendfile.function_pointer_call.1/vn_sendfile"
 
 # A worker, which is this script run by xargs below: build and check job N
@@ -204,7 +203,7 @@ s="$top/sys/kern/kern_sendfile.c"
 # The file spans three pages and a byte, so a run can start inside one
 # page and end inside another; header and trailer up to 8 bytes.
 d="-DMAXFILE=(2*PAGE_SIZE+1) -DMAXHDR=8"
-u="setup.0:5,pr_send.0:4,pr_send.1:6,m_freem.0:4,m_length.0:4"
+u="setup.0:5,deliver.0:4,deliver.1:6,m_freem.0:4,m_length.0:4"
 u="$u,sigsetmasked.0:5,__sigisempty.0:5"
 # The page arithmetic, for runs up to two pages.
 ua="proof_xfsize.0:4,proof_fixspace.0:4,fixspace.0:4,fixspace.1:4"
@@ -247,8 +246,10 @@ fi
 #
 ul="vn_sendfile.11:4,sendfile_swapin.12:4,sendfile_swapin.0:4"
 ul="$ul,sendfile_swapin.5:4,sendfile_swapin.8:4,setup.0:5,sfio_malloc.0:6"
-ul="$ul,vm_page_grab_pages_unlocked.0:4,vm_pager_get_pages_async.0:4"
-ul="$ul,pr_send.0:6,pr_send.1:6,pr_ready.0:6,pr_ready.1:6"
+ul="$ul,vm_page_grab_pages_unlocked.0:4"
+ul="$ul,deliver.0:6,deliver.1:6,notready_pages.0:6,notready_pages.1:6"
+ul="$ul,io_complete.0:4,io_flush.0:3,sendfile_swapin.9:4,sendfile_swapin.10:4"
+ul="$ul,sendfile_swapin.11:4"
 ul="$ul,m_freem.0:6,m_length.0:6,fixspace.0:4,fixspace.1:4"
 ul="$ul,sigsetmasked.0:5,__sigisempty.0:5"
 for l in 0 1 2 3 4 5 6 7 9; do
@@ -320,6 +321,41 @@ if want sendfile; then
 	mutant sendfile_nodiskio_short "$h" "$s" proof_nodiskio "$dndio" \
 	    "vn_sendfile.14:2,$ul" \
 	    's/xfsize(i, sfio->npages, off, len)/xfsize(i, npages, off, len)/'
+fi
+
+#
+# sendfile(2) when reading the file fails: at once, the pager returning
+# the error, or later, through the read's completion, which may come
+# after vn_sendfile() has returned.  With mapped mbufs the not-ready
+# accounting makes these proofs too slow; they run with unmapped ones,
+# and the mapped one, which did not finish within an hour, with SLOW=1.
+#
+dlater="-DMAXFILE=PAGE_SIZE -DMAXHDR=4 -DMINSPACE=(PAGE_SIZE+6)"
+dlater="$dlater -DMAXSPACE=(2*PAGE_SIZE) -DIODEFER=1 -DMAXIO=1"
+
+if want sendfile; then
+	proof sendfile_ioerror_extpg "$h" "$s" proof_ioerror_extpg "$dread" \
+	    "vn_sendfile.14:2,$ul"
+	slow proof sendfile_ioerror_later_extpg "$h" "$s" proof_ioerror_extpg \
+	    "$dlater" "vn_sendfile.14:2,$ul"
+	slow proof sendfile_ioerror "$h" "$s" proof_ioerror "$dread" \
+	    "vn_sendfile.14:2,$ul"
+
+	# A read failing at once fails the call with EIO ...
+	mutant sendfile_ioerror_sync "$h" "$s" proof_ioerror_extpg "$dread" \
+	    "vn_sendfile.14:2,$ul" \
+	    '/sendfile_iowait(sfio, "sferrio");/,/return (EIO);/s/return (EIO);/return (0);/'
+	# ... one failing later leaves EIO on the socket ...
+	mutant sendfile_ioerror_soerror "$h" "$s" proof_ioerror_extpg \
+	    "$dread" "vn_sendfile.14:2,$ul" 's/so->so_error = EIO;/;/'
+	# ... after aborting it ...
+	mutant sendfile_ioerror_abort "$h" "$s" proof_ioerror_extpg "$dread" \
+	    "vn_sendfile.14:2,$ul" \
+	    's/so->so_proto->pr_abort(so);/if (0) so->so_proto->pr_abort(so);/'
+	# ... and freeing exactly the pages queued not ready.
+	mutant sendfile_ioerror_free "$h" "$s" proof_ioerror_extpg "$dread" \
+	    "vn_sendfile.14:2,$ul" \
+	    's/mb_free_notready(sfio->m, sfio->npages);/mb_free_notready(sfio->m, sfio->npages + 1);/'
 fi
 
 #

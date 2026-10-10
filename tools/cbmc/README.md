@@ -8,7 +8,7 @@ against the kernel's own source for every input within the bounds,
 not a sample of inputs as a test or a fuzzer would.
 
     pkg install cbmc
-    tools/cbmc/run.sh            # every proof, about 30 minutes
+    tools/cbmc/run.sh            # every proof, about 35 minutes
     SLOW=1 tools/cbmc/run.sh     # and the ones over half an hour
     tools/cbmc/run.sh sendfile   # one system call
 
@@ -31,6 +31,9 @@ not a sample of inputs as a test or a fuzzer would.
   is reported with the property that caught it.  A mutation whose
   `sed` no longer applies fails the run, because otherwise it would
   silently prove the unmutated file again.
+- A mutant never deletes an indirect call, it puts it under `if (0)`:
+  the function pointer restrictions name call sites by their rank in
+  the function, and deleting one shifts the others.
 - An "open question" is a proof of the manual's wording where it and
   the code disagree and nobody has yet said which one is right.  It is
   expected to fail, and does not fail the run.  There is none at the
@@ -95,6 +98,13 @@ Proven:
 - the file truncated or extended by another thread during the call,
   modelled as a new size, up to the bounds, each time `vn_sendfile()`
   takes the object lock to read it, over one and two iterations;
+- reads of the file that fail, at once (the pager returns the error,
+  after running the completion with it, as the vnode pager and ZFS do)
+  or later through the completion: a read failing at once fails the call
+  with EIO; one failing later tears the socket down with EIO, and the
+  pages queued not ready are freed, never delivered.  With unmapped
+  mbufs, in 6 minutes; with reads completing after the call returns, in
+  33 minutes (`SLOW=1`);
 - with the paging path, what `sbready()` expects of `pr_ready()`: the
   pages queued `M_NOTREADY`, counted one per mapped mbuf and
   `m_epg_nrdy` per unmapped one, are exactly those readied.  For mapped
@@ -161,6 +171,9 @@ Not proven yet:
 
 - KTLS (`KERN_TLS` is off in the build), and `SF_NOCACHE`, whose
   effect, the pages' release policy, the model does not observe.
-- An I/O error from the pager.  Truncation is modelled through the size
-  alone: the pages past the new end stay, as sendfile has them wired.
+- I/O errors with mapped mbufs: the proof did not finish within an
+  hour (`SLOW=1` runs it).  Page busy state is not modelled: a page left
+  busy, or unbusied twice, on the error paths would go unseen.
+- Truncation is modelled through the size alone: the pages past the new
+  end stay, as sendfile has them wired.
 - Shared memory objects (`DTYPE_SHM`) and `vn_getsize_locked()` objects.
