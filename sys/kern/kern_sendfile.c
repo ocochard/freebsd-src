@@ -47,6 +47,7 @@
 #include <sys/protosw.h>
 #include <sys/rwlock.h>
 #include <sys/sf_buf.h>
+#include <sys/signalvar.h>
 #include <sys/socket.h>
 #include <sys/socketvar.h>
 #include <sys/syscallsubr.h>
@@ -722,6 +723,26 @@ done:
 	return (error);
 }
 
+/*
+ * The error for a header or trailer write the socket cut short.
+ * sousrsend() clears EINTR, ERESTART and EWOULDBLOCK once some of the
+ * data went out, but sendfile(2) reports that not everything was sent.
+ * A pending signal interrupted the write; otherwise the socket is
+ * non-blocking or its send timeout expired.
+ */
+static int
+sendfile_short_write(struct thread *td)
+{
+	struct proc *p;
+	bool pending;
+
+	p = td->td_proc;
+	PROC_LOCK(p);
+	pending = SIGPENDING(td);
+	PROC_UNLOCK(p);
+	return (pending ? EINTR : EAGAIN);
+}
+
 int
 vn_sendfile(struct file *fp, int sockfd, struct uio *hdr_uio,
     struct uio *trl_uio, off_t offset, size_t nbytes, off_t *sent, int flags,
@@ -1219,15 +1240,20 @@ prepend_header:
 			error = kern_filewrite(td, sockfd, sock_fp, hdr_uio, 0,
 			    &cnt);
 			sbytes += cnt;
+			if (error == 0 && cnt != len)
+				error = sendfile_short_write(td);
 			/* Do not send trailers after a partial header. */
-			if (error != 0 || cnt != len)
+			if (error != 0)
 				goto out;
 		}
 		if (trl_uio != NULL) {
+			len = trl_uio->uio_resid;
 			error = kern_filewrite(td, sockfd, sock_fp, trl_uio, 0,
 			    &cnt);
 			/* A socket write counts what it sent, error or not. */
 			sbytes += cnt;
+			if (error == 0 && cnt != len)
+				error = sendfile_short_write(td);
 		}
 		goto out;
 	}
