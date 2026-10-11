@@ -10,6 +10,7 @@ not a sample of inputs as a test or a fuzzer would.
     pkg install cbmc
     tools/cbmc/run.sh            # every proof, about 70 minutes
     SLOW=1 tools/cbmc/run.sh     # and the ones over half an hour
+    ONLY=nocache tools/cbmc/run.sh   # the jobs whose name matches
     tools/cbmc/run.sh sendfile   # one system call
 
 ## Method
@@ -25,6 +26,12 @@ not a sample of inputs as a test or a fuzzer would.
   every `KASSERT()` is checked too.  It also defines
   `SAN_NEEDS_INTERCEPTORS`, as KCSAN builds do, so that atomics are
   calls to the model and not inline assembly cbmc cannot read.
+- `run.sh` schedules the jobs longest first, as many at once as fit in
+  70% of the memory, each counted at the peak it reached on the last
+  run plus a margin, or at `CBMC_MEM` until measured (`costs`, which
+  every run updates).  cbmc is
+  single-threaded and most jobs need a few gigabytes, where a single
+  limit for all had allowed 3 at once on a 64-core, 256 GB host.
 - `run.sh` runs two passes.  First, every proof must hold on the
   source as it is.  Second, every mutant must fail: a mutant is the
   source with one fix taken back or one check removed.  Each mutant
@@ -115,6 +122,16 @@ Proven:
   `ktls_enqueue()` included.  On the paging and I/O error paths, in
   software mode on one-page runs, in 22 and 27 minutes; the I/O error
   one needs 60 GB and runs with `SLOW=1 CBMC_MEM=61440`;
+- the wiring of the pages: every page the call wires is released
+  exactly once, through the kernel's own `sendfile_free_mext()` and
+  `sendfile_free_mext_pg()`, when its mbuf is freed.  Checked with
+  unmapped mbufs, on the cached KTLS socket and with `SF_NOCACHE`; with
+  mapped mbufs one release per page made each proof take over an hour,
+  so they leave it out;
+- `SF_NOCACHE`: every page sent is released to be freed
+  (`VPR_TRYFREE`), but the one the send stopped in when more of it is to
+  follow (`EXT_FLAG_CACHE_LAST` for unmapped mbufs), over one and two
+  iterations.  With mapped mbufs, 36 minutes, `SLOW=1`;
 - the busy state of the pages, on every path above, error paths
   included: every page the grab busies is unbusied exactly once, none
   is left busy when the call and its reads are done, no page is
@@ -187,8 +204,7 @@ manual says nothing of a file that changes size during the call:
 
 Not proven yet:
 
-- `SF_NOCACHE`, whose effect, the pages' release policy, the model
-  does not observe.  `ktls_frame()` and `ktls_enqueue()` themselves are
+- `ktls_frame()` and `ktls_enqueue()` themselves are
   modelled, not proven; the encryption completes at once.  A
   `kern.ipc.tls.maxlen` that is not a multiple of the page size is not
   explored: the KTLS buffer code asserts it is one.
