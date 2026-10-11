@@ -57,6 +57,9 @@
  *   proof_shm		proof_send, proof_read and proof_resize on a
  *   proof_shm_read	shared memory object (DTYPE_SHM)
  *   proof_shm_resize
+ *   proof_novnp	proof_send, proof_resize and a failing
+ *   proof_novnp_resize	VOP_GETATTR() on a vnode whose object is not a
+ *   proof_novnp_attrerr vnode pager's (tmpfs)
  *   proof_shm_lp	the same on a largepage shared memory object
  *   proof_shm_lp_resize
  *   proof_resize	proof_send with the file truncated or extended
@@ -149,6 +152,9 @@ static bool		g_resized;	/* and it did */
 static off_t		g_size_max;	/* the largest size it had */
 static bool		g_shm;		/* the file is a shared memory object */
 static bool		g_lp;		/* a largepage one */
+static bool		g_novnp;	/* a vnode whose object is no vnode pager's */
+static off_t		g_vsize;	/* its size, as VOP_GETATTR() reports it */
+static bool		g_attrerr;	/* VOP_GETATTR() may fail */
 static struct shmfd	g_shmfd;
 static bool		g_vlocked;	/* vn_sendfile() holds the vnode lock */
 static bool		g_rlocked;	/* and the shm range lock */
@@ -259,6 +265,10 @@ resize_point(void)
 		if (size != (off_t)g_shmfd.shm_size)
 			g_resized = true;
 		g_shmfd.shm_size = size;
+	} else if (g_novnp) {
+		if (size != g_vsize)
+			g_resized = true;
+		g_vsize = size;
 	} else {
 		if (size != g_obj.un_pager.vnp.vnp_size)
 			g_resized = true;
@@ -284,6 +294,39 @@ vnode_locked(struct vnode *vp)
 		resize_point();		/* just before it is taken */
 		g_vlocked = true;
 	}
+}
+
+/*
+ * A vnode whose object is not a vnode pager's, as tmpfs's: its size is
+ * the filesystem's, from VOP_GETATTR(), directly or through
+ * vn_getsize_locked().  With g_attrerr either may fail.
+ */
+static int
+getattr_size(struct vnode *vp, off_t *size)
+{
+	__CPROVER_assert(vp == &g_vnode, "asks the file's vnode");
+	__CPROVER_assert(g_vlocked, "asks with the vnode locked");
+	if (g_attrerr && nondet_bool())
+		return (EIO);
+	*size = g_vsize;
+	return (0);
+}
+
+int
+VOP_GETATTR_APV(const struct vop_vector *vop, struct vop_getattr_args *a)
+{
+	off_t size;
+	int error;
+
+	if ((error = getattr_size(a->a_vp, &size)) == 0)
+		a->a_vap->va_size = size;
+	return (error);
+}
+
+int
+vn_getsize_locked(struct vnode *vp, off_t *size, struct ucred *cred)
+{
+	return (getattr_size(vp, size));
 }
 
 /* The shm range lock, which a truncation takes exclusive. */
@@ -367,7 +410,7 @@ all_unbusied(void)
 		    g_tryfree[k] || (g_file_next / PAGE_SIZE == k &&
 		    g_file_next % PAGE_SIZE != 0 &&
 		    g_file_next < (g_shm ? (off_t)g_shmfd.shm_size :
-		    g_obj.un_pager.vnp.vnp_size)),
+		    g_novnp ? g_vsize : g_obj.un_pager.vnp.vnp_size)),
 		    "SF_NOCACHE frees every page but one the send stopped in");
 	}
 }
@@ -1104,6 +1147,11 @@ setup(struct uio *hdr, struct uio *trl, bool *has_hdr, bool *has_trl,
 		g_shmfd.shm_size = size;
 		g_obj.type = OBJT_SWAP;
 	}
+	if (g_novnp) {
+		/* tmpfs: a swap object, the size in the node. */
+		g_obj.type = OBJT_SWAP;
+		g_vsize = size;
+	}
 	if (g_lp) {
 		/*
 		 * A largepage object: physical, its pages allocated with it,
@@ -1468,6 +1516,34 @@ proof_shm_lp_resize(void)
 	g_release = true;
 	mb_use_ext_pgs = true;
 	proof_resize();
+}
+
+/*
+ * proof_send, proof_resize and a failing VOP_GETATTR() on a vnode whose
+ * object is not a vnode pager's (tmpfs).
+ */
+void
+proof_novnp(void)
+{
+	g_novnp = true;
+	g_nowait_fails = false;
+	send(0);
+}
+
+void
+proof_novnp_resize(void)
+{
+	g_novnp = true;
+	proof_resize();
+}
+
+void
+proof_novnp_attrerr(void)
+{
+	g_novnp = true;
+	g_attrerr = true;
+	g_nowait_fails = false;
+	send(0);
 }
 
 void

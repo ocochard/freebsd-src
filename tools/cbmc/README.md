@@ -110,6 +110,9 @@ Proven:
   the vnode lock; for a shared memory object, while it holds neither
   the object lock nor the range lock.  The grab must only take pages
   within the object's size;
+- vnodes whose object is not a vnode pager's (tmpfs): the size from
+  `vn_getsize_locked()` and `VOP_GETATTR()`, which may fail, the size
+  changing during the call, and the vnode unlocked on every error;
 - shared memory objects (`DTYPE_SHM`): the cached send, the paging
   path, and resizing; and largepage ones, whose pages are unmanaged and
   wired by the object, and whose size only grows: their release only
@@ -235,6 +238,5 @@ Not proven yet:
   grab that stops short (`SF_NODISKIO`).
 - Truncation is modelled through the size alone: the pages past the new
   end stay, as sendfile has them wired.
-- Vnodes whose object is not a vnode pager's (`vn_getsize_locked()`,
-  `VOP_GETATTR()`).  Largepage objects with mapped mbufs, and with
+- Largepage objects with mapped mbufs, and with
   `SF_NOCACHE`, which cannot free their unmanaged pages.
