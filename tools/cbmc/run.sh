@@ -382,6 +382,22 @@ if want sendfile; then
 	mutant sendfile_shm_lp_release "$h" "$s" proof_shm_lp "$dsend" \
 	    "vn_sendfile.14:2,$ul" \
 	    '/^sendfile_free_mext_pg/,/^}/s/vm_page_release(pg, flags);/vm_page_release(pg, flags); vm_page_release(pg, flags);/'
+	# A vnode whose object is not a vnode pager's (tmpfs): its size from
+	# VOP_GETATTR(), which may fail.
+	proof sendfile_novnp "$h" "$s" proof_novnp "$dsend" "vn_sendfile.14:2,$ul"
+	proof sendfile_novnp_resize "$h" "$s" proof_novnp_resize "$dsend" \
+	    "vn_sendfile.14:2,$ul"
+	proof sendfile_novnp_attrerr "$h" "$s" proof_novnp_attrerr "$dsend" \
+	    "vn_sendfile.14:2,$ul"
+	# A failing VOP_GETATTR() leaves the vnode unlocked ...
+	mutant sendfile_novnp_unlock "$h" "$s" proof_novnp_attrerr "$dsend" \
+	    "vn_sendfile.14:2,$ul" \
+	    '/error = VOP_GETATTR(vp, \&va, td->td_ucred);/,/goto done;/s/VOP_UNLOCK(vp);/;/'
+	# ... and the size it reports is the one used.  Ignoring a failing
+	# vn_getsize_locked() in sendfile_getobj() is no mutant: the loop
+	# reads the size again before it grabs a page, or fails.
+	mutant sendfile_novnp_size "$h" "$s" proof_novnp_resize "$dsend" \
+	    "vn_sendfile.14:2,$ul" 's/nobj_size = va.va_size;/nobj_size = obj_size;/'
 	# The file truncated or extended under the call.
 	proof sendfile_resize "$h" "$s" proof_resize "$dsend" \
 	    "vn_sendfile.14:2,$ul"

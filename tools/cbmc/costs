@@ -27,6 +27,12 @@ sendfile_nodiskio 141 4981
 sendfile_nodiskio_extpg 46 1331
 sendfile_nodiskio_short 153 4935
 sendfile_noloop 1 94
+sendfile_novnp 164 4975
+sendfile_novnp_attrerr 127 4027
+sendfile_novnp_getsize 162 4952
+sendfile_novnp_resize 222 4962
+sendfile_novnp_size 203 4985
+sendfile_novnp_unlock 118 4035
 sendfile_read_extpg 923 23244
 sendfile_read_tls 1284 31706
 sendfile_read_valid 29 1216
