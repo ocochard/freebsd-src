@@ -8,7 +8,7 @@ against the kernel's own source for every input within the bounds,
 not a sample of inputs as a test or a fuzzer would.
 
     pkg install cbmc
-    tools/cbmc/run.sh            # every proof, about 55 minutes
+    tools/cbmc/run.sh            # every proof, about 70 minutes
     SLOW=1 tools/cbmc/run.sh     # and the ones over half an hour
     tools/cbmc/run.sh sendfile   # one system call
 
@@ -105,6 +105,16 @@ Proven:
   pages queued not ready are freed, never delivered.  With unmapped
   mbufs, in 6 minutes; with reads completing after the call returns, in
   33 minutes (`SLOW=1`);
+- KTLS, built with `KERN_TLS`, in software, NIC and TOE modes, for any
+  page-aligned `max_frame_len` up to 16384: every record handed to
+  `ktls_frame()` meets what it asserts (unmapped, at most
+  `max_frame_len` bytes), the header is one such record, the pages
+  `ktls_enqueue()` encrypts are exactly those queued not ready, header
+  record included, and the socket and session references taken are
+  dropped once; the socket reference the read completion donates to
+  `ktls_enqueue()` included.  On the paging and I/O error paths, in
+  software mode on one-page runs, in 22 and 27 minutes; the I/O error
+  one needs 60 GB and runs with `SLOW=1 CBMC_MEM=61440`;
 - the busy state of the pages, on every path above, error paths
   included: every page the grab busies is unbusied exactly once, none
   is left busy when the call and its reads are done, no page is
@@ -177,8 +187,11 @@ manual says nothing of a file that changes size during the call:
 
 Not proven yet:
 
-- KTLS (`KERN_TLS` is off in the build), and `SF_NOCACHE`, whose
-  effect, the pages' release policy, the model does not observe.
+- `SF_NOCACHE`, whose effect, the pages' release policy, the model
+  does not observe.  `ktls_frame()` and `ktls_enqueue()` themselves are
+  modelled, not proven; the encryption completes at once.  A
+  `kern.ipc.tls.maxlen` that is not a multiple of the page size is not
+  explored: the KTLS buffer code asserts it is one.
 - I/O errors with mapped mbufs: the proof did not finish within an
   hour (`SLOW=1` runs it).  Busy state is tracked for this call's own
   pages only; another thread holding a page busy is modelled only as a
