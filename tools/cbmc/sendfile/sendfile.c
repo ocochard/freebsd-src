@@ -52,6 +52,8 @@
  *   proof_ioerror_tls	and TOE modes
  *   proof_ioerror	proof_read with reads that fail, at once or
  *			later, and complete after the call
+ *   proof_nocache	proof_send with SF_NOCACHE: every page wired is
+ *   proof_nocache_extpg released, freed unless the send stopped in it
  *   proof_resize	proof_send with the file truncated or extended
  *			during the call
  *   proof_nodiskio	the same with SF_NODISKIO, pages partly valid but
@@ -116,6 +118,16 @@ static struct file	g_fp;
  */
 static vm_page_t	g_pages[NPAGES];
 static bool		g_busy[NPAGES];	/* busied by this call */
+static bool		g_wired[NPAGES];	/* wired by this call, ever */
+static bool		g_tryfree[NPAGES];	/* last released with VPR_TRYFREE */
+static int		g_flags;		/* the call's flags */
+/*
+ * Page release through the mbufs' free routines, and the checks on it:
+ * on for unmapped mbufs, KTLS and SF_NOCACHE, off for mapped mbufs, where
+ * one release per page made each proof take over an hour.  A run-time
+ * flag, constant in each proof, so that cbmc prunes the code it guards.
+ */
+static bool		g_release;
 static struct vm_page	g_bogus;
 static char		g_data[NPAGES * PAGE_SIZE];	/* the pages' bytes */
 vm_page_t bogus_page = &g_bogus;
@@ -267,6 +279,23 @@ all_unbusied(void)
 	__CPROVER_assert(g_pending != NULL || g_tls.refcount == 1,
 	    "TLS session references balanced");
 #endif
+	if (g_pending != NULL || !g_release)
+		return;
+	for (int k = 0; k < NPAGES; k++) {
+		__CPROVER_assert(g_pages[k]->ref_count == 0,
+		    "every page wired is released");
+		/*
+		 * sendfile.2: with SF_NOCACHE "the data sent to socket will
+		 * not be cached ... and will be freed directly to the pool of
+		 * free pages".  vn_sendfile() keeps the page a send stopped
+		 * in, when more of it is to follow, for the next one.
+		 */
+		__CPROVER_assert((g_flags & SF_NOCACHE) == 0 || !g_wired[k] ||
+		    g_tryfree[k] || (g_file_next / PAGE_SIZE == k &&
+		    g_file_next % PAGE_SIZE != 0 &&
+		    g_file_next < g_obj.un_pager.vnp.vnp_size),
+		    "SF_NOCACHE frees every page but one the send stopped in");
+	}
 }
 
 /* VM model. */
@@ -290,8 +319,10 @@ vm_page_grab_pages_unlocked(vm_object_t object, vm_pindex_t pindex,
 		    "grabs no page it holds busy already");
 		g_busy[pindex + i] = true;
 		ma[i] = g_pages[pindex + i];
-		if ((allocflags & VM_ALLOC_WIRED) != 0)
+		if ((allocflags & VM_ALLOC_WIRED) != 0) {
 			ma[i]->ref_count++;
+			g_wired[pindex + i] = true;
+		}
 	}
 	return (grabbed);
 }
@@ -330,10 +361,23 @@ vm_page_unwire(vm_page_t m, uint8_t nqueue)
 	m->ref_count--;
 }
 
+/*
+ * A page sendfile_free_mext() or sendfile_free_mext_pg() releases when
+ * its mbuf is freed; the flags of the last release are kept.
+ */
 void
 vm_page_release(vm_page_t m, int flags)
 {
 	vm_page_unwire(m, PQ_INACTIVE);
+	g_tryfree[m->pindex] = (flags & VPR_TRYFREE) != 0;
+}
+
+vm_page_t
+PHYS_TO_VM_PAGE(vm_paddr_t pa)
+{
+	__CPROVER_assert(pa % PAGE_SIZE == 0 && pa / PAGE_SIZE >= 1 &&
+	    pa / PAGE_SIZE <= NPAGES, "a physical address of the file's");
+	return (g_pages[pa / PAGE_SIZE - 1]);
 }
 void vm_object_pip_add(vm_object_t object, short i) { }
 void vm_object_pip_wakeup(vm_object_t object) { }
@@ -518,6 +562,8 @@ m_length(struct mbuf *m0, struct mbuf **last)
 	return (len);
 }
 
+static bool is_hdr(struct mbuf *);
+
 void
 m_freem(struct mbuf *m)
 {
@@ -529,6 +575,21 @@ m_freem(struct mbuf *m)
 		if ((m->m_flags & M_EXTPG) != 0 && m->m_epg_tls != NULL)
 			ktls_free(m->m_epg_tls);
 #endif
+		/*
+		 * The pages of a page mbuf go back through the kernel's own
+		 * free routine, named rather than called through ext_free,
+		 * which would be one more indirect call to restrict.
+		 */
+		if (g_release && (m->m_flags & M_EXT) != 0 && !is_hdr(m)) {
+			if (m->m_ext.ext_free == sendfile_free_mext)
+				sendfile_free_mext(m);
+			else {
+				__CPROVER_assert(m->m_ext.ext_free ==
+				    sendfile_free_mext_pg,
+				    "a page mbuf frees through sendfile");
+				sendfile_free_mext_pg(m);
+			}
+		}
 		__CPROVER_deallocate(m);
 		m = n;
 	}
@@ -921,6 +982,7 @@ setup(struct uio *hdr, struct uio *trl, bool *has_hdr, bool *has_trl,
 	off_t size;
 
 	g_cached = cached;
+	g_release = g_release || mb_use_ext_pgs;
 	size = nondet_off_t();
 	__CPROVER_assume(size >= 0 && size <= MAXFILE);
 	for (int i = 0; i < NPAGES; i++) {
@@ -1075,6 +1137,7 @@ send(int flags)
 	nbytes = nondet_size_t();
 	g_file_next = offset;
 
+	g_flags = flags;
 	error = vn_sendfile(&g_fp, 0, has_hdr ? &hdr : NULL,
 	    has_trl ? &trl : NULL, offset, nbytes, &sent, flags, &g_td);
 	check_stream(error, sent, offset, nbytes, size, hlen, tlen);
@@ -1186,6 +1249,7 @@ proof_ioerror_extpg(void)
 void
 proof_send_tls(void)
 {
+	g_release = true;
 	g_nowait_fails = false;
 	send(0);
 }
@@ -1224,6 +1288,22 @@ proof_resize(void)
 	g_resize = true;
 	g_nowait_fails = false;
 	send(0);
+}
+
+/* proof_send with SF_NOCACHE, on mapped and on unmapped mbufs. */
+void
+proof_nocache(void)
+{
+	g_release = true;
+	g_nowait_fails = false;
+	send(SF_NOCACHE);
+}
+
+void
+proof_nocache_extpg(void)
+{
+	mb_use_ext_pgs = true;
+	proof_nocache();
 }
 
 void

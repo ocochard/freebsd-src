@@ -25,7 +25,9 @@
 # property, and with SAN_NEEDS_INTERCEPTORS, as KCSAN builds are, so that
 # atomics are calls to the model rather than inline assembly.
 #
-# Usage: run.sh [proof ...]	(default: every proof listed below)
+# Usage: run.sh [syscall ...]	(default: every one listed below)
+# ONLY=regex runs only the jobs whose name matches; SLOW=1 adds the ones
+# over half an hour.
 # Needs cbmc and goto-cc (pkg install cbmc).  JOBS sets the parallelism.
 
 set -eu
@@ -37,6 +39,7 @@ here="$top/tools/cbmc"
 # send loop proofs need most of it.  By default JOBS is the core count,
 # bounded so that every job at its limit still fits in half the memory.
 CBMC_MEM=${CBMC_MEM:-40960}
+[ -n "${JOBS:-}" ] && JOBS_SET=1
 if [ -z "${JOBS:-}" ]; then
 	JOBS=$(sysctl -n hw.ncpu 2>/dev/null || echo 1)
 	mem=$(($(sysctl -n hw.physmem 2>/dev/null || echo 0) / 1048576))
@@ -115,6 +118,17 @@ if [ "${1:-}" = "--job" ]; then
 	exit 0
 fi
 
+# A job under time(1): job N in WORK, its wall seconds and peak resident
+# megabytes left in N.cost for the scheduler.
+if [ "${1:-}" = "--timed" ]; then
+	work=$2
+	name=$(head -1 "$work/job.$3")
+	/usr/bin/time -l -o "$work/$name.time" sh "$0" --job "$work" "$3"
+	awk -v n="$name" '/ real /{t=$1} /maximum resident set size/{m=int($1/1024)}
+	    END{print n, int(t), m}' "$work/$name.time" >"$work/$name.cost"
+	exit 0
+fi
+
 work=$(mktemp -d "${TMPDIR:-/tmp}/kern-cbmc.XXXXXX")
 trap 'rm -rf "$work"' EXIT INT TERM
 
@@ -143,6 +157,10 @@ njobs=0
 # queue KIND NAME HARNESS SOURCE PROOF DEFS UNWINDSET
 queue()
 {
+	# ONLY: a regular expression the job's name must match.
+	if [ -n "${ONLY:-}" ] && ! echo "$2" | grep -qE "$ONLY"; then
+		return
+	fi
 	njobs=$((njobs + 1))
 	printf '%s\n' "$2" "$3" "$4" "$5" "$6" "$7" >"$work/job.$njobs"
 	echo "$1 $2" >>"$work/order"
@@ -158,6 +176,9 @@ proof()
 # applied has to have changed, and the proof has to fail on it.
 mutant()
 {
+	if [ -n "${ONLY:-}" ] && ! echo "$1" | grep -qE "$ONLY"; then
+		return
+	fi
 	dst="$work/$1.c"
 	sed -e "$7" "$3" >"$dst"
 	if cmp -s "$3" "$dst"; then
@@ -204,7 +225,7 @@ s="$top/sys/kern/kern_sendfile.c"
 # page and end inside another; header and trailer up to 8 bytes.
 d="-DMAXFILE=(2*PAGE_SIZE+1) -DMAXHDR=8"
 u="setup.0:5,deliver.0:4,deliver.1:6,m_freem.0:4,m_length.0:4"
-u="$u,sigsetmasked.0:5,__sigisempty.0:5,all_unbusied.0:6"
+u="$u,sigsetmasked.0:5,__sigisempty.0:5,all_unbusied.0:6,all_unbusied.1:6"
 # The page arithmetic, for runs up to two pages.
 ua="proof_xfsize.0:4,proof_fixspace.0:4,fixspace.0:4,fixspace.1:4"
 
@@ -250,7 +271,8 @@ ul="$ul,vm_page_grab_pages_unlocked.0:4"
 ul="$ul,deliver.0:6,deliver.1:6,notready_pages.0:6,all_ready.0:6"
 ul="$ul,ktls_frame.0:6,chain_payload.0:6,is_hdr.0:4"
 ul="$ul,io_complete.0:4,io_flush.0:3,sendfile_swapin.9:4,sendfile_swapin.10:4"
-ul="$ul,sendfile_swapin.11:4,unbusy.0:6,all_unbusied.0:6"
+ul="$ul,sendfile_swapin.11:4,unbusy.0:6,all_unbusied.0:6,all_unbusied.1:6"
+ul="$ul,sendfile_free_mext_pg.0:6,sendfile_free_mext_pg.1:6"
 ul="$ul,vm_pager_get_pages_async.0:4"
 ul="$ul,m_freem.0:6,m_length.0:6,fixspace.0:4,fixspace.1:4"
 ul="$ul,sigsetmasked.0:5,__sigisempty.0:5"
@@ -308,6 +330,34 @@ if want sendfile; then
 	slow mutant sendfile_read_notready "$h" "$s" proof_read "$dread" \
 	    "vn_sendfile.14:2,$ul" \
 	    's/^\([[:space:]]*\)m0->m_flags |= M_NOTREADY;$/\1;/'
+	# SF_NOCACHE: every page wired is released, and freed unless the
+	# send stopped in it with more of it to come.
+	# Releasing a mapped mbuf per page is costly: the one pass proof
+	# runs on runs of up to two pages, the two pass one with SLOW=1
+	# CBMC_MEM=61440.
+	slow proof sendfile_nocache "$h" "$s" proof_nocache "$dread" \
+	    "vn_sendfile.14:2,$ul"
+	slow proof sendfile_nocache_twice "$h" "$s" proof_nocache "$dtwo" \
+	    "vn_sendfile.14:3,$ul"
+	# A page sent is freed ...
+	mutant sendfile_nocache_noflag "$h" "$s" proof_nocache_extpg "$dsend" \
+	    "vn_sendfile.14:2,$ul" \
+	    '/if (flags \& SF_NOCACHE) {/{n;n;s/EXT_FLAG_NOCACHE;/0;/;}'
+	# ... unless the send stopped in it with more to come ...
+	mutant sendfile_nocache_cachelast "$h" "$s" proof_nocache_extpg \
+	    "$dsend" "vn_sendfile.14:2,$ul" \
+	    's/if ((npages - i <= max_pgs) \&\&/if (1 || (npages - i <= max_pgs) \&\&/'
+	# ... and every page wired is released.
+	mutant sendfile_nocache_leak "$h" "$s" proof_nocache_extpg "$dsend" \
+	    "vn_sendfile.14:2,$ul" \
+	    's/for (i = 0; i < m->m_epg_npgs; i++) {/for (i = 0; i < m->m_epg_npgs - 1; i++) {/'
+	# The same with mapped mbufs.
+	slow mutant sendfile_nocache_mapped "$h" "$s" proof_nocache "$dread" \
+	    "vn_sendfile.14:2,$ul" 's/if ((flags \& SF_NOCACHE) \&\&/if (0 \&\&/'
+	proof sendfile_nocache_extpg "$h" "$s" proof_nocache_extpg "$dsend" \
+	    "vn_sendfile.14:2,$ul"
+	proof sendfile_nocache_twice_extpg "$h" "$s" proof_nocache_extpg \
+	    "$dtwo" "vn_sendfile.14:3,$ul"
 	# The file truncated or extended under the call.
 	proof sendfile_resize "$h" "$s" proof_resize "$dsend" \
 	    "vn_sendfile.14:2,$ul"
@@ -473,8 +523,64 @@ fi
 
 [ "$njobs" -gt 0 ] || { echo "run.sh: nothing selected" >&2; exit 2; }
 
-# shellcheck disable=SC2016
-seq 1 "$njobs" | xargs -P "$JOBS" -I % sh "$0" --job "$work" %
+# Longest first, as many at once as fit in the memory budget, each job
+# counted at its measured peak and a margin, from the costs of the last
+# run (costs, beside this script), or at CBMC_MEM when it has none, so
+# that a job never measured cannot overcommit the host; JOBS still
+# bounds how many run at once.  cbmc is single-threaded and most proofs
+# need a few gigabytes, so this runs far more of them at once than one
+# limit for all would.
+costs="$here/costs"
+budget=$(( $(sysctl -n hw.physmem) / 1048576 * 7 / 10 ))
+[ -n "${JOBS_SET:-}" ] || JOBS=$(sysctl -n hw.ncpu)
+for i in $(seq 1 "$njobs"); do
+	n=$(head -1 "$work/job.$i")
+	awk -v n="$n" -v i="$i" -v def="$CBMC_MEM" '
+	    $1 == n { t = $2; m = int($3 * 13 / 10) + 512 }
+	    END { if (t == "") { t = 100000; m = def }
+		  if (m > def) m = def; print t, m, i }' "$costs" 2>/dev/null ||
+	    echo "100000 $CBMC_MEM $i"
+done | sort -rn >"$work/queue"
+used=0
+running=""
+while [ -s "$work/queue" ] || [ -n "$running" ]; do
+	# Reap the jobs done.
+	still=""
+	for r in $running; do
+		i=${r%%:*}
+		if [ -f "$work/$(head -1 "$work/job.$i").cost" ]; then
+			used=$((used - ${r#*:}))
+		else
+			still="$still $r"
+		fi
+	done
+	running=$still
+	# Start the longest job that fits, or any when nothing runs.
+	started=0
+	nrun=$(echo $running | wc -w)
+	while read -r t m i; do
+		if [ "$nrun" -lt "$JOBS" ] &&
+		    { [ $((used + m)) -le "$budget" ] || [ -z "$running" ]; }; then
+			sh "$0" --timed "$work" "$i" &
+			running="$running $i:$m"
+			used=$((used + m))
+			grep -v " $i\$" "$work/queue" >"$work/queue.new" || true
+			mv "$work/queue.new" "$work/queue"
+			started=1
+			break
+		fi
+	done <"$work/queue"
+	[ "$started" = 1 ] || sleep 2
+done
+wait
+
+# Keep the costs measured for the next run's schedule.
+cat "$work"/*.cost 2>/dev/null >"$work/costs.new" || true
+if [ -s "$work/costs.new" ]; then
+	{ cat "$work/costs.new"; [ -f "$costs" ] && cat "$costs"; } |
+	    awk '!seen[$1]++' | sort >"$work/costs.all"
+	cp "$work/costs.all" "$costs"
+fi
 
 while read -r kind name; do
 	case $kind in
