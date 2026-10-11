@@ -335,12 +335,19 @@ void _rw_runlock_cookie(volatile uintptr_t *c, const char *file,
     int line) { }
 void __rw_assert(const volatile uintptr_t *c, int what, const char *file,
     int line) { }
+/* CBMC_VN_LOCK_HOOK and CBMC_VN_UNLOCK_HOOK let a harness track the lock. */
 int _vn_lock(struct vnode *vp, int flags, const char *file, int line)
 {
+#ifdef CBMC_VN_LOCK_HOOK
+	CBMC_VN_LOCK_HOOK(vp);
+#endif
 	return (0);
 }
 int VOP_UNLOCK_APV(const struct vop_vector *vop, struct vop_unlock_args *a)
 {
+#ifdef CBMC_VN_UNLOCK_HOOK
+	CBMC_VN_UNLOCK_HOOK(a->a_vp);
+#endif
 	return (0);
 }
 int VOP_INOTIFY_APV(const struct vop_vector *vop, struct vop_inotify_args *a)
