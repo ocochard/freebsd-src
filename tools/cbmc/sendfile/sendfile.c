@@ -54,6 +54,9 @@
  *			later, and complete after the call
  *   proof_nocache	proof_send with SF_NOCACHE: every page wired is
  *   proof_nocache_extpg released, freed unless the send stopped in it
+ *   proof_shm		proof_send, proof_read and proof_resize on a
+ *   proof_shm_read	shared memory object (DTYPE_SHM)
+ *   proof_shm_resize
  *   proof_resize	proof_send with the file truncated or extended
  *			during the call
  *   proof_nodiskio	the same with SF_NODISKIO, pages partly valid but
@@ -82,6 +85,10 @@ static void *sfio_malloc(size_t, struct malloc_type *, int);
 #define	CBMC_MALLOC_HOOK	sfio_malloc
 static void resize(volatile uintptr_t *);
 #define	CBMC_RW_RLOCK_HOOK	resize
+static void vnode_locked(struct vnode *);
+static void vnode_unlocked(struct vnode *);
+#define	CBMC_VN_LOCK_HOOK	vnode_locked
+#define	CBMC_VN_UNLOCK_HOOK	vnode_unlocked
 static void unbusy(volatile u_int *);
 #define	CBMC_CMPSET_HOOK	unbusy
 #include "kern.h"
@@ -138,6 +145,10 @@ static bool		g_noio;		/* no page needs reading */
 static bool		g_resize;	/* the file size may change */
 static bool		g_resized;	/* and it did */
 static off_t		g_size_max;	/* the largest size it had */
+static bool		g_shm;		/* the file is a shared memory object */
+static struct shmfd	g_shmfd;
+static bool		g_vlocked;	/* vn_sendfile() holds the vnode lock */
+static bool		g_rlocked;	/* and the shm range lock */
 
 /* The socket. */
 static struct protosw	g_proto;
@@ -217,27 +228,82 @@ sfio_malloc(size_t size, struct malloc_type *type, int flags)
 }
 
 /*
- * proof_resize: another thread truncating or extending the file, which
- * changes the pager's size, vnp_size, under the object lock.  Each time
- * vn_sendfile() takes that lock to read the size, the size may have
- * changed to any length the bounds allow.  The pages stay as they were:
- * truncation would free the ones past the end, but sendfile has them
- * wired.
+ * proof_resize: another thread truncating or extending the file.  It can
+ * only do so where vn_sendfile() holds no lock that excludes it: for a
+ * vnode, truncation takes the vnode lock exclusive, so only while
+ * vn_sendfile() does not hold it shared; for a shared memory object,
+ * shm_dotruncate_locked() takes the shm range lock and the object lock,
+ * neither of which vn_sendfile() holds across its work, so anywhere it
+ * does not hold the object lock.  resize_point() marks those places: the
+ * size, and the object's size in pages, may have changed to any length
+ * the bounds allow.  The pages stay: those sendfile has wired would not
+ * go, and any others the model does not track.
  */
 static void
-resize(volatile uintptr_t *c)
+resize_point(void)
 {
 	off_t size;
 
-	if (!g_resize || c != &g_obj.lock.rw_lock || nondet_bool())
+	if (!g_resize || (!g_shm && g_vlocked) || (g_shm && g_rlocked) ||
+	    nondet_bool())
 		return;
 	size = nondet_off_t();
 	__CPROVER_assume(size >= 0 && size <= MAXFILE);
-	if (size != g_obj.un_pager.vnp.vnp_size)
-		g_resized = true;
-	g_obj.un_pager.vnp.vnp_size = size;
+	if (g_shm) {
+		if (size != (off_t)g_shmfd.shm_size)
+			g_resized = true;
+		g_shmfd.shm_size = size;
+	} else {
+		if (size != g_obj.un_pager.vnp.vnp_size)
+			g_resized = true;
+		g_obj.un_pager.vnp.vnp_size = size;
+	}
+	g_obj.size = OFF_TO_IDX(size + PAGE_MASK);
 	if (size > g_size_max)
 		g_size_max = size;
+}
+
+/* Taking the object lock: the size may have changed just before. */
+static void
+resize(volatile uintptr_t *c)
+{
+	if (c == &g_obj.lock.rw_lock)
+		resize_point();
+}
+
+static void
+vnode_locked(struct vnode *vp)
+{
+	if (vp == &g_vnode) {
+		resize_point();		/* just before it is taken */
+		g_vlocked = true;
+	}
+}
+
+/* The shm range lock, which a truncation takes exclusive. */
+void *
+rangelock_rlock(struct rangelock *lock, vm_ooffset_t start, vm_ooffset_t end)
+{
+	__CPROVER_assert(lock == &g_shmfd.shm_rl, "the object's range lock");
+	__CPROVER_assert(!g_rlocked, "range lock not taken twice");
+	resize_point();		/* just before it is taken */
+	g_rlocked = true;
+	return (&g_rlocked);
+}
+
+void
+rangelock_unlock(struct rangelock *lock, void *cookie)
+{
+	__CPROVER_assert(lock == &g_shmfd.shm_rl && cookie == &g_rlocked &&
+	    g_rlocked, "releases the range lock it holds");
+	g_rlocked = false;
+}
+
+static void
+vnode_unlocked(struct vnode *vp)
+{
+	if (vp == &g_vnode)
+		g_vlocked = false;
 }
 
 /*
@@ -273,6 +339,7 @@ all_unbusied(void)
 	for (int k = 0; k < NPAGES; k++)
 		__CPROVER_assert(!g_busy[k],
 		    "leaves no page busy");
+	__CPROVER_assert(!g_rlocked && !g_vlocked, "leaves the file unlocked");
 	__CPROVER_assert(g_pending != NULL || g_so.so_count == 1,
 	    "socket references balanced");
 #ifdef KERN_TLS
@@ -293,7 +360,8 @@ all_unbusied(void)
 		__CPROVER_assert((g_flags & SF_NOCACHE) == 0 || !g_wired[k] ||
 		    g_tryfree[k] || (g_file_next / PAGE_SIZE == k &&
 		    g_file_next % PAGE_SIZE != 0 &&
-		    g_file_next < g_obj.un_pager.vnp.vnp_size),
+		    g_file_next < (g_shm ? (off_t)g_shmfd.shm_size :
+		    g_obj.un_pager.vnp.vnp_size)),
 		    "SF_NOCACHE frees every page but one the send stopped in");
 	}
 }
@@ -307,6 +375,9 @@ vm_page_grab_pages_unlocked(vm_object_t object, vm_pindex_t pindex,
 	int grabbed;
 
 	__CPROVER_assert(object == &g_obj, "grabs from the file");
+	resize_point();		/* the grab takes no object lock first */
+	__CPROVER_assert(pindex + count <= g_obj.size,
+	    "grabs only pages within the object's size");
 	__CPROVER_assert(count >= 0 && pindex + count <= NPAGES,
 	    "grabs only pages of the file");
 	grabbed = count;
@@ -542,6 +613,7 @@ sendfile_wait(struct socket *so, off_t need, int *space)
 	*space = nondet_int();
 	__CPROVER_assume(*space >= MINSPACE && *space <= MAXSPACE);
 	g_room = *space;
+	resize_point();		/* waiting, vn_sendfile() holds no lock */
 	return (0);
 }
 
@@ -970,6 +1042,7 @@ kern_filewrite(struct thread *td, int fd, struct file *fp, struct uio *auio,
 static int
 vop_unlock(struct vop_unlock_args *ap)
 {
+	vnode_unlocked(ap->a_vp);
 	return (0);
 }
 
@@ -996,6 +1069,7 @@ setup(struct uio *hdr, struct uio *trl, bool *has_hdr, bool *has_trl,
 	g_obj.type = OBJT_VNODE;
 	g_obj.flags = 0;
 	g_obj.un_pager.vnp.vnp_size = size;
+	g_obj.size = OFF_TO_IDX(size + PAGE_MASK);
 	g_size_max = size;
 	g_vnode.v_type = VREG;
 	g_vnode.v_object = &g_obj;
@@ -1003,6 +1077,15 @@ setup(struct uio *hdr, struct uio *trl, bool *has_hdr, bool *has_trl,
 	g_vnode.v_op = &g_vop;
 	g_fp.f_type = DTYPE_VNODE;
 	g_fp.f_vnode = &g_vnode;
+	if (g_shm) {
+		/* A shared memory object: swap backed, its size in the shmfd. */
+		g_fp.f_type = DTYPE_SHM;
+		g_fp.f_vnode = NULL;
+		g_fp.f_data = &g_shmfd;
+		g_shmfd.shm_object = &g_obj;
+		g_shmfd.shm_size = size;
+		g_obj.type = OBJT_SWAP;
+	}
 
 	g_proto.pr_type = SOCK_STREAM;
 	g_proto.pr_protocol = IPPROTO_TCP;
@@ -1304,6 +1387,32 @@ proof_nocache_extpg(void)
 {
 	mb_use_ext_pgs = true;
 	proof_nocache();
+}
+
+/*
+ * proof_send, proof_read and proof_resize on a shared memory object
+ * (DTYPE_SHM), whose size vn_sendfile() reads once, from the shmfd.
+ */
+void
+proof_shm(void)
+{
+	g_shm = true;
+	g_nowait_fails = false;
+	send(0);
+}
+
+void
+proof_shm_read(void)
+{
+	g_shm = true;
+	proof_read();
+}
+
+void
+proof_shm_resize(void)
+{
+	g_shm = true;
+	proof_resize();
 }
 
 void

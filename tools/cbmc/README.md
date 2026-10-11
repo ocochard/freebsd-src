@@ -8,7 +8,7 @@ against the kernel's own source for every input within the bounds,
 not a sample of inputs as a test or a fuzzer would.
 
     pkg install cbmc
-    tools/cbmc/run.sh            # every proof, about 70 minutes
+    tools/cbmc/run.sh            # every proof, about 60 minutes
     SLOW=1 tools/cbmc/run.sh     # and the ones over half an hour
     ONLY=nocache tools/cbmc/run.sh   # the jobs whose name matches
     tools/cbmc/run.sh sendfile   # one system call
@@ -103,8 +103,13 @@ Proven:
   default for TCP on amd64), plus a six-page run that fills one unmapped
   mbuf (`MBUF_PEXT_MAX_PGS` is 5) and starts another;
 - the file truncated or extended by another thread during the call,
-  modelled as a new size, up to the bounds, each time `vn_sendfile()`
-  takes the object lock to read it, over one and two iterations;
+  over one and two iterations, wherever `vn_sendfile()` holds no lock
+  that keeps the truncation out: for a vnode, while it does not hold
+  the vnode lock; for a shared memory object, while it holds neither
+  the object lock nor the range lock.  The grab must only take pages
+  within the object's size;
+- shared memory objects (`DTYPE_SHM`): the cached send, the paging
+  path, and resizing;
 - reads of the file that fail, at once (the pager returns the error,
   after running the completion with it, as the vnode pager and ZFS do)
   or later through the completion: a read failing at once fails the call
@@ -202,6 +207,17 @@ manual says nothing of a file that changes size during the call:
   blocking `sendfile()` waits for room returns 0 without its trailer.
   The regression test is `trailer_after_truncation`.
 
+Found by the shared memory proofs, fixed on this branch, not yet
+reported:
+
+- `sendfile: Keep a shared memory object from shrinking under the
+  pages`: for a shared memory object `vn_sendfile()` read the size once
+  and held nothing that keeps `shm_dotruncate_locked()` out.  An object
+  truncated while sendfile waited for socket buffer space had its pages
+  past the new end grabbed again, outside the object's size, and sent
+  as zeros: a 1 MiB object truncated to 0 still sent 1 MiB, 960 KiB of
+  it zeros, on 16.0-CURRENT.  The regression test is `shm_truncation`.
+
 Not proven yet:
 
 - `ktls_frame()` and `ktls_enqueue()` themselves are
@@ -214,4 +230,5 @@ Not proven yet:
   grab that stops short (`SF_NODISKIO`).
 - Truncation is modelled through the size alone: the pages past the new
   end stay, as sendfile has them wired.
-- Shared memory objects (`DTYPE_SHM`) and `vn_getsize_locked()` objects.
+- Vnodes whose object is not a vnode pager's (`vn_getsize_locked()`,
+  `VOP_GETATTR()`), and largepage shared memory objects.

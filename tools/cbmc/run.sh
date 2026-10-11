@@ -358,6 +358,20 @@ if want sendfile; then
 	    "vn_sendfile.14:2,$ul"
 	proof sendfile_nocache_twice_extpg "$h" "$s" proof_nocache_extpg \
 	    "$dtwo" "vn_sendfile.14:3,$ul"
+	# A shared memory object (DTYPE_SHM), and one resized under the call.
+	proof sendfile_shm "$h" "$s" proof_shm "$dsend" "vn_sendfile.14:2,$ul"
+	proof sendfile_shm_read "$h" "$s" proof_shm_read \
+	    "$dread -DNO_READY_CHECK" "vn_sendfile.14:2,$ul"
+	proof sendfile_shm_resize "$h" "$s" proof_shm_resize "$dsend" \
+	    "vn_sendfile.14:2,$ul"
+	# The range lock keeps a truncation off the pages being grabbed ...
+	mutant sendfile_shm_rangelock "$h" "$s" proof_shm_resize "$dsend" \
+	    "vn_sendfile.14:2,$ul" \
+	    's/rl_cookie = rangelock_rlock(\&shmfd->shm_rl, off, OFF_MAX);/;/'
+	# ... and the size is read again under it.
+	mutant sendfile_shm_size "$h" "$s" proof_shm_resize "$dsend" \
+	    "vn_sendfile.14:2,$ul" 's/nobj_size = shmfd->shm_size;/nobj_size = obj_size;/'
+
 	# The file truncated or extended under the call.
 	proof sendfile_resize "$h" "$s" proof_resize "$dsend" \
 	    "vn_sendfile.14:2,$ul"
