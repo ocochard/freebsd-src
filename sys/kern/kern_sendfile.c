@@ -724,6 +724,22 @@ done:
 }
 
 /*
+ * Release the lock vn_sendfile() holds on the file while it checks its
+ * size and grabs its pages: the vnode lock, or a shared memory object's
+ * range lock.
+ */
+static void
+sendfile_unlock_file(struct vnode *vp, struct shmfd *shmfd, void **rl_cookie)
+{
+	if (vp != NULL)
+		VOP_UNLOCK(vp);
+	else if (*rl_cookie != NULL) {
+		rangelock_unlock(&shmfd->shm_rl, *rl_cookie);
+		*rl_cookie = NULL;
+	}
+}
+
+/*
  * The error for a header or trailer write the socket cut short.
  * sousrsend() clears EINTR, ERESTART and EWOULDBLOCK once some of the
  * data went out, but sendfile(2) reports that not everything was sent.
@@ -761,6 +777,7 @@ vn_sendfile(struct file *fp, int sockfd, struct uio *hdr_uio,
 	struct sf_buf *sf;
 	struct shmfd *shmfd;
 	struct vattr va;
+	void *rl_cookie;
 	off_t end, off, sbytes, rem, obj_size, nobj_size;
 	int error, ext_pgs_idx, hdrlen, max_pgs, softerr;
 #ifdef KERN_TLS
@@ -776,6 +793,7 @@ vn_sendfile(struct file *fp, int sockfd, struct uio *hdr_uio,
 #endif
 	hdrlen = sbytes = 0;
 	softerr = 0;
+	rl_cookie = NULL;
 	use_ext_pgs = false;
 
 	error = sendfile_getobj(td, fp, &obj, &vp, &shmfd, &obj_size);
@@ -892,27 +910,38 @@ vn_sendfile(struct file *fp, int sockfd, struct uio *hdr_uio,
 				}
 				nobj_size = va.va_size;
 			}
-			if (off >= nobj_size) {
-				VOP_UNLOCK(vp);
-				/*
-				 * The file shrank below the offset.  As when the
-				 * offset starts past the end of the file, send
-				 * what is left of the header and the trailers:
-				 * a header copied above goes out alone, as when
-				 * it fills the socket buffer, and the loop ends.
-				 */
-				if (mh == NULL)
-					break;
-				rem = 0;
-				space = 0;
-				sfio = NULL;
-				nios = 0;
-				goto prepend_header;
-			}
-			if (nobj_size != obj_size) {
-				obj_size = nobj_size;
-				rem = omin(end, obj_size) - off;
-			}
+		} else {
+			/*
+			 * Hold the range lock, as shm_read() does, from the
+			 * size check until the pages are wired: a truncation
+			 * takes it exclusive, and would otherwise shrink the
+			 * object under the pages being grabbed.
+			 */
+			rl_cookie = rangelock_rlock(&shmfd->shm_rl, off, OFF_MAX);
+			VM_OBJECT_RLOCK(obj);
+			nobj_size = shmfd->shm_size;
+			VM_OBJECT_RUNLOCK(obj);
+		}
+		if (off >= nobj_size) {
+			sendfile_unlock_file(vp, shmfd, &rl_cookie);
+			/*
+			 * The file shrank below the offset.  As when the offset
+			 * starts past the end of the file, send what is left of
+			 * the header and the trailers: a header copied above
+			 * goes out alone, as when it fills the socket buffer,
+			 * and the loop ends.
+			 */
+			if (mh == NULL)
+				break;
+			rem = 0;
+			space = 0;
+			sfio = NULL;
+			nios = 0;
+			goto prepend_header;
+		}
+		if (nobj_size != obj_size) {
+			obj_size = nobj_size;
+			rem = omin(end, obj_size) - off;
 		}
 
 		if (space > rem)
@@ -972,8 +1001,7 @@ vn_sendfile(struct file *fp, int sockfd, struct uio *hdr_uio,
 		error = sendfile_swapin(obj, sfio, &nios, off, space, rhpages,
 		    flags);
 		if (error != 0) {
-			if (vp != NULL)
-				VOP_UNLOCK(vp);
+			sendfile_unlock_file(vp, shmfd, &rl_cookie);
 			sendfile_iodone(sfio, NULL, 0, error);
 			goto done;
 		}
@@ -1134,8 +1162,7 @@ vn_sendfile(struct file *fp, int sockfd, struct uio *hdr_uio,
 			mtail = m0;
 		}
 
-		if (vp != NULL)
-			VOP_UNLOCK(vp);
+		sendfile_unlock_file(vp, shmfd, &rl_cookie);
 
 		/* Keep track of bytes processed. */
 		off += space;

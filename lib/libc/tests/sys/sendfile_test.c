@@ -1393,6 +1393,48 @@ ATF_TC_BODY(hdtr_short_nonblocking, tc)
 	(void)close(fd);
 }
 
+ATF_TC_WITHOUT_HEAD(shm_truncation);
+ATF_TC_BODY(shm_truncation, tc)
+{
+	static char block[1024 * 1024];
+	char buf[65536];
+	ssize_t n;
+	pid_t pid;
+	int error, fd, sv[2];
+
+	fd = shm_open(SHM_ANON, O_RDWR, 0600);
+	ATF_REQUIRE_MSG(fd != -1, "shm_open failed: %s", strerror(errno));
+	memset(block, 'x', sizeof(block));
+	ATF_REQUIRE(ftruncate(fd, sizeof(block)) == 0);
+	ATF_REQUIRE(pwrite(fd, block, sizeof(block), 0) == sizeof(block));
+	ATF_REQUIRE_MSG(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0,
+	    "socketpair failed: %s", strerror(errno));
+
+	/*
+	 * The peer truncates the object while sendfile waits for room in
+	 * the socket: nothing past the new end, which would read as zeros,
+	 * may follow.
+	 */
+	pid = atf_utils_fork();
+	if (pid == 0) {
+		(void)close(sv[0]);
+		sleep(1);
+		if (ftruncate(fd, 0) != 0)
+			_exit(2);
+		while ((n = read(sv[1], buf, sizeof(buf))) > 0)
+			if (memchr(buf, 0, n) != NULL)
+				_exit(1);
+		_exit(0);
+	}
+	(void)close(sv[1]);
+
+	error = sendfile(fd, sv[0], 0, 0, NULL, NULL, 0);
+	ATF_CHECK_EQ_MSG(error, 0, "sendfile failed: %s", strerror(errno));
+	(void)close(sv[0]);
+	atf_utils_wait(pid, 0, "", "");
+	(void)close(fd);
+}
+
 ATF_TP_ADD_TCS(tp)
 {
 
@@ -1435,6 +1477,7 @@ ATF_TP_ADD_TCS(tp)
 	ATF_TP_ADD_TC(tp, hdtr_without_file_data);
 	ATF_TP_ADD_TC(tp, trailer_after_truncation);
 	ATF_TP_ADD_TC(tp, hdtr_short_nonblocking);
+	ATF_TP_ADD_TC(tp, shm_truncation);
 
 	return (atf_no_error());
 }
