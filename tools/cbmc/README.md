@@ -46,6 +46,8 @@ not a sample of inputs as a test or a fuzzer would.
   expected to fail, and does not fail the run.  There is none at the
   moment.
 
+Bug reports, one per fix, ready to file: `reports/sendfile.md`.
+
 ## Model choices forced by cbmc 6.11
 
 Each of these was measured: without it, the proof did not finish or
@@ -109,7 +111,10 @@ Proven:
   the object lock nor the range lock.  The grab must only take pages
   within the object's size;
 - shared memory objects (`DTYPE_SHM`): the cached send, the paging
-  path, and resizing;
+  path, and resizing; and largepage ones, whose pages are unmanaged and
+  wired by the object, and whose size only grows: their release only
+  unwires them and never takes the object's own wiring, with unmapped
+  mbufs;
 - reads of the file that fail, at once (the pager returns the error,
   after running the completion with it, as the vnode pager and ZFS do)
   or later through the completion: a read failing at once fails the call
@@ -231,4 +236,5 @@ Not proven yet:
 - Truncation is modelled through the size alone: the pages past the new
   end stay, as sendfile has them wired.
 - Vnodes whose object is not a vnode pager's (`vn_getsize_locked()`,
-  `VOP_GETATTR()`), and largepage shared memory objects.
+  `VOP_GETATTR()`).  Largepage objects with mapped mbufs, and with
+  `SF_NOCACHE`, which cannot free their unmanaged pages.

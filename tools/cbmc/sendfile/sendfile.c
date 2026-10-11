@@ -57,6 +57,8 @@
  *   proof_shm		proof_send, proof_read and proof_resize on a
  *   proof_shm_read	shared memory object (DTYPE_SHM)
  *   proof_shm_resize
+ *   proof_shm_lp	the same on a largepage shared memory object
+ *   proof_shm_lp_resize
  *   proof_resize	proof_send with the file truncated or extended
  *			during the call
  *   proof_nodiskio	the same with SF_NODISKIO, pages partly valid but
@@ -146,6 +148,7 @@ static bool		g_resize;	/* the file size may change */
 static bool		g_resized;	/* and it did */
 static off_t		g_size_max;	/* the largest size it had */
 static bool		g_shm;		/* the file is a shared memory object */
+static bool		g_lp;		/* a largepage one */
 static struct shmfd	g_shmfd;
 static bool		g_vlocked;	/* vn_sendfile() holds the vnode lock */
 static bool		g_rlocked;	/* and the shm range lock */
@@ -249,6 +252,9 @@ resize_point(void)
 		return;
 	size = nondet_off_t();
 	__CPROVER_assume(size >= 0 && size <= MAXFILE);
+	/* shm_dotruncate_largepage() refuses to shrink (ENOTSUP). */
+	if (g_lp)
+		__CPROVER_assume(size >= (off_t)g_shmfd.shm_size);
 	if (g_shm) {
 		if (size != (off_t)g_shmfd.shm_size)
 			g_resized = true;
@@ -349,7 +355,7 @@ all_unbusied(void)
 	if (g_pending != NULL || !g_release)
 		return;
 	for (int k = 0; k < NPAGES; k++) {
-		__CPROVER_assert(g_pages[k]->ref_count == 0,
+		__CPROVER_assert(g_pages[k]->ref_count == (g_lp ? 1 : 0),
 		    "every page wired is released");
 		/*
 		 * sendfile.2: with SF_NOCACHE "the data sent to socket will
@@ -430,6 +436,12 @@ vm_page_unwire(vm_page_t m, uint8_t nqueue)
 {
 	__CPROVER_assert(m->ref_count > 0, "unwires a wired page");
 	m->ref_count--;
+	/*
+	 * vm_page_unwire() frees an unmanaged page whose last wiring goes:
+	 * a largepage object's pages hold the object's own.
+	 */
+	__CPROVER_assert((m->oflags & VPO_UNMANAGED) == 0 || m->ref_count > 0,
+	    "never frees a page its object still holds");
 }
 
 /*
@@ -439,6 +451,12 @@ vm_page_unwire(vm_page_t m, uint8_t nqueue)
 void
 vm_page_release(vm_page_t m, int flags)
 {
+	/* As vm_page_release(): an unmanaged page is only unwired. */
+	if ((m->oflags & VPO_UNMANAGED) != 0) {
+		vm_page_unwire(m, PQ_NONE);
+		g_tryfree[m->pindex] = false;
+		return;
+	}
 	vm_page_unwire(m, PQ_INACTIVE);
 	g_tryfree[m->pindex] = (flags & VPR_TRYFREE) != 0;
 }
@@ -1086,6 +1104,18 @@ setup(struct uio *hdr, struct uio *trl, bool *has_hdr, bool *has_trl,
 		g_shmfd.shm_size = size;
 		g_obj.type = OBJT_SWAP;
 	}
+	if (g_lp) {
+		/*
+		 * A largepage object: physical, its pages allocated with it,
+		 * zeroed and valid, unmanaged, each wired by the object.
+		 */
+		g_obj.type = OBJT_PHYS;
+		for (int i = 0; i < NPAGES; i++) {
+			g_pages[i]->oflags = VPO_UNMANAGED;
+			g_pages[i]->ref_count = 1;
+			g_pages[i]->valid = VM_PAGE_BITS_ALL;
+		}
+	}
 
 	g_proto.pr_type = SOCK_STREAM;
 	g_proto.pr_protocol = IPPROTO_TCP;
@@ -1412,6 +1442,31 @@ void
 proof_shm_resize(void)
 {
 	g_shm = true;
+	proof_resize();
+}
+
+/*
+ * proof_shm and proof_shm_resize on a largepage shared memory object,
+ * with unmapped mbufs and the release of the pages checked.
+ */
+void
+proof_shm_lp(void)
+{
+	g_shm = true;
+	g_lp = true;
+	g_release = true;
+	mb_use_ext_pgs = true;
+	g_nowait_fails = false;
+	send(0);
+}
+
+void
+proof_shm_lp_resize(void)
+{
+	g_shm = true;
+	g_lp = true;
+	g_release = true;
+	mb_use_ext_pgs = true;
 	proof_resize();
 }
 
