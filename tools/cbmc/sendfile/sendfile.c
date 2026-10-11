@@ -47,6 +47,9 @@
  *   proof_send_extpg	proof_send, proof_read and proof_nodiskio with
  *   proof_read_extpg	unmapped mbufs (mb_use_ext_pgs), what TCP uses
  *   proof_nodiskio_extpg on amd64
+ *   proof_send_tls	proof_send, proof_read and proof_ioerror on a
+ *   proof_read_tls	KTLS socket, built with KERN_TLS: software, NIC
+ *   proof_ioerror_tls	and TOE modes
  *   proof_ioerror	proof_read with reads that fail, at once or
  *			later, and complete after the call
  *   proof_resize	proof_send with the file truncated or extended
@@ -140,6 +143,11 @@ static int		g_room;		/* room the last wait reported */
 static int		g_waits;	/* send loop iterations so far */
 static struct uio	*g_hdr_uio;
 static struct mbuf	*g_pending;	/* chain queued not ready */
+#ifdef KERN_TLS
+static struct ktls_session g_tls;	/* the socket's TLS session */
+#endif
+static struct mbuf	*g_hdrm[MAXWAITS + 1];	/* header mbufs made */
+static int		g_nhdrm;
 static bool		g_ioerror;	/* reads may fail */
 static bool		g_aborted;	/* pr_abort() was called */
 static bool		g_syncerr;	/* a read failed at once */
@@ -243,13 +251,22 @@ unbusy(volatile u_int *p)
 	__CPROVER_assert(found, "unbusies a page of the file");
 }
 
-/* When the call is done, no page it busied is still busy. */
+/*
+ * When the call is done, no page it busied is still busy, and the
+ * references it took on the socket and the TLS session are dropped.
+ */
 static void
 all_unbusied(void)
 {
 	for (int k = 0; k < NPAGES; k++)
 		__CPROVER_assert(!g_busy[k],
 		    "leaves no page busy");
+	__CPROVER_assert(g_pending != NULL || g_so.so_count == 1,
+	    "socket references balanced");
+#ifdef KERN_TLS
+	__CPROVER_assert(g_pending != NULL || g_tls.refcount == 1,
+	    "TLS session references balanced");
+#endif
 }
 
 /* VM model. */
@@ -451,7 +468,12 @@ getsock(struct thread *td, int fd, const cap_rights_t *rightsp,
 int _fdrop(struct file *fp, struct thread *td) { return (0); }
 int soiolock(struct socket *so, struct sx *sx, int flags) { return (0); }
 void soiounlock(struct sx *sx) { }
-void sorele_locked(struct socket *so) { }
+/* Called on the last reference, which frees the socket: the fd has one. */
+void
+sorele_locked(struct socket *so)
+{
+	__CPROVER_assert(0, "never drops the socket's last reference");
+}
 int sbwait(struct socket *so, sb_which which) { return (0); }
 
 /* A blocking socket: each wait returns room for some bytes, no error. */
@@ -503,12 +525,21 @@ m_freem(struct mbuf *m)
 
 	while (m != NULL) {
 		n = m->m_next;
+#ifdef KERN_TLS
+		if ((m->m_flags & M_EXTPG) != 0 && m->m_epg_tls != NULL)
+			ktls_free(m->m_epg_tls);
+#endif
 		__CPROVER_deallocate(m);
 		m = n;
 	}
 }
 
-/* The header as an mbuf of the length copied, which it then leaves. */
+/*
+ * The header as one mbuf of the length copied, which it then leaves:
+ * unmapped with M_EXTPG, as a KTLS socket asks, holding no more than LSPACE
+ * (max_frame_len) bytes, mapped otherwise.  The header mbufs are told from
+ * the page mbufs by identity, kept in g_hdrm.
+ */
 struct mbuf *
 m_uiotombuf(struct uio *uio, int how, int len, int lspace, int flags)
 {
@@ -518,10 +549,38 @@ m_uiotombuf(struct uio *uio, int how, int len, int lspace, int flags)
 	n = uio->uio_resid;
 	if (len > 0 && len < n)
 		n = len;
-	m = m_get(how, MT_DATA);
+	if ((flags & M_EXTPG) != 0) {
+		__CPROVER_assert(lspace > 0 && n <= lspace,
+		    "model: header fits one record");
+		m = mb_alloc_ext_pgs(how, NULL, 0);
+		m->m_epg_npgs = howmany(n, PAGE_SIZE);
+		m->m_epg_last_len = n;
+		m->m_ext.ext_size = PAGE_SIZE;
+	} else
+		m = m_get(how, MT_DATA);
 	m->m_len = n;
 	uio->uio_resid -= n;
+	__CPROVER_assert(g_nhdrm <= MAXWAITS, "model: header mbufs bounded");
+	g_hdrm[g_nhdrm++] = m;
 	return (m);
+}
+
+static bool
+is_hdr(struct mbuf *m)
+{
+	for (int i = 0; i < g_nhdrm; i++)
+		if (g_hdrm[i] == m)
+			return (true);
+	return (false);
+}
+
+/* The payload of an mbuf, without the TLS header and trailer framing it. */
+static int
+payload(struct mbuf *m)
+{
+	if ((m->m_flags & M_EXTPG) != 0)
+		return (m->m_len - m->m_epg_hdrlen - m->m_epg_trllen);
+	return (m->m_len);
 }
 
 /*
@@ -565,15 +624,14 @@ deliver(struct mbuf *m0, int how)
 
 	for (m = m0; m != NULL; m = m->m_next) {
 		/*
-		 * Header mbufs are the ones m_uiotombuf() makes, with no
-		 * external storage; every page mbuf has some.  No flag marks
-		 * them: M_PROTO1 was tried, and it is M_NOTREADY.
+		 * Header mbufs are the ones m_uiotombuf() made.  No flag
+		 * marks them: M_PROTO1 was tried, and it is M_NOTREADY.
 		 */
-		if ((m->m_flags & M_EXT) == 0) {
+		if (is_hdr(m)) {
 			if ((how & QUEUED) != 0) {
 				__CPROVER_assert(g_phase == 0,
 				    "header bytes come before file bytes");
-				g_hdr_seen += m->m_len;
+				g_hdr_seen += payload(m);
 			}
 			continue;
 		}
@@ -602,8 +660,8 @@ deliver(struct mbuf *m0, int how)
 				sum += len;
 			}
 			__CPROVER_assert((how & QUEUED) == 0 ||
-			    sum == m->m_len,
-			    "unmapped mbuf length is its pages'");
+			    sum == payload(m),
+			    "unmapped mbuf length is its pages' and framing");
 			continue;
 		}
 		__CPROVER_assert(m->m_ext.ext_type == EXT_SFBUF,
@@ -617,10 +675,21 @@ deliver(struct mbuf *m0, int how)
 }
 
 static int
+chain_payload(struct mbuf *m0)
+{
+	int len;
+
+	len = 0;
+	for (struct mbuf *m = m0; m != NULL; m = m->m_next)
+		len += payload(m);
+	return (len);
+}
+
+static int
 pr_send(struct socket *so, int flags, struct mbuf *m0, struct sockaddr *a,
     struct mbuf *c, struct thread *td)
 {
-	__CPROVER_assert(m_length(m0, NULL) <= (u_int)g_room,
+	__CPROVER_assert(chain_payload(m0) <= g_room,
 	    "queues no more than the socket has room for");
 	/*
 	 * A chain queued not ready takes its place in the stream now, and
@@ -643,9 +712,8 @@ pr_send(struct socket *so, int flags, struct mbuf *m0, struct sockaddr *a,
 }
 
 /*
- * Walk COUNT not-ready pages from M, one per mapped mbuf and m_epg_nrdy
- * per unmapped one, as sbready() and mb_free_notready() do; the mbufs
- * after them must all be ready.
+ * COUNT not-ready pages from M, one per mapped mbuf and m_epg_nrdy per
+ * unmapped one, as sbready() and mb_free_notready() take them.
  */
 static void
 notready_pages(struct mbuf *m, int count)
@@ -663,9 +731,28 @@ notready_pages(struct mbuf *m, int count)
 			count--;
 		m = m->m_next;
 	}
-	for (; m != NULL; m = m->m_next)
-		__CPROVER_assert((m->m_flags & M_NOTREADY) == 0,
-		    "every page queued not ready is accounted for");
+}
+
+/*
+ * The COUNT pages are all the not-ready pages of the chain queued: none
+ * is left not ready, before M (a TLS header record) or after.
+ */
+static void
+all_ready(int count)
+{
+	int total;
+
+	total = 0;
+	for (struct mbuf *m = g_pending; m != NULL; m = m->m_next) {
+		if ((m->m_flags & M_NOTREADY) == 0)
+			continue;
+		if ((m->m_flags & M_EXTPG) != 0 && m->m_epg_npgs != 0)
+			total += m->m_epg_nrdy;
+		else
+			total++;
+	}
+	__CPROVER_assert(total == count,
+	    "every page queued not ready is accounted for");
 }
 
 /*
@@ -673,6 +760,68 @@ notready_pages(struct mbuf *m, int count)
  * readies all the pages of a chain at once.  The chain is then
  * delivered.
  */
+#ifdef KERN_TLS
+/*
+ * KTLS.  The session the socket holds, with one reference, the socket's.
+ * ktls_frame() is modelled by its preconditions, the KASSERT()s it makes
+ * of every mbuf it frames, and by its effects: the record header and
+ * trailer bytes, a session reference, and with software encryption the
+ * pages to encrypt, queued not ready.  ktls_enqueue() encrypts at once:
+ * it readies the pages, as sbready() does after encryption, and drops
+ * the socket reference sendfile donated to it.
+ */
+void
+ktls_frame(struct mbuf *top, struct ktls_session *tls, int *enq_cnt,
+    uint8_t record_type)
+{
+	struct mbuf *m;
+	int tls_len;
+
+	__CPROVER_assert(tls == &g_tls, "frames with the socket's session");
+	*enq_cnt = 0;
+	for (m = top; m != NULL; m = m->m_next) {
+		__CPROVER_assert(m->m_len > 0 &&
+		    m->m_len <= tls->params.max_frame_len,
+		    "a TLS record holds at most max_frame_len bytes");
+		__CPROVER_assert((m->m_flags & M_EXTPG) != 0,
+		    "a TLS record is an unmapped mbuf");
+		tls_len = m->m_len;
+		m->m_epg_tls = ktls_hold(tls);
+		m->m_epg_hdrlen = tls->params.tls_hlen;
+		m->m_epg_trllen = tls->params.tls_tlen;
+		m->m_len += m->m_epg_hdrlen + m->m_epg_trllen;
+		if (tls->mode == TCP_TLS_MODE_SW) {
+			m->m_flags |= M_NOTREADY;
+			m->m_epg_nrdy = tls_len == 0 ? 1 : m->m_epg_npgs;
+			*enq_cnt += m->m_epg_nrdy;
+		}
+	}
+}
+
+void
+ktls_enqueue(struct mbuf *m, struct socket *so, int page_count)
+{
+	__CPROVER_assert(g_tls.mode == TCP_TLS_MODE_SW,
+	    "only software TLS is encrypted by the host");
+	__CPROVER_assert(so == &g_so, "encrypts for the socket");
+	__CPROVER_assert(g_pending != NULL, "encrypts a chain queued not ready");
+	notready_pages(m, page_count);
+	all_ready(page_count);
+	deliver(g_pending, READY);
+	m_freem(g_pending);
+	g_pending = NULL;
+	__CPROVER_assert(g_so.so_count > 1,
+	    "the socket reference donated is not its last");
+	g_so.so_count--;
+}
+
+void
+ktls_destroy(struct ktls_session *tls)
+{
+	__CPROVER_assert(0, "the session is not freed while the socket has it");
+}
+#endif
+
 static int
 pr_ready(struct socket *so, struct mbuf *m, int count)
 {
@@ -681,6 +830,7 @@ pr_ready(struct socket *so, struct mbuf *m, int count)
 #endif
 	__CPROVER_assert(g_pending != NULL, "readies a chain queued not ready");
 	notready_pages(m, count);
+	all_ready(count);
 	deliver(g_pending, READY);
 	m_freem(g_pending);
 	g_pending = NULL;
@@ -697,7 +847,12 @@ mb_free_notready(struct mbuf *m, int count)
 {
 	__CPROVER_assert(g_aborted, "frees not-ready mbufs on abort only");
 	__CPROVER_assert(g_pending != NULL, "frees a chain queued not ready");
+	/*
+	 * It frees COUNT pages from M; pr_abort() frees the ready mbufs.
+	 * A not-ready mbuf outside those COUNT pages would be lost.
+	 */
 	notready_pages(m, count);
+	all_ready(count);
 	m_freem(g_pending);
 	g_pending = NULL;
 }
@@ -795,6 +950,36 @@ setup(struct uio *hdr, struct uio *trl, bool *has_hdr, bool *has_trl,
 	g_proto.pr_sendfile_wait = sendfile_wait;
 	g_so.so_type = SOCK_STREAM;
 	g_so.so_proto = &g_proto;
+	g_so.so_count = 1;
+#ifdef KERN_TLS
+	/*
+	 * A TLS 1.2 or 1.3 session: max_frame_len is min(16384,
+	 * kern.ipc.tls.maxlen), which the KTLS buffer code requires to be
+	 * a multiple of the page size; the header and trailer are what an
+	 * AEAD cipher adds.
+	 */
+	{
+		int pages = nondet_int();
+
+		__CPROVER_assume(pages >= 1 && pages <= 16384 / PAGE_SIZE);
+		g_tls.params.max_frame_len = pages * PAGE_SIZE;
+	}
+	g_tls.params.tls_hlen = nondet_int();
+	__CPROVER_assume(g_tls.params.tls_hlen >= 5 &&
+	    g_tls.params.tls_hlen <= 13);
+	g_tls.params.tls_tlen = nondet_int();
+	__CPROVER_assume(g_tls.params.tls_tlen >= 16 &&
+	    g_tls.params.tls_tlen <= 17);
+#ifdef TLS_MODE
+	g_tls.mode = TLS_MODE;		/* one mode, for the costlier proofs */
+#else
+	g_tls.mode = nondet_int();
+	__CPROVER_assume(g_tls.mode == TCP_TLS_MODE_SW ||
+	    g_tls.mode == TCP_TLS_MODE_IFNET || g_tls.mode == TCP_TLS_MODE_TOE);
+#endif
+	g_tls.refcount = 1;
+	g_so.so_snd.sb_tls_info = &g_tls;
+#endif
 	g_so.so_state = SS_ISCONNECTED;
 	g_sock_fp.f_type = DTYPE_SOCKET;
 	g_sock_fp.f_data = &g_so;
@@ -995,6 +1180,28 @@ proof_ioerror_extpg(void)
 	mb_use_ext_pgs = true;
 	proof_ioerror();
 }
+
+#ifdef KERN_TLS
+/* proof_send, proof_read and proof_ioerror on a KTLS socket. */
+void
+proof_send_tls(void)
+{
+	g_nowait_fails = false;
+	send(0);
+}
+
+void
+proof_read_tls(void)
+{
+	proof_read();
+}
+
+void
+proof_ioerror_tls(void)
+{
+	proof_ioerror();
+}
+#endif
 
 void
 proof_read_extpg(void)

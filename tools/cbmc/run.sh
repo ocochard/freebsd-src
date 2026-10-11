@@ -247,7 +247,8 @@ fi
 ul="vn_sendfile.11:4,sendfile_swapin.12:4,sendfile_swapin.0:4"
 ul="$ul,sendfile_swapin.5:4,sendfile_swapin.8:4,setup.0:5,sfio_malloc.0:6"
 ul="$ul,vm_page_grab_pages_unlocked.0:4"
-ul="$ul,deliver.0:6,deliver.1:6,notready_pages.0:6,notready_pages.1:6"
+ul="$ul,deliver.0:6,deliver.1:6,notready_pages.0:6,all_ready.0:6"
+ul="$ul,ktls_frame.0:6,chain_payload.0:6,is_hdr.0:4"
 ul="$ul,io_complete.0:4,io_flush.0:3,sendfile_swapin.9:4,sendfile_swapin.10:4"
 ul="$ul,sendfile_swapin.11:4,unbusy.0:6,all_unbusied.0:6"
 ul="$ul,vm_pager_get_pages_async.0:4"
@@ -375,6 +376,56 @@ if want sendfile; then
 	mutant sendfile_ioerror_free "$h" "$s" proof_ioerror_extpg "$dread" \
 	    "vn_sendfile.14:2,$ul" \
 	    's/mb_free_notready(sfio->m, sfio->npages);/mb_free_notready(sfio->m, sfio->npages + 1);/'
+fi
+
+#
+# sendfile(2) on a KTLS socket, built with KERN_TLS: software encryption,
+# NIC offload and TOE.  The paging and I/O error proofs, in software mode
+# on one page runs, take over 20 minutes each, their mutants too.
+#
+dtls="$dsend -DKERN_TLS"
+dtlsp="-DKERN_TLS -DTLS_MODE=TCP_TLS_MODE_SW -DMAXFILE=PAGE_SIZE -DMAXHDR=4"
+dtlsp="$dtlsp -DMINSPACE=(PAGE_SIZE+6) -DMAXSPACE=(2*PAGE_SIZE)"
+# A one page run's chain holds a header and a page mbuf: the model's walks
+# of it are bounded so, as each is inlined at every call site.
+utlsp=$(echo "$ul" | sed -E 's/(deliver\.[01]|notready_pages\.0|all_ready\.0|chain_payload\.0|ktls_frame\.0|m_freem\.0|m_length\.0|is_hdr\.0):[0-9]+/\1:3/g; s/sfio_malloc\.0:6/sfio_malloc.0:4/; s/setup\.0:5/setup.0:3/')
+
+if want sendfile; then
+	proof sendfile_send_tls "$h" "$s" proof_send_tls "$dtls" \
+	    "vn_sendfile.14:2,$ul"
+	proof sendfile_read_tls "$h" "$s" proof_read_tls "$dtlsp" \
+	    "vn_sendfile.14:2,$utlsp"
+	# Over 40G: SLOW=1 CBMC_MEM=61440 (proven so, in 27 minutes).
+	slow proof sendfile_ioerror_tls "$h" "$s" proof_ioerror_tls "$dtlsp" \
+	    "vn_sendfile.14:2,$utlsp"
+
+	# A record holds at most max_frame_len bytes ...
+	mutant sendfile_tls_maxpgs "$h" "$s" proof_send_tls "$dtls" \
+	    "vn_sendfile.14:2,$ul" \
+	    's/max_pgs = num_pages(tls->params.max_frame_len);/max_pgs = MBUF_PEXT_MAX_PGS;/'
+	# ... and the header is one, unmapped.
+	mutant sendfile_tls_header "$h" "$s" proof_send_tls "$dtls" \
+	    "vn_sendfile.14:2,$ul" \
+	    's/tls->params.max_frame_len, M_EXTPG);/0, 0);/'
+	# The socket reference ktls_enqueue() is given is taken first ...
+	mutant sendfile_tls_soref "$h" "$s" proof_send_tls "$dtls" \
+	    "vn_sendfile.14:2,$ul" \
+	    '/ktls_enqueue(m, so, tls_enq_cnt);/!{/soref(so);$/{N;/ktls_enqueue/s/soref(so);/;/;};}'
+	# ... and the session reference sendfile holds is dropped.
+	mutant sendfile_tls_free "$h" "$s" proof_send_tls "$dtls" \
+	    "vn_sendfile.14:2,$ul" \
+	    '/if (tls != NULL)$/{N;s/ktls_free(tls);/;/;}'
+	# The completion donates its socket reference to ktls_enqueue() ...
+	slow mutant sendfile_tls_ref "$h" "$s" proof_read_tls "$dtlsp" \
+	    "vn_sendfile.14:2,$utlsp" 's/goto out_with_ref;/;/'
+	# ... and encrypts the header record with the pages ...
+	slow mutant sendfile_tls_hdrm "$h" "$s" proof_read_tls "$dtlsp" \
+	    "vn_sendfile.14:2,$utlsp" \
+	    's/if (hdrlen != 0 \&\& tls != NULL \&\&/if (0 \&\& tls != NULL \&\&/'
+	# ... or, on a failed read, frees it with them.
+	slow mutant sendfile_tls_abortfree "$h" "$s" proof_ioerror_tls \
+	    "$dtlsp" "vn_sendfile.14:2,$utlsp" \
+	    '/so->so_error = EIO;/,/mb_free_notready/s/if (sfio->tls_m != NULL)/if (0)/'
 fi
 
 #
