@@ -272,7 +272,7 @@ ul="$ul,deliver.0:6,deliver.1:6,notready_pages.0:6,all_ready.0:6"
 ul="$ul,ktls_frame.0:6,chain_payload.0:6,is_hdr.0:4"
 ul="$ul,io_complete.0:4,io_flush.0:3,sendfile_swapin.9:4,sendfile_swapin.10:4"
 ul="$ul,sendfile_swapin.11:4,unbusy.0:6,all_unbusied.0:6,all_unbusied.1:6"
-ul="$ul,sendfile_free_mext_pg.0:6,sendfile_free_mext_pg.1:6"
+ul="$ul,sendfile_free_mext_pg.0:6,sendfile_free_mext_pg.1:6,setup.1:5"
 ul="$ul,vm_pager_get_pages_async.0:4"
 ul="$ul,m_freem.0:6,m_length.0:6,fixspace.0:4,fixspace.1:4"
 ul="$ul,sigsetmasked.0:5,__sigisempty.0:5"
@@ -372,6 +372,16 @@ if want sendfile; then
 	mutant sendfile_shm_size "$h" "$s" proof_shm_resize "$dsend" \
 	    "vn_sendfile.14:2,$ul" 's/nobj_size = shmfd->shm_size;/nobj_size = obj_size;/'
 
+	# A largepage shared memory object: unmanaged pages the object keeps
+	# wired, and a size that only grows.
+	proof sendfile_shm_lp "$h" "$s" proof_shm_lp "$dsend" \
+	    "vn_sendfile.14:2,$ul"
+	proof sendfile_shm_lp_resize "$h" "$s" proof_shm_lp_resize "$dsend" \
+	    "vn_sendfile.14:2,$ul"
+	# A page is released once: twice would free one the object holds.
+	mutant sendfile_shm_lp_release "$h" "$s" proof_shm_lp "$dsend" \
+	    "vn_sendfile.14:2,$ul" \
+	    '/^sendfile_free_mext_pg/,/^}/s/vm_page_release(pg, flags);/vm_page_release(pg, flags); vm_page_release(pg, flags);/'
 	# The file truncated or extended under the call.
 	proof sendfile_resize "$h" "$s" proof_resize "$dsend" \
 	    "vn_sendfile.14:2,$ul"
