@@ -110,6 +110,14 @@ Proven:
   the vnode lock; for a shared memory object, while it holds neither
   the object lock nor the range lock.  The grab must only take pages
   within the object's size;
+- truncation removing pages, as `vm_object_page_remove()` does: it
+  waits for busy pages, invalidates wired ones, frees the others.  What
+  is delivered is checked against what the pages hold, not their valid
+  bits, which an invalidation clears without changing the contents.
+  Over the cached resize proofs (a freed page is not grabbed again: a
+  cached file has no invalid page) and the paging one, where freed pages
+  are grabbed again afresh and the pages replaced with `bogus_page` are
+  looked up again after a truncation;
 - vnodes whose object is not a vnode pager's (tmpfs): the size from
   `vn_getsize_locked()` and `VOP_GETATTR()`, which may fail, the size
   changing during the call, and the vnode unlocked on every error;
@@ -236,7 +244,7 @@ Not proven yet:
   hour (`SLOW=1` runs it).  Busy state is tracked for this call's own
   pages only; another thread holding a page busy is modelled only as a
   grab that stops short (`SF_NODISKIO`).
-- Truncation is modelled through the size alone: the pages past the new
-  end stay, as sendfile has them wired.
+- The partial last page of a truncation, zeroed past the new end, is
+  not modelled.
 - Largepage objects with mapped mbufs, and with
   `SF_NOCACHE`, which cannot free their unmanaged pages.
