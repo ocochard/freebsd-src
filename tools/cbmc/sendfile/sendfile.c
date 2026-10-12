@@ -62,6 +62,8 @@
  *   proof_novnp_attrerr vnode pager's (tmpfs)
  *   proof_shm_lp	the same on a largepage shared memory object
  *   proof_shm_lp_resize
+ *   proof_shm_lp_mapped	the same with mapped mbufs
+ *   proof_shm_lp_mapped_resize
  *   proof_read_resize	proof_read, unmapped, with the file resized
  *   proof_resize_window proof_resize, truncated before transmission
  *   proof_resize	proof_send with the file truncated or extended
@@ -1653,6 +1655,26 @@ void
 proof_resize_window(void)
 {
 	g_window = true;
+	proof_resize();
+}
+
+/* proof_shm_lp and proof_shm_lp_resize with mapped mbufs. */
+void
+proof_shm_lp_mapped(void)
+{
+	g_shm = true;
+	g_lp = true;
+	g_release = true;
+	g_nowait_fails = false;
+	send(0);
+}
+
+void
+proof_shm_lp_mapped_resize(void)
+{
+	g_shm = true;
+	g_lp = true;
+	g_release = true;
 	proof_resize();
 }
 

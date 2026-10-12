@@ -55,6 +55,10 @@ sendfile_send_npages 225 7447
 sendfile_send_tls 370 4326
 sendfile_shm 258 6659
 sendfile_shm_lp 73 1300
+sendfile_shm_lp_mapped1 1227 25327
+sendfile_shm_lp_mapped2 3495 50727
+sendfile_shm_lp_mapped_release 2400 47461
+sendfile_shm_lp_mapped_resize 1411 25326
 sendfile_shm_lp_release 66 1357
 sendfile_shm_lp_resize 116 1339
 sendfile_shm_rangelock 313 7477
