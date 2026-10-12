@@ -59,7 +59,10 @@ A value of 0 indicates a stalled or absent fan.
 The IT8613E has no FAN1 input, so there is no
 .Va fan0 .
 .It Va vin0 , vin1 , vin2 , vin4 , vin5 , vin7
-Voltage input readings in millivolts.
+Voltage measured at the corresponding VIN pin, in millivolts.
+VIN0 to VIN5 are general-purpose ADC inputs: which rail each one
+monitors, and through which resistor divider, is decided by the board
+vendor, so the reported value is the pin voltage, not the rail voltage.
 Each ADC LSB represents 11 mV.
 .Va vin7
 .Pq VSB

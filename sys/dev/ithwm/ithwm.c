@@ -267,6 +267,7 @@ ithwm_attach(device_t dev)
 	int8_t		temp;
 	int		i;
 	char		name[8];
+	char		desc[64];
 
 	sc = device_get_softc(dev);
 
@@ -332,9 +333,15 @@ ithwm_attach(device_t dev)
 		if (ITHWM_VIN_ABSENT & (1 << i))
 			continue;
 		snprintf(name, sizeof(name), "vin%d", i);
+		if (ITHWM_VIN_SCALED & (1 << i))
+			snprintf(desc, sizeof(desc),
+			    "3VSB voltage in millivolts");
+		else
+			snprintf(desc, sizeof(desc), "Voltage at VIN%d pin in "
+			    "millivolts (rail is board-specific)", i);
 		SYSCTL_ADD_PROC(ctx, tree, OID_AUTO, name,
 		    CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_MPSAFE,
-		    sc, i, ithwm_sysctl_vin, "IU", "Voltage in millivolts");
+		    sc, i, ithwm_sysctl_vin, "IU", desc);
 	}
 	SYSCTL_ADD_PROC(ctx, tree, OID_AUTO, "vbat",
 	    CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_MPSAFE,
