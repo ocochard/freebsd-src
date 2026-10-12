@@ -5,7 +5,7 @@
  */
 
 /*
- * Driver for the hardware monitor logical device of ITE IT87xx SuperIO chips.
+ * Driver for the hardware monitor logical device of the ITE IT8613E SuperIO.
  * Exposes temperatures (deg C), fan speeds (RPM), and voltages (mV)
  * via sysctl under dev.ithwm.<unit>.
  *
@@ -15,7 +15,8 @@
  * locking; a per-device mutex serialises concurrent sysctl reads.
  *
  * References:
- *   - IT8613 datasheet (ITE Technology)
+ *   - Linux drivers/hwmon/it87.c and the out-of-tree frankcrawford/it87
+ *     driver (IT8613E feature set: 16-bit fans, five fans, 11 mV ADC)
  *   - sys/dev/itwd/itwd.c   (ITE SuperIO child driver template)
  *   - sys/dev/ncthwm/ncthwm.c (HWM-via-SuperIO pattern)
  */
@@ -52,24 +53,23 @@
 
 /* Logical register numbers (written to ADDR port) */
 
-/* Configuration / status */
-#define ITHWM_REG_CFG		0x00	/* bit 3: SMIOVT; bit 6: 16-bit tach */
-#define ITHWM_CFG_TACH16	0x08	/* 16-bit tachometer enable (bit 3)   */
-
-/* Fan tachometer - 8-bit legacy low bytes */
+/*
+ * Fan tachometers.  The IT8613E always runs its tachometers in 16-bit mode
+ * with a fixed divisor of 2: count = (high << 8) | low.
+ */
 #define ITHWM_REG_FAN1_L	0x0d
 #define ITHWM_REG_FAN2_L	0x0e
 #define ITHWM_REG_FAN3_L	0x0f
+#define ITHWM_REG_FAN4_L	0x80
+#define ITHWM_REG_FAN5_L	0x82
 
-/* Fan tachometer - 16-bit mode high bytes (pair with low regs above) */
 #define ITHWM_REG_FAN1_H	0x18
 #define ITHWM_REG_FAN2_H	0x19
 #define ITHWM_REG_FAN3_H	0x1a
+#define ITHWM_REG_FAN4_H	0x81
+#define ITHWM_REG_FAN5_H	0x83
 
-/* Fan divisor register (legacy 8-bit mode) */
-#define ITHWM_REG_FANDIV	0x0b
-
-/* Voltage ADC readings (raw, 1 LSB ~= 16 mV for most pins) */
+/* Voltage ADC readings (raw, 1 LSB = 11 mV on the IT8613E) */
 #define ITHWM_REG_VIN0		0x20
 #define ITHWM_REG_VIN1		0x21
 #define ITHWM_REG_VIN2		0x22
@@ -85,13 +85,22 @@
 #define ITHWM_REG_TEMP2		0x2a
 #define ITHWM_REG_TEMP3		0x2b
 
+/* Temperature register value reported when no sensor is connected */
+#define ITHWM_TEMP_NONE		(-128)
+
 /* RPM base clock for the IT87xx family */
 #define ITHWM_FAN_CLOCK		1350000
+#define ITHWM_FAN16_DIV		2
+
+/* ADC LSB in mV */
+#define ITHWM_ADC_LSB_MV	11
+
+#define ITHWM_DEVID_IT8613	0x8613
 
 /* 0 deg C in decikelvin - matches amdtemp(4) "IK" sysctl convention */
 #define ITHWM_ZERO_C_TO_K	2731
 
-#define ITHWM_NFANS		3
+#define ITHWM_NFANS		5
 #define ITHWM_NVINS		8	/* VIN0..VIN7; VBAT separate */
 #define ITHWM_NTEMPS		3
 
@@ -103,7 +112,6 @@ struct ithwm_softc {
 	struct resource	*io_res;
 	int		io_rid;
 	struct mtx	lock;
-	bool		tach16;		/* 16-bit tachometer mode active */
 };
 
 /* ------------------------------------------------------------------ */
@@ -153,11 +161,9 @@ ithwm_sysctl_temp(SYSCTL_HANDLER_ARGS)
 
 /*
  * Fan speed handler - returns RPM (unsigned int).
- * arg2 = 0..2 selects FAN1..FAN3.
+ * arg2 = 0..4 selects FAN1..FAN5.
  *
- * 16-bit mode: count = (high << 8) | low; RPM = clock / count.
- * 8-bit mode:  divisor from FANDIV; RPM = clock / (count * divisor).
- * count == 0 or 0xFF(FF) => stalled / not present => 0 RPM.
+ * RPM = clock / (count * 2); count 0 or 0xffff => stalled / absent => 0 RPM.
  */
 static int
 ithwm_sysctl_fan(SYSCTL_HANDLER_ARGS)
@@ -166,38 +172,28 @@ ithwm_sysctl_fan(SYSCTL_HANDLER_ARGS)
 	int		idx = arg2;
 	uint16_t	count;
 	unsigned int	rpm;
-	uint8_t		lo, hi, divbyte;
-	int		divisor;
 	const uint8_t lregs[ITHWM_NFANS] = {
-		ITHWM_REG_FAN1_L, ITHWM_REG_FAN2_L, ITHWM_REG_FAN3_L
+		ITHWM_REG_FAN1_L, ITHWM_REG_FAN2_L, ITHWM_REG_FAN3_L,
+		ITHWM_REG_FAN4_L, ITHWM_REG_FAN5_L
 	};
 	const uint8_t hregs[ITHWM_NFANS] = {
-		ITHWM_REG_FAN1_H, ITHWM_REG_FAN2_H, ITHWM_REG_FAN3_H
+		ITHWM_REG_FAN1_H, ITHWM_REG_FAN2_H, ITHWM_REG_FAN3_H,
+		ITHWM_REG_FAN4_H, ITHWM_REG_FAN5_H
 	};
-	/* Divisor bits: fan1=bits[1:0], fan2=bits[3:2], fan3=bits[5:4] */
-	const int divshift[ITHWM_NFANS] = { 0, 2, 4 };
 
 	KASSERT(idx >= 0 && idx < ITHWM_NFANS,
 	    ("%s: idx %d out of range", __func__, idx));
 
 	mtx_lock(&sc->lock);
-	lo = ithwm_readb(sc, lregs[idx]);
-	if (sc->tach16) {
-		hi    = ithwm_readb(sc, hregs[idx]);
-		count = ((uint16_t)hi << 8) | lo;
-		if (count == 0 || count == 0xffff)
-			rpm = 0;
-		else
-			rpm = ITHWM_FAN_CLOCK / count;
-	} else {
-		divbyte = ithwm_readb(sc, ITHWM_REG_FANDIV);
-		divisor = 1 << ((divbyte >> divshift[idx]) & 0x03);
-		if (lo == 0 || lo == 0xff)
-			rpm = 0;
-		else
-			rpm = ITHWM_FAN_CLOCK / ((unsigned int)lo * divisor);
-	}
+	count = ithwm_readb(sc, lregs[idx]);
+	count |= (uint16_t)ithwm_readb(sc, hregs[idx]) << 8;
 	mtx_unlock(&sc->lock);
+
+	if (count == 0 || count == 0xffff)
+		rpm = 0;
+	else
+		rpm = ITHWM_FAN_CLOCK /
+		    ((unsigned int)count * ITHWM_FAN16_DIV);
 
 	return (sysctl_handle_int(oidp, &rpm, 0, req));
 }
@@ -206,8 +202,9 @@ ithwm_sysctl_fan(SYSCTL_HANDLER_ARGS)
  * Voltage handler - returns millivolts (unsigned int).
  * arg2 = 0..ITHWM_NVINS selects VIN0..VIN7 then VBAT.
  *
- * Each ADC LSB ~= 16 mV.  On-board voltage dividers for higher rails
- * (e.g. +12 V) are board-specific; raw scaled mV is reported as-is.
+ * Each ADC LSB is 11 mV.  On-board voltage dividers for higher rails
+ * (e.g. +12 V) and the chip's internal scaling of some inputs are not
+ * applied; raw scaled mV is reported as-is.
  */
 static int
 ithwm_sysctl_vin(SYSCTL_HANDLER_ARGS)
@@ -229,7 +226,7 @@ ithwm_sysctl_vin(SYSCTL_HANDLER_ARGS)
 	raw = ithwm_readb(sc, regs[idx]);
 	mtx_unlock(&sc->lock);
 
-	mv = (unsigned int)raw * 16;
+	mv = (unsigned int)raw * ITHWM_ADC_LSB_MV;
 	return (sysctl_handle_int(oidp, &mv, 0, req));
 }
 
@@ -244,7 +241,9 @@ ithwm_probe(device_t dev)
 		return (ENXIO);
 	if (superio_get_type(dev) != SUPERIO_DEV_HWM)
 		return (ENXIO);
-	device_set_desc(dev, "ITE IT87xx Hardware Monitor");
+	if (superio_devid(dev) != ITHWM_DEVID_IT8613)
+		return (ENXIO);
+	device_set_desc(dev, "ITE IT8613E Hardware Monitor");
 	return (BUS_PROBE_DEFAULT);
 }
 
@@ -255,7 +254,7 @@ ithwm_attach(device_t dev)
 	struct sysctl_ctx_list *ctx;
 	struct sysctl_oid_list *tree;
 	uint16_t	iobase;
-	uint8_t		cfg;
+	int8_t		temp;
 	int		i;
 	char		name[8];
 
@@ -288,24 +287,19 @@ ithwm_attach(device_t dev)
 
 	mtx_init(&sc->lock, "ithwm", NULL, MTX_DEF);
 
-	/*
-	 * Detect 16-bit tachometer mode from the configuration register.
-	 * Read directly without ithwm_readb() since no concurrent access
-	 * is possible during attach.
-	 */
-	bus_write_1(sc->io_res, ITHWM_PORT_ADDR, ITHWM_REG_CFG);
-	cfg = bus_read_1(sc->io_res, ITHWM_PORT_DATA);
-	sc->tach16 = (cfg & ITHWM_CFG_TACH16) != 0;
-
 	if (bootverbose)
-		device_printf(dev, "iobase 0x%x cfg 0x%02x tach16=%d\n",
-		    iobase, cfg, sc->tach16);
+		device_printf(dev, "iobase 0x%x\n", iobase);
 
 	ctx = device_get_sysctl_ctx(dev);
 	tree = SYSCTL_CHILDREN(device_get_sysctl_tree(dev));
 
-	/* Temperatures: temp0, temp1, temp2 */
+	/* Temperatures: temp0, temp1, temp2; skip unconnected sensors */
 	for (i = 0; i < ITHWM_NTEMPS; i++) {
+		mtx_lock(&sc->lock);
+		temp = (int8_t)ithwm_readb(sc, ITHWM_REG_TEMP1 + i);
+		mtx_unlock(&sc->lock);
+		if (temp == ITHWM_TEMP_NONE)
+			continue;
 		snprintf(name, sizeof(name), "temp%d", i);
 		SYSCTL_ADD_PROC(ctx, tree, OID_AUTO, name,
 		    CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_MPSAFE,
@@ -313,7 +307,7 @@ ithwm_attach(device_t dev)
 		    "Temperature sensor");
 	}
 
-	/* Fan speeds: fan0, fan1, fan2 */
+	/* Fan speeds: fan0..fan4 */
 	for (i = 0; i < ITHWM_NFANS; i++) {
 		snprintf(name, sizeof(name), "fan%d", i);
 		SYSCTL_ADD_PROC(ctx, tree, OID_AUTO, name,

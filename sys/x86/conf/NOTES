@@ -613,9 +613,11 @@ device		itwd
 #
 # coretemp: on-die sensor on Intel Core and newer CPUs
 # amdtemp: on-die sensor on AMD K8/K10/K11 CPUs
+# ithwm: ITE IT8613E Super I/O hardware monitor
 #
 device		coretemp
 device		amdtemp
+device		ithwm
 
 #
 # CPU control pseudo-device. Provides access to MSRs, CPUID info and

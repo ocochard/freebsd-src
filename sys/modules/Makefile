@@ -197,6 +197,7 @@ SUBDIR=	\
 	${_iser} \
 	isp \
 	${_ispfw} \
+	${_ithwm} \
 	${_itwd} \
 	${_iwi} \
 	${_iwifw} \
@@ -769,6 +770,7 @@ _ftgpio=	ftgpio
 _ftwd=		ftwd
 _exca=		exca
 _io=		io
+_ithwm=		ithwm
 _itwd=		itwd
 _ix=		ix
 _ixv=		ixv

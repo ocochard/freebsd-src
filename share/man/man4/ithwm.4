@@ -3,12 +3,12 @@
 .\"
 .\" SPDX-License-Identifier: BSD-2-Clause
 .\"
-.Dd April 14, 2026
+.Dd October 12, 2026
 .Dt ITHWM 4
 .Os
 .Sh NAME
 .Nm ithwm
-.Nd hardware monitor driver for ITE IT87xx Super I/O chips
+.Nd hardware monitor driver for the ITE IT8613E Super I/O chip
 .Sh SYNOPSIS
 .Cd "device superio"
 .Cd "device ithwm"
@@ -16,7 +16,8 @@
 The
 .Nm
 driver exposes temperature sensors, fan speed counters, and voltage inputs
-from the hardware monitor logical device (LDN 4) of ITE IT87xx Super I/O chips
+from the hardware monitor logical device (LDN 4) of the ITE IT8613E
+Super I/O chip
 via
 .Xr sysctl 8 .
 .Pp
@@ -29,8 +30,6 @@ ithwm_load="YES"
 Register access uses the 8-byte I/O window provided by the
 .Xr superio 4
 bus via an index/data port pair.
-The driver auto-detects whether the chip operates in 16-bit or 8-bit
-tachometer mode from the hardware configuration register.
 .Sh HARDWARE
 The
 .Nm
@@ -47,19 +46,21 @@ variables are provided under
 .Va dev.ithwm.<unit> :
 .Bl -tag -width indent
 .It Va temp0 , temp1 , temp2
-Temperature sensor readings in degrees Celsius, reported using the
+Temperature sensor readings, reported using the
 .Dq IK
 (decikelvin) sysctl format as used by
 .Xr amdtemp 4
 and
 .Xr lm75 4 .
-.It Va fan0 , fan1 , fan2
+Sensors that read as not connected at attach time are not exposed.
+.It Va fan0 Ns .. Ns Va fan4
 Fan tachometer readings in RPM.
 A value of 0 indicates a stalled or absent fan.
 .It Va vin0 Ns .. Ns Va vin7
 Voltage input readings in millivolts.
-Each ADC LSB represents approximately 16 mV.
-On-board voltage dividers for higher-voltage rails are board-specific;
+Each ADC LSB represents 11 mV.
+On-board voltage dividers for higher-voltage rails are board-specific
+and internal scaling of some inputs is not applied;
 raw scaled millivolt values are reported.
 .It Va vbat
 Battery voltage in millivolts.
@@ -74,7 +75,7 @@ Battery voltage in millivolts.
 The
 .Nm
 driver first appeared in
-.Fx 15.0 .
+.Fx 16.0 .
 .Sh AUTHORS
 The
 .Nm
