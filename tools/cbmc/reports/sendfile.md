@@ -18,6 +18,11 @@ with the fix in a bhyve guest, the other cases unchanged.
 | 6 | short header/trailer write reported as success | `67d6e7e09420` | confirmed by the developer |
 | 7 | truncated shared memory object sent as zeros | `20c3302e9d29` | ready |
 
+Open question, no fix yet: data truncated after `sendfile()` queued it
+and before the socket transmitted it arrives part zeroed, part old (see
+`../README.md`, `sendfile_resize_window`); sendfile.2 says nothing of
+the file changing before transmission.
+
 The two manual page commits, `a5bf794ee696` (readahead wording) and
 `c602ed263a2b` (two more errors), were confirmed by the developer and
 need no report.

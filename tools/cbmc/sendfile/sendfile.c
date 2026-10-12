@@ -63,6 +63,7 @@
  *   proof_shm_lp	the same on a largepage shared memory object
  *   proof_shm_lp_resize
  *   proof_read_resize	proof_read, unmapped, with the file resized
+ *   proof_resize_window proof_resize, truncated before transmission
  *   proof_resize	proof_send with the file truncated or extended
  *			during the call
  *   proof_nodiskio	the same with SF_NODISKIO, pages partly valid but
@@ -138,6 +139,14 @@ static bool		g_busy[NPAGES];	/* busied by this call */
  */
 static vm_page_bits_t	g_content[NPAGES];
 static bool		g_removed[NPAGES];	/* freed by a truncation */
+/*
+ * Where in each page a truncation zeroed the bytes past the new end,
+ * PAGE_SIZE when it did not; set back when the file grows over them,
+ * since the file then reads those zeros.
+ */
+static int		g_zero_from[NPAGES];
+static bool		g_window;	/* a truncation between queueing and
+					   delivery, see proof_resize_window */
 static bool		g_wired[NPAGES];	/* wired by this call, ever */
 static bool		g_tryfree[NPAGES];	/* last released with VPR_TRYFREE */
 static int		g_flags;		/* the call's flags */
@@ -277,6 +286,23 @@ resize_point(void)
 	 */
 	for (int k = OFF_TO_IDX(size + PAGE_MASK); k < NPAGES; k++)
 		__CPROVER_assume(!g_busy[k]);
+	/*
+	 * The last page, when the new end falls inside it and the page is
+	 * resident, is zeroed past it, as vnode_pager_setsize() and
+	 * shm_partial_page_invalidate() do, waiting while it is busy.
+	 */
+	if ((size & PAGE_MASK) != 0 && OFF_TO_IDX(size) < g_obj.size &&
+	    !g_removed[OFF_TO_IDX(size)]) {
+		__CPROVER_assume(!g_busy[OFF_TO_IDX(size)]);
+		if ((size & PAGE_MASK) < g_zero_from[OFF_TO_IDX(size)])
+			g_zero_from[OFF_TO_IDX(size)] = size & PAGE_MASK;
+	}
+	/* Grown over zeroed bytes, the file reads them. */
+	for (int k = 0; k < NPAGES; k++)
+		if (IDX_TO_OFF(k) + g_zero_from[k] < size &&
+		    size > (g_shm ? (off_t)g_shmfd.shm_size : g_novnp ?
+		    g_vsize : g_obj.un_pager.vnp.vnp_size))
+			g_zero_from[k] = PAGE_SIZE;
 	for (int k = OFF_TO_IDX(size + PAGE_MASK); k < NPAGES; k++) {
 		if (k >= (int)g_obj.size)
 			continue;	/* not in the object before either */
@@ -476,6 +502,7 @@ vm_page_grab_pages_unlocked(vm_object_t object, vm_pindex_t pindex,
 			m->phys_addr = (vm_paddr_t)(pindex + i + 1) * PAGE_SIZE;
 			g_pages[pindex + i] = m;
 			g_content[pindex + i] = 0;
+			g_zero_from[pindex + i] = PAGE_SIZE;
 			g_removed[pindex + i] = false;
 		}
 		__CPROVER_assert(!g_busy[pindex + i],
@@ -849,6 +876,8 @@ file_bytes(vm_page_t pg, size_t inpage, int len, int how)
 		__CPROVER_assert((g_content[pg->pindex] &
 		    page_bits(inpage, len)) == page_bits(inpage, len),
 		    "only file bytes read from the file are sent");
+		__CPROVER_assert(inpage + len <= (size_t)g_zero_from[pg->pindex],
+		    "sends no byte a truncation zeroed");
 		__CPROVER_assert(!g_busy[pg->pindex],
 		    "delivers no page still busy");
 	}
@@ -947,7 +976,15 @@ pr_send(struct socket *so, int flags, struct mbuf *m0, struct sockaddr *a,
 		return (0);
 	}
 #endif
-	deliver(m0, QUEUED | READY);
+	/*
+	 * proof_resize_window: the socket transmits later, from the pages
+	 * themselves, sendfile being zero-copy; vn_sendfile() holds no lock
+	 * on the file by then, and a truncation may come first.
+	 */
+	deliver(m0, QUEUED);
+	if (g_window)
+		resize_point();
+	deliver(m0, READY);
 	m_freem(m0);
 	return (0);
 }
@@ -1174,6 +1211,7 @@ setup(struct uio *hdr, struct uio *trl, bool *has_hdr, bool *has_trl,
 		g_pages[i]->valid = cached ? VM_PAGE_BITS_ALL :
 		    nondet_vm_page_bits_t();
 		g_content[i] = g_pages[i]->valid;
+		g_zero_from[i] = PAGE_SIZE;
 	}
 	g_obj.type = OBJT_VNODE;
 	g_obj.flags = 0;
@@ -1605,6 +1643,17 @@ proof_read_resize(void)
 	g_resize = true;
 	mb_use_ext_pgs = true;
 	proof_read();
+}
+
+/*
+ * proof_resize with a truncation possible between queueing and the
+ * socket's transmission, which sendfile.2 says nothing of.
+ */
+void
+proof_resize_window(void)
+{
+	g_window = true;
+	proof_resize();
 }
 
 void
