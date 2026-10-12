@@ -53,17 +53,22 @@ Temperature sensor readings, reported using the
 and
 .Xr lm75 4 .
 Sensors that read as not connected at attach time are not exposed.
-.It Va fan0 Ns .. Ns Va fan4
+.It Va fan1 Ns .. Ns Va fan4
 Fan tachometer readings in RPM.
 A value of 0 indicates a stalled or absent fan.
-.It Va vin0 Ns .. Ns Va vin7
+The IT8613E has no FAN1 input, so there is no
+.Va fan0 .
+.It Va vin0 , vin1 , vin2 , vin4 , vin5 , vin7
 Voltage input readings in millivolts.
 Each ADC LSB represents 11 mV.
+.Va vin7
+.Pq VSB
+is scaled down by an internal divider; the driver doubles its LSB.
 On-board voltage dividers for higher-voltage rails are board-specific
-and internal scaling of some inputs is not applied;
-raw scaled millivolt values are reported.
+and not applied.
+The IT8613E has no VIN3 or VIN6 input.
 .It Va vbat
-Battery voltage in millivolts.
+Battery voltage in millivolts, with the internal divider applied.
 .El
 .Sh SEE ALSO
 .Xr amdtemp 4 ,

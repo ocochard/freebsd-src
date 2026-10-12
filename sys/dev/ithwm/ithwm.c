@@ -92,8 +92,16 @@
 #define ITHWM_FAN_CLOCK		1350000
 #define ITHWM_FAN16_DIV		2
 
-/* ADC LSB in mV */
+/*
+ * ADC LSB in mV.  VIN7 (VSB) and VBAT are internal inputs halved by an
+ * on-chip divider, so their LSB is doubled.
+ */
 #define ITHWM_ADC_LSB_MV	11
+#define ITHWM_VIN_SCALED	((1 << 7) | (1 << ITHWM_NVINS))
+
+/* Inputs not bonded out on the IT8613E: FAN1, VIN3 and VIN6 */
+#define ITHWM_FAN_ABSENT	(1 << 0)
+#define ITHWM_VIN_ABSENT	((1 << 3) | (1 << 6))
 
 #define ITHWM_DEVID_IT8613	0x8613
 
@@ -202,9 +210,9 @@ ithwm_sysctl_fan(SYSCTL_HANDLER_ARGS)
  * Voltage handler - returns millivolts (unsigned int).
  * arg2 = 0..ITHWM_NVINS selects VIN0..VIN7 then VBAT.
  *
- * Each ADC LSB is 11 mV.  On-board voltage dividers for higher rails
- * (e.g. +12 V) and the chip's internal scaling of some inputs are not
- * applied; raw scaled mV is reported as-is.
+ * Each ADC LSB is 11 mV (22 mV for the internally scaled VIN7 and VBAT).
+ * On-board voltage dividers for higher rails (e.g. +12 V) are
+ * board-specific and not applied.
  */
 static int
 ithwm_sysctl_vin(SYSCTL_HANDLER_ARGS)
@@ -227,6 +235,8 @@ ithwm_sysctl_vin(SYSCTL_HANDLER_ARGS)
 	mtx_unlock(&sc->lock);
 
 	mv = (unsigned int)raw * ITHWM_ADC_LSB_MV;
+	if (ITHWM_VIN_SCALED & (1 << idx))
+		mv *= 2;
 	return (sysctl_handle_int(oidp, &mv, 0, req));
 }
 
@@ -307,16 +317,20 @@ ithwm_attach(device_t dev)
 		    "Temperature sensor");
 	}
 
-	/* Fan speeds: fan0..fan4 */
+	/* Fan speeds: fan1..fan4 */
 	for (i = 0; i < ITHWM_NFANS; i++) {
+		if (ITHWM_FAN_ABSENT & (1 << i))
+			continue;
 		snprintf(name, sizeof(name), "fan%d", i);
 		SYSCTL_ADD_PROC(ctx, tree, OID_AUTO, name,
 		    CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_MPSAFE,
 		    sc, i, ithwm_sysctl_fan, "IU", "Fan speed in RPM");
 	}
 
-	/* Voltages: vin0..vin7, vbat */
+	/* Voltages: vin0..vin7 except absent inputs, vbat */
 	for (i = 0; i < ITHWM_NVINS; i++) {
+		if (ITHWM_VIN_ABSENT & (1 << i))
+			continue;
 		snprintf(name, sizeof(name), "vin%d", i);
 		SYSCTL_ADD_PROC(ctx, tree, OID_AUTO, name,
 		    CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_MPSAFE,
