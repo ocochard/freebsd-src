@@ -3,7 +3,7 @@
 .\"
 .\" SPDX-License-Identifier: BSD-2-Clause
 .\"
-.Dd October 12, 2026
+.Dd October 13, 2026
 .Dt ITHWM 4
 .Os
 .Sh NAME
@@ -72,6 +72,12 @@ and not applied.
 The IT8613E has no VIN3 or VIN6 input.
 .It Va vbat
 Battery voltage in millivolts, with the internal divider applied.
+.It Va avcc3
+The chip's own 3.3 V supply
+.Pq AVCC3
+in millivolts, with the internal divider applied.
+It should read close to 3300 and serves as a check that the scaling of the
+internally divided inputs is correct.
 .El
 .Sh SEE ALSO
 .Xr amdtemp 4 ,

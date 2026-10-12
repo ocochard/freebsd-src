@@ -79,6 +79,7 @@
 #define ITHWM_REG_VIN6		0x26
 #define ITHWM_REG_VIN7		0x27
 #define ITHWM_REG_VBAT		0x28
+#define ITHWM_REG_AVCC3		0x2f
 
 /* Temperature readings (signed 8-bit, deg C) */
 #define ITHWM_REG_TEMP1		0x29
@@ -93,11 +94,13 @@
 #define ITHWM_FAN16_DIV		2
 
 /*
- * ADC LSB in mV.  VIN7 (VSB) and VBAT are internal inputs halved by an
- * on-chip divider, so their LSB is doubled.
+ * ADC LSB in mV.  VIN7 (VSB), VBAT and AVCC3 are halved by an on-chip
+ * divider, so their LSB is doubled.  AVCC3 is the chip's own 3.3 V supply
+ * and serves as a check of the scaling.
  */
 #define ITHWM_ADC_LSB_MV	11
-#define ITHWM_VIN_SCALED	((1 << 7) | (1 << ITHWM_NVINS))
+#define ITHWM_VIN_SCALED	\
+	((1 << 7) | (1 << ITHWM_VIN_VBAT) | (1 << ITHWM_VIN_AVCC3))
 
 /* Inputs not bonded out on the IT8613E: FAN1, VIN3 and VIN6 */
 #define ITHWM_FAN_ABSENT	(1 << 0)
@@ -109,7 +112,9 @@
 #define ITHWM_ZERO_C_TO_K	2731
 
 #define ITHWM_NFANS		5
-#define ITHWM_NVINS		8	/* VIN0..VIN7; VBAT separate */
+#define ITHWM_NVINS		8	/* VIN0..VIN7; VBAT, AVCC3 separate */
+#define ITHWM_VIN_VBAT		ITHWM_NVINS
+#define ITHWM_VIN_AVCC3		(ITHWM_NVINS + 1)
 #define ITHWM_NTEMPS		3
 
 /* ------------------------------------------------------------------ */
@@ -208,9 +213,9 @@ ithwm_sysctl_fan(SYSCTL_HANDLER_ARGS)
 
 /*
  * Voltage handler - returns millivolts (unsigned int).
- * arg2 = 0..ITHWM_NVINS selects VIN0..VIN7 then VBAT.
+ * arg2 = 0..7 selects VIN0..VIN7, then ITHWM_VIN_VBAT, ITHWM_VIN_AVCC3.
  *
- * Each ADC LSB is 11 mV (22 mV for the internally scaled VIN7 and VBAT).
+ * Each ADC LSB is 11 mV (22 mV for the internally scaled inputs).
  * On-board voltage dividers for higher rails (e.g. +12 V) are
  * board-specific and not applied.
  */
@@ -221,13 +226,14 @@ ithwm_sysctl_vin(SYSCTL_HANDLER_ARGS)
 	int		idx = arg2;
 	unsigned int	mv;
 	uint8_t		raw;
-	const uint8_t regs[ITHWM_NVINS + 1] = {
+	const uint8_t regs[ITHWM_VIN_AVCC3 + 1] = {
 		ITHWM_REG_VIN0, ITHWM_REG_VIN1, ITHWM_REG_VIN2,
 		ITHWM_REG_VIN3, ITHWM_REG_VIN4, ITHWM_REG_VIN5,
-		ITHWM_REG_VIN6, ITHWM_REG_VIN7, ITHWM_REG_VBAT
+		ITHWM_REG_VIN6, ITHWM_REG_VIN7, ITHWM_REG_VBAT,
+		ITHWM_REG_AVCC3
 	};
 
-	KASSERT(idx >= 0 && idx <= ITHWM_NVINS,
+	KASSERT(idx >= 0 && idx <= ITHWM_VIN_AVCC3,
 	    ("%s: idx %d out of range", __func__, idx));
 
 	mtx_lock(&sc->lock);
@@ -328,14 +334,14 @@ ithwm_attach(device_t dev)
 		    sc, i, ithwm_sysctl_fan, "IU", "Fan speed in RPM");
 	}
 
-	/* Voltages: vin0..vin7 except absent inputs, vbat */
+	/* Voltages: vin0..vin7 except absent inputs, vbat, avcc3 */
 	for (i = 0; i < ITHWM_NVINS; i++) {
 		if (ITHWM_VIN_ABSENT & (1 << i))
 			continue;
 		snprintf(name, sizeof(name), "vin%d", i);
 		if (ITHWM_VIN_SCALED & (1 << i))
-			snprintf(desc, sizeof(desc),
-			    "3VSB voltage in millivolts");
+			snprintf(desc, sizeof(desc), "VIN7 (VSB) voltage "
+			    "in millivolts, internally halved");
 		else
 			snprintf(desc, sizeof(desc), "Voltage at VIN%d pin in "
 			    "millivolts (rail is board-specific)", i);
@@ -345,8 +351,12 @@ ithwm_attach(device_t dev)
 	}
 	SYSCTL_ADD_PROC(ctx, tree, OID_AUTO, "vbat",
 	    CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_MPSAFE,
-	    sc, ITHWM_NVINS, ithwm_sysctl_vin, "IU",
+	    sc, ITHWM_VIN_VBAT, ithwm_sysctl_vin, "IU",
 	    "Battery voltage in millivolts");
+	SYSCTL_ADD_PROC(ctx, tree, OID_AUTO, "avcc3",
+	    CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_MPSAFE,
+	    sc, ITHWM_VIN_AVCC3, ithwm_sysctl_vin, "IU",
+	    "Chip 3.3 V supply (AVCC3) in millivolts");
 
 	return (0);
 }
