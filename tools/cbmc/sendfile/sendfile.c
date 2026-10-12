@@ -62,6 +62,7 @@
  *   proof_novnp_attrerr vnode pager's (tmpfs)
  *   proof_shm_lp	the same on a largepage shared memory object
  *   proof_shm_lp_resize
+ *   proof_read_resize	proof_read, unmapped, with the file resized
  *   proof_resize	proof_send with the file truncated or extended
  *			during the call
  *   proof_nodiskio	the same with SF_NODISKIO, pages partly valid but
@@ -130,6 +131,13 @@ static struct file	g_fp;
  */
 static vm_page_t	g_pages[NPAGES];
 static bool		g_busy[NPAGES];	/* busied by this call */
+/*
+ * The bytes of each page that hold the file's data, read or zero-filled:
+ * unlike the valid bits, a truncation invalidating a wired page leaves
+ * them, the page's contents being unchanged.
+ */
+static vm_page_bits_t	g_content[NPAGES];
+static bool		g_removed[NPAGES];	/* freed by a truncation */
 static bool		g_wired[NPAGES];	/* wired by this call, ever */
 static bool		g_tryfree[NPAGES];	/* last released with VPR_TRYFREE */
 static int		g_flags;		/* the call's flags */
@@ -261,6 +269,25 @@ resize_point(void)
 	/* shm_dotruncate_largepage() refuses to shrink (ENOTSUP). */
 	if (g_lp)
 		__CPROVER_assume(size >= (off_t)g_shmfd.shm_size);
+	/*
+	 * A shrinking truncation removes the pages past the new end, as
+	 * vm_object_page_remove() does: it waits for a busy page, so none
+	 * may be busy here; a wired one stays, invalidated, its contents
+	 * unchanged; any other is freed.
+	 */
+	for (int k = OFF_TO_IDX(size + PAGE_MASK); k < NPAGES; k++)
+		__CPROVER_assume(!g_busy[k]);
+	for (int k = OFF_TO_IDX(size + PAGE_MASK); k < NPAGES; k++) {
+		if (k >= (int)g_obj.size)
+			continue;	/* not in the object before either */
+		if (g_pages[k]->ref_count > 0)
+			g_pages[k]->valid = 0;
+		else {
+			/* Freed, and its bytes no longer the file's. */
+			g_removed[k] = true;
+			g_content[k] = 0;
+		}
+	}
 	if (g_shm) {
 		if (size != (off_t)g_shmfd.shm_size)
 			g_resized = true;
@@ -435,6 +462,22 @@ vm_page_grab_pages_unlocked(vm_object_t object, vm_pindex_t pindex,
 		__CPROVER_assume(grabbed >= 0 && grabbed <= count);
 	}
 	for (int i = 0; i < grabbed; i++) {
+		/*
+		 * A page a truncation freed is allocated afresh, invalid: a
+		 * cached file has none, so proof_read_resize covers this.
+		 */
+		if (g_removed[pindex + i]) {
+			__CPROVER_assume(!g_cached);
+			vm_page_t m = __CPROVER_allocate(sizeof(struct vm_page),
+			    1);
+
+			m->pindex = pindex + i;
+			m->object = &g_obj;
+			m->phys_addr = (vm_paddr_t)(pindex + i + 1) * PAGE_SIZE;
+			g_pages[pindex + i] = m;
+			g_content[pindex + i] = 0;
+			g_removed[pindex + i] = false;
+		}
 		__CPROVER_assert(!g_busy[pindex + i],
 		    "grabs no page it holds busy already");
 		g_busy[pindex + i] = true;
@@ -469,6 +512,7 @@ void
 vm_page_valid(vm_page_t m)
 {
 	m->valid = VM_PAGE_BITS_ALL;
+	g_content[m->pindex] = VM_PAGE_BITS_ALL;	/* zero-filled */
 }
 
 void pmap_zero_page(vm_page_t m) { }
@@ -520,7 +564,7 @@ vm_page_t
 vm_page_relookup(vm_object_t object, vm_pindex_t pindex)
 {
 	__CPROVER_assert(pindex < NPAGES, "relookup of a page of the file");
-	return (g_pages[pindex]);
+	return (g_removed[pindex] ? NULL : g_pages[pindex]);
 }
 
 /*
@@ -571,7 +615,10 @@ io_complete(void *arg, vm_page_t *m, int count, int error)
 	if (error == 0)
 		for (int i = 0; i < count; i++)
 			if (m[i] != bogus_page)
+			{
 				m[i]->valid = VM_PAGE_BITS_ALL;
+				g_content[m[i]->pindex] = VM_PAGE_BITS_ALL;
+			}
 	sendfile_iodone(arg, m, count, error);
 }
 
@@ -799,8 +846,8 @@ file_bytes(vm_page_t pg, size_t inpage, int len, int how)
 		g_file_seen += len;
 	}
 	if ((how & READY) != 0) {
-		__CPROVER_assert((pg->valid & page_bits(inpage, len)) ==
-		    page_bits(inpage, len),
+		__CPROVER_assert((g_content[pg->pindex] &
+		    page_bits(inpage, len)) == page_bits(inpage, len),
 		    "only file bytes read from the file are sent");
 		__CPROVER_assert(!g_busy[pg->pindex],
 		    "delivers no page still busy");
@@ -1126,6 +1173,7 @@ setup(struct uio *hdr, struct uio *trl, bool *has_hdr, bool *has_trl,
 		g_pages[i]->phys_addr = (vm_paddr_t)(i + 1) * PAGE_SIZE;
 		g_pages[i]->valid = cached ? VM_PAGE_BITS_ALL :
 		    nondet_vm_page_bits_t();
+		g_content[i] = g_pages[i]->valid;
 	}
 	g_obj.type = OBJT_VNODE;
 	g_obj.flags = 0;
@@ -1544,6 +1592,19 @@ proof_novnp_attrerr(void)
 	g_attrerr = true;
 	g_nowait_fails = false;
 	send(0);
+}
+
+/*
+ * proof_read with the file truncated or extended: pages a truncation
+ * freed grabbed again, and the pages replaced with bogus_page looked up
+ * again after it.
+ */
+void
+proof_read_resize(void)
+{
+	g_resize = true;
+	mb_use_ext_pgs = true;
+	proof_read();
 }
 
 void

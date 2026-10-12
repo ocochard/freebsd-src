@@ -38,7 +38,7 @@ here="$top/tools/cbmc"
 # blows up fails as one proof rather than taking the host with it; the
 # send loop proofs need most of it.  By default JOBS is the core count,
 # bounded so that every job at its limit still fits in half the memory.
-CBMC_MEM=${CBMC_MEM:-40960}
+CBMC_MEM=${CBMC_MEM:-61440}
 [ -n "${JOBS:-}" ] && JOBS_SET=1
 if [ -z "${JOBS:-}" ]; then
 	JOBS=$(sysctl -n hw.ncpu 2>/dev/null || echo 1)
@@ -273,6 +273,7 @@ ul="$ul,ktls_frame.0:6,chain_payload.0:6,is_hdr.0:4"
 ul="$ul,io_complete.0:4,io_flush.0:3,sendfile_swapin.9:4,sendfile_swapin.10:4"
 ul="$ul,sendfile_swapin.11:4,unbusy.0:6,all_unbusied.0:6,all_unbusied.1:6"
 ul="$ul,sendfile_free_mext_pg.0:6,sendfile_free_mext_pg.1:6,setup.1:5"
+ul="$ul,resize_point.0:6,resize_point.1:6"
 ul="$ul,vm_pager_get_pages_async.0:4"
 ul="$ul,m_freem.0:6,m_length.0:6,fixspace.0:4,fixspace.1:4"
 ul="$ul,sigsetmasked.0:5,__sigisempty.0:5"
@@ -398,6 +399,15 @@ if want sendfile; then
 	# reads the size again before it grabs a page, or fails.
 	mutant sendfile_novnp_size "$h" "$s" proof_novnp_resize "$dsend" \
 	    "vn_sendfile.14:2,$ul" 's/nobj_size = va.va_size;/nobj_size = obj_size;/'
+	# Truncation removing pages while they are read: freed ones grabbed
+	# again, bogus_page ones looked up again.
+	proof sendfile_read_resize "$h" "$s" proof_read_resize "$dread" \
+	    "vn_sendfile.14:2,$ul"
+	# The pages sendfile holds are wired, so that a truncation only
+	# invalidates them rather than freeing them under the mbufs.
+	mutant sendfile_resize_wired "$h" "$s" proof_resize "$dsend" \
+	    "vn_sendfile.14:2,$ul" \
+	    's/VM_ALLOC_NORMAL | VM_ALLOC_WIRED | flags, pa, npages);/VM_ALLOC_NORMAL | flags, pa, npages);/'
 	# The file truncated or extended under the call.
 	proof sendfile_resize "$h" "$s" proof_resize "$dsend" \
 	    "vn_sendfile.14:2,$ul"
@@ -485,7 +495,7 @@ if want sendfile; then
 	    "vn_sendfile.14:2,$ul"
 	proof sendfile_read_tls "$h" "$s" proof_read_tls "$dtlsp" \
 	    "vn_sendfile.14:2,$utlsp"
-	# Over 40G: SLOW=1 CBMC_MEM=61440 (proven so, in 27 minutes).
+	# Near 60G: SLOW=1 (proven so, in 27 minutes).
 	slow proof sendfile_ioerror_tls "$h" "$s" proof_ioerror_tls "$dtlsp" \
 	    "vn_sendfile.14:2,$utlsp"
 
@@ -584,6 +594,8 @@ done | sort -rn >"$work/queue"
 used=0
 running=""
 while [ -s "$work/queue" ] || [ -n "$running" ]; do
+	# A run killed from outside loses its work directory: stop.
+	[ -d "$work" ] || exit 1
 	# Reap the jobs done.
 	still=""
 	for r in $running; do
@@ -613,6 +625,22 @@ while [ -s "$work/queue" ] || [ -n "$running" ]; do
 	[ "$started" = 1 ] || sleep 2
 done
 wait
+
+# A job that ran out of memory beside others, its cost underestimated
+# after a change to the model, runs again alone.
+for f in "$work"/*.rc; do
+	[ -f "$f" ] || continue
+	n=$(basename "$f" .rc)
+	if [ "$(cat "$f")" != 0 ] && [ "$(cat "$f")" != 10 ] &&
+	    grep -qi 'out of memory' "$work/$n.log"; then
+		for j in "$work"/job.*; do
+			[ "$(head -1 "$j")" = "$n" ] && i=${j##*.}
+		done
+		echo "run.sh: $n ran out of memory, running it alone" >&2
+		rm -f "$work/$n.cost" "$f"
+		sh "$0" --timed "$work" "$i"
+	fi
+done
 
 # Keep the costs measured for the next run's schedule.
 cat "$work"/*.cost 2>/dev/null >"$work/costs.new" || true
