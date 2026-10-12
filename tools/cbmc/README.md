@@ -8,7 +8,7 @@ against the kernel's own source for every input within the bounds,
 not a sample of inputs as a test or a fuzzer would.
 
     pkg install cbmc
-    tools/cbmc/run.sh            # every proof, about 60 minutes
+    tools/cbmc/run.sh            # every proof, about 100 minutes
     SLOW=1 tools/cbmc/run.sh     # and the ones over half an hour
     ONLY=nocache tools/cbmc/run.sh   # the jobs whose name matches
     tools/cbmc/run.sh sendfile   # one system call
