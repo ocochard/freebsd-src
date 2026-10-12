@@ -10,13 +10,13 @@ with the fix in a bhyve guest, the other cases unchanged.
 
 | # | Bug | Fix | Status |
 |---|---|---|---|
-| 1 | `nbytes` past `OFF_MAX` sends nothing | `b8708a7c4d8e` | ready |
-| 2 | partial trailer left out of `*sbytes` | `40f5b7d9c7a6` | ready |
-| 3 | header dropped when there is no file data | `42f012912f61` | ready |
-| 4 | `SF_NODISKIO` sends bytes never read | `5ffb5c5fb98c` | private, sent to glebius@ |
-| 5 | header/trailer dropped when the file shrinks | `6ee7ec9c8778` | waiting for the developer |
-| 6 | short header/trailer write reported as success | `67d6e7e09420` | confirmed by the developer |
-| 7 | truncated shared memory object sent as zeros | `20c3302e9d29` | ready |
+| 1 | `nbytes` past `OFF_MAX` sends nothing | [b8708a7c4d8e](https://github.com/ocochard/freebsd-src/commit/b8708a7c4d8e) | ready |
+| 2 | partial trailer left out of `*sbytes` | [40f5b7d9c7a6](https://github.com/ocochard/freebsd-src/commit/40f5b7d9c7a6) | ready |
+| 3 | header dropped when there is no file data | [42f012912f61](https://github.com/ocochard/freebsd-src/commit/42f012912f61) | ready |
+| 4 | `SF_NODISKIO` sends bytes never read | [5ffb5c5fb98c](https://github.com/ocochard/freebsd-src/commit/5ffb5c5fb98c) | private, sent to glebius@ |
+| 5 | header/trailer dropped when the file shrinks | [6ee7ec9c8778](https://github.com/ocochard/freebsd-src/commit/6ee7ec9c8778) | waiting for the developer |
+| 6 | short header/trailer write reported as success | [67d6e7e09420](https://github.com/ocochard/freebsd-src/commit/67d6e7e09420) | confirmed by the developer |
+| 7 | truncated shared memory object sent as zeros | [20c3302e9d29](https://github.com/ocochard/freebsd-src/commit/20c3302e9d29) | ready |
 
 Open question, no fix yet: data truncated after `sendfile()` queued it
 and before the socket transmitted it arrives part zeroed, part old (see
