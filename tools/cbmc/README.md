@@ -118,6 +118,9 @@ Proven:
   cached file has no invalid page) and the paging one, where freed pages
   are grabbed again afresh and the pages replaced with `bogus_page` are
   looked up again after a truncation;
+- the partial last page of a truncation, zeroed past the new end in
+  place (`vnode_pager_setsize()`, `shm_partial_page_invalidate()`): no
+  byte a truncation zeroed is sent, while sendfile holds the file;
 - vnodes whose object is not a vnode pager's (tmpfs): the size from
   `vn_getsize_locked()` and `VOP_GETATTR()`, which may fail, the size
   changing during the call, and the vnode unlocked on every error;
@@ -199,6 +202,16 @@ Manual and code disagreed; settled with the developer:
   for header or trailer iovecs that `copyinuio()` refuses: missing
   documentation, fixed by `sendfile.2: Document two more errors`.
 
+Open question for the developer (`run.sh` question
+`sendfile_resize_window`): sendfile is zero-copy, so the socket later
+transmits the pages themselves.  A truncation after `sendfile()` has
+queued the data, before the peer reads it, zeroes the bytes past the new
+end of the partial last page, while the pages past it, wired by the
+mbufs, keep the old data: the peer receives neither the old file nor the
+new one.  On 16.0-CURRENT, two pages of `x` truncated to 100 bytes after
+`sendfile()` returned arrive as 100 `x`, 3996 zeros, 4096 `x`.
+sendfile.2 says nothing of the file changing before transmission.
+
 Found by the loop proofs, fixed on this branch, not yet reported:
 
 - `sendfile: Validate the pages of a short grab over all they send`:
@@ -244,7 +257,5 @@ Not proven yet:
   hour (`SLOW=1` runs it).  Busy state is tracked for this call's own
   pages only; another thread holding a page busy is modelled only as a
   grab that stops short (`SF_NODISKIO`).
-- The partial last page of a truncation, zeroed past the new end, is
-  not modelled.
 - Largepage objects with mapped mbufs, and with
   `SF_NOCACHE`, which cannot free their unmanaged pages.

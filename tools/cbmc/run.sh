@@ -273,7 +273,7 @@ ul="$ul,ktls_frame.0:6,chain_payload.0:6,is_hdr.0:4"
 ul="$ul,io_complete.0:4,io_flush.0:3,sendfile_swapin.9:4,sendfile_swapin.10:4"
 ul="$ul,sendfile_swapin.11:4,unbusy.0:6,all_unbusied.0:6,all_unbusied.1:6"
 ul="$ul,sendfile_free_mext_pg.0:6,sendfile_free_mext_pg.1:6,setup.1:5"
-ul="$ul,resize_point.0:6,resize_point.1:6"
+ul="$ul,resize_point.0:6,resize_point.1:6,resize_point.2:6"
 ul="$ul,vm_pager_get_pages_async.0:4"
 ul="$ul,m_freem.0:6,m_length.0:6,fixspace.0:4,fixspace.1:4"
 ul="$ul,sigsetmasked.0:5,__sigisempty.0:5"
@@ -408,6 +408,11 @@ if want sendfile; then
 	mutant sendfile_resize_wired "$h" "$s" proof_resize "$dsend" \
 	    "vn_sendfile.14:2,$ul" \
 	    's/VM_ALLOC_NORMAL | VM_ALLOC_WIRED | flags, pa, npages);/VM_ALLOC_NORMAL | flags, pa, npages);/'
+	# sendfile is zero-copy: a truncation after the data is queued, before
+	# the socket transmits it, zeroes bytes the peer then receives.
+	# sendfile.2 says nothing of it.
+	question sendfile_resize_window "$h" "$s" proof_resize_window \
+	    "$dsend" "vn_sendfile.14:2,$ul"
 	# The file truncated or extended under the call.
 	proof sendfile_resize "$h" "$s" proof_resize "$dsend" \
 	    "vn_sendfile.14:2,$ul"
