@@ -296,6 +296,12 @@ dread="$dread -DMAXSPACE=(2*PAGE_SIZE)"
 # SF_NODISKIO stopping short in a three page run, with no header.
 dndio="-DMAXFILE=(2*PAGE_SIZE+1) -DMAXHDR=0 -DMINSPACE=(2*PAGE_SIZE+2)"
 dndio="$dndio -DMAXSPACE=(3*PAGE_SIZE)"
+# One and two page runs with mapped mbufs, the model's walks of the chain
+# bounded to what they hold: a header and one, or two, page mbufs.
+dioe1="-DMAXFILE=PAGE_SIZE -DMAXHDR=4 -DMINSPACE=(PAGE_SIZE+6)"
+dioe1="$dioe1 -DMAXSPACE=(2*PAGE_SIZE)"
+uioe1=$(echo "$ul" | sed -E 's/(deliver\.[01]|notready_pages\.0|all_ready\.0|m_freem\.0|m_length\.0|is_hdr\.0|chain_payload\.0):[0-9]+/\1:3/g; s/sfio_malloc\.0:6/sfio_malloc.0:4/; s/setup\.0:5/setup.0:3/')
+uioe2=$(echo "$ul" | sed -E 's/(deliver\.[01]|notready_pages\.0|all_ready\.0|m_freem\.0|m_length\.0|is_hdr\.0|chain_payload\.0):[0-9]+/\1:4/g; s/sfio_malloc\.0:6/sfio_malloc.0:5/; s/setup\.0:5/setup.0:4/')
 
 if want sendfile; then
 	proof sendfile_send "$h" "$s" proof_send "$dsend" "vn_sendfile.14:2,$ul"
@@ -379,6 +385,18 @@ if want sendfile; then
 	    "vn_sendfile.14:2,$ul"
 	proof sendfile_shm_lp_resize "$h" "$s" proof_shm_lp_resize "$dsend" \
 	    "vn_sendfile.14:2,$ul"
+	# With mapped mbufs, a release per page: one and two page runs, the
+	# model's walks bounded to what they hold.
+	proof sendfile_shm_lp_mapped1 "$h" "$s" proof_shm_lp_mapped "$dioe1" \
+	    "vn_sendfile.14:2,$uioe1"
+	# Over 60G of address space: SLOW=1 CBMC_MEM=102400 (58 minutes).
+	slow proof sendfile_shm_lp_mapped2 "$h" "$s" proof_shm_lp_mapped \
+	    "$dread" "vn_sendfile.14:2,$uioe2"
+	proof sendfile_shm_lp_mapped_resize "$h" "$s" proof_shm_lp_mapped_resize \
+	    "$dioe1" "vn_sendfile.14:2,$uioe1"
+	mutant sendfile_shm_lp_mapped_release "$h" "$s" proof_shm_lp_mapped \
+	    "$dioe1" "vn_sendfile.14:2,$uioe1" \
+	    '/^sendfile_free_mext(/,/^}/s/vm_page_release(pg, flags);/vm_page_release(pg, flags); vm_page_release(pg, flags);/'
 	# A page is released once: twice would free one the object holds.
 	mutant sendfile_shm_lp_release "$h" "$s" proof_shm_lp "$dsend" \
 	    "vn_sendfile.14:2,$ul" \
@@ -439,10 +457,6 @@ fi
 # the not-ready accounting is costly: those proofs bound the model's
 # walks of the chain to what one and two page runs hold.
 #
-dioe1="-DMAXFILE=PAGE_SIZE -DMAXHDR=4 -DMINSPACE=(PAGE_SIZE+6)"
-dioe1="$dioe1 -DMAXSPACE=(2*PAGE_SIZE)"
-uioe1=$(echo "$ul" | sed -E 's/(deliver\.[01]|notready_pages\.0|all_ready\.0|m_freem\.0|m_length\.0|is_hdr\.0|chain_payload\.0):[0-9]+/\1:3/g; s/sfio_malloc\.0:6/sfio_malloc.0:4/; s/setup\.0:5/setup.0:3/')
-uioe2=$(echo "$ul" | sed -E 's/(deliver\.[01]|notready_pages\.0|all_ready\.0|m_freem\.0|m_length\.0|is_hdr\.0|chain_payload\.0):[0-9]+/\1:4/g; s/sfio_malloc\.0:6/sfio_malloc.0:5/; s/setup\.0:5/setup.0:4/')
 dlater="-DMAXFILE=PAGE_SIZE -DMAXHDR=4 -DMINSPACE=(PAGE_SIZE+6)"
 dlater="$dlater -DMAXSPACE=(2*PAGE_SIZE) -DIODEFER=1 -DMAXIO=1"
 

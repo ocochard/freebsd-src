@@ -49,7 +49,7 @@ leaves no lock, page busy state or reference behind.  `offset` and
 - mapped and unmapped (`mb_use_ext_pgs`) mbufs, KTLS (software, NIC,
   TOE), `SF_NOCACHE`
 - vnodes, tmpfs-like vnodes (size from `VOP_GETATTR()`), shared memory
-  and largepage shared memory objects
+  and largepage shared memory objects, with mapped and unmapped mbufs
 - I/O errors, at once and after the call; the file truncated or grown
   during the call, with page removal and partial-page zeroing
 - page wiring released once, busy state, what `sbready()`,
@@ -59,8 +59,7 @@ Each property is shown to bite by a mutant, the source with one fix or
 check taken back, which `run.sh` requires to fail.
 
 Not covered: `ktls_frame()`/`ktls_enqueue()` themselves (modelled), a
-page busied by another thread (only as a short grab), largepage objects
-with mapped mbufs.
+page busied by another thread (only as a short grab).
 
 ## How it works
 
