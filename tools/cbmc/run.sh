@@ -435,10 +435,14 @@ fi
 #
 # sendfile(2) when reading the file fails: at once, the pager returning
 # the error, or later, through the read's completion, which may come
-# after vn_sendfile() has returned.  With mapped mbufs the not-ready
-# accounting makes these proofs too slow; they run with unmapped ones,
-# and the mapped one, which did not finish within an hour, with SLOW=1.
+# after vn_sendfile() has returned.  With mapped mbufs, one per page,
+# the not-ready accounting is costly: those proofs bound the model's
+# walks of the chain to what one and two page runs hold.
 #
+dioe1="-DMAXFILE=PAGE_SIZE -DMAXHDR=4 -DMINSPACE=(PAGE_SIZE+6)"
+dioe1="$dioe1 -DMAXSPACE=(2*PAGE_SIZE)"
+uioe1=$(echo "$ul" | sed -E 's/(deliver\.[01]|notready_pages\.0|all_ready\.0|m_freem\.0|m_length\.0|is_hdr\.0|chain_payload\.0):[0-9]+/\1:3/g; s/sfio_malloc\.0:6/sfio_malloc.0:4/; s/setup\.0:5/setup.0:3/')
+uioe2=$(echo "$ul" | sed -E 's/(deliver\.[01]|notready_pages\.0|all_ready\.0|m_freem\.0|m_length\.0|is_hdr\.0|chain_payload\.0):[0-9]+/\1:4/g; s/sfio_malloc\.0:6/sfio_malloc.0:5/; s/setup\.0:5/setup.0:4/')
 dlater="-DMAXFILE=PAGE_SIZE -DMAXHDR=4 -DMINSPACE=(PAGE_SIZE+6)"
 dlater="$dlater -DMAXSPACE=(2*PAGE_SIZE) -DIODEFER=1 -DMAXIO=1"
 
@@ -447,8 +451,20 @@ if want sendfile; then
 	    "vn_sendfile.14:2,$ul"
 	slow proof sendfile_ioerror_later_extpg "$h" "$s" proof_ioerror_extpg \
 	    "$dlater" "vn_sendfile.14:2,$ul"
-	slow proof sendfile_ioerror "$h" "$s" proof_ioerror "$dread" \
-	    "vn_sendfile.14:2,$ul"
+	# Mapped mbufs, on one page runs, the model's walks bounded to a
+	# header and a page mbuf, and on two page runs.
+	proof sendfile_ioerror_mapped1 "$h" "$s" proof_ioerror "$dioe1" \
+	    "vn_sendfile.14:2,$uioe1"
+	proof sendfile_ioerror_mapped2 "$h" "$s" proof_ioerror "$dread" \
+	    "vn_sendfile.14:2,$uioe2"
+	# The abort frees exactly the mapped page mbufs queued not ready ...
+	mutant sendfile_ioerror_mapped_free "$h" "$s" proof_ioerror "$dioe1" \
+	    "vn_sendfile.14:2,$uioe1" \
+	    's/mb_free_notready(sfio->m, sfio->npages);/mb_free_notready(sfio->m, sfio->npages + 1);/'
+	# ... which are the ones queued while their pages are read.
+	mutant sendfile_ioerror_mapped_notready "$h" "$s" proof_ioerror \
+	    "$dioe1" "vn_sendfile.14:2,$uioe1" \
+	    's/^\([[:space:]]*\)m0->m_flags |= M_NOTREADY;$/\1;/'
 
 	# A read failing at once fails the call with EIO ...
 	mutant sendfile_ioerror_sync "$h" "$s" proof_ioerror_extpg "$dread" \

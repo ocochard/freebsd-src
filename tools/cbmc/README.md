@@ -135,7 +135,8 @@ Proven:
   with EIO; one failing later tears the socket down with EIO, and the
   pages queued not ready are freed, never delivered.  With unmapped
   mbufs, in 6 minutes; with reads completing after the call returns, in
-  33 minutes (`SLOW=1`);
+  33 minutes (`SLOW=1`); with mapped mbufs, on one and two page runs, in
+  25 and 39 minutes (36 and 50 GB);
 - KTLS, built with `KERN_TLS`, in software, NIC and TOE modes, for any
   page-aligned `max_frame_len` up to 16384: every record handed to
   `ktls_frame()` meets what it asserts (unmapped, at most
@@ -253,8 +254,7 @@ Not proven yet:
   modelled, not proven; the encryption completes at once.  A
   `kern.ipc.tls.maxlen` that is not a multiple of the page size is not
   explored: the KTLS buffer code asserts it is one.
-- I/O errors with mapped mbufs: the proof did not finish within an
-  hour (`SLOW=1` runs it).  Busy state is tracked for this call's own
+- Busy state is tracked for this call's own
   pages only; another thread holding a page busy is modelled only as a
   grab that stops short (`SF_NODISKIO`).
 - Largepage objects with mapped mbufs, and with
