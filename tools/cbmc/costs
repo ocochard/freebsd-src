@@ -14,6 +14,10 @@ sendfile_header_partial 1 94
 sendfile_ioerror_abort 1488 37656
 sendfile_ioerror_extpg 1431 40774
 sendfile_ioerror_free 1735 37336
+sendfile_ioerror_mapped1 1477 36038
+sendfile_ioerror_mapped2 2352 50360
+sendfile_ioerror_mapped_free 1629 36025
+sendfile_ioerror_mapped_notready 1481 36040
 sendfile_ioerror_soerror 1077 36874
 sendfile_ioerror_sync 1539 37461
 sendfile_nbytes_offmax 1 94
