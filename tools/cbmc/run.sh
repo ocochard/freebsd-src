@@ -57,20 +57,22 @@ for t in cbmc goto-cc goto-instrument; do
 done
 
 # Calls goto-instrument redirects to a model, each for a reason given
-# where the model is defined.
-replace="vm_pager_has_page:cbmc_vm_pager_has_page
-	sf_buf_kva:cbmc_sf_buf_kva
-	counter_u64_add:cbmc_counter_u64_add
+# where the model is defined: in model/kern.h for every harness, and in
+# the harness for those named replace_HARNESS.
+replace="counter_u64_add:cbmc_counter_u64_add
 	__curthread:cbmc_curthread
 	refcount_acquire:cbmc_refcount_acquire
 	refcount_release:cbmc_refcount_release
 	refcount_release_if_not_last:cbmc_refcount_release_if_not_last"
+replace_sendfile="vm_pager_has_page:cbmc_vm_pager_has_page
+	sf_buf_kva:cbmc_sf_buf_kva"
 
 # The targets of each indirect call, which goto-instrument would otherwise
 # resolve to every function of a compatible type: pr_abort() through an
 # sf_io went to malloc_init() and sendfile_free_mext(), and that alone
-# made a one page proof time out where it now takes seconds.
-restrict="vn_sendfile.function_pointer_call.1/sendfile_wait
+# made a one page proof time out where it now takes seconds.  Named
+# restrict_HARNESS, as each names functions of one source.
+restrict_sendfile="vn_sendfile.function_pointer_call.1/sendfile_wait
 	vn_sendfile.function_pointer_call.2/pr_send
 	vn_sendfile.function_pointer_call.3/pr_send
 	sendfile_iodone.function_pointer_call.1/pr_abort
@@ -91,11 +93,13 @@ if [ "${1:-}" = "--job" ]; then
 		read -r unwind
 	} <"$work/job.$3"
 	ulimit -v $((CBMC_MEM * 1024))
+	h=$(basename "$harness" .c)
+	eval "hreplace=\${replace_$h:-} hrestrict=\${restrict_$h:-}"
 	rflags=
-	for r in $replace; do
+	for r in $replace $hreplace; do
 		rflags="$rflags --replace-calls $r"
 	done
-	for r in $restrict; do
+	for r in $hrestrict; do
 		rflags="$rflags --restrict-function-pointer $r"
 	done
 	# shellcheck disable=SC2086
@@ -146,7 +150,7 @@ mkdir -p "$work/inc"
 	ln -s "$top/sys/x86/include" x86
 ) >/dev/null
 for f in $(sed -n 's/^#include "\(opt_[a-z0-9_]*\.h\)"/\1/p' \
-    "$top/sys/kern/kern_sendfile.c"); do
+    "$top/sys/kern/kern_sendfile.c" "$top/sys/kern/uipc_ktls.c"); do
 	: >"$work/inc/$f"
 done
 
@@ -160,6 +164,11 @@ queue()
 	# ONLY: a regular expression the job's name must match.
 	if [ -n "${ONLY:-}" ] && ! echo "$2" | grep -qE "$ONLY"; then
 		return
+	fi
+	# A job's files are named after it: two of one name share them.
+	if grep -q " $2\$" "$work/order"; then
+		echo "run.sh: two jobs named $2" >&2
+		exit 2
 	fi
 	njobs=$((njobs + 1))
 	printf '%s\n' "$2" "$3" "$4" "$5" "$6" "$7" >"$work/job.$njobs"
@@ -604,6 +613,75 @@ if want sendfile; then
 	mutant sendfile_extpg_nrdy "$h" "$s" proof_read_extpg "$dread" \
 	    "vn_sendfile.14:2,$ul" \
 	    's/^\([[:space:]]*\)m0->m_epg_nrdy++;$/\1;/'
+fi
+
+#
+# ktls_frame() and ktls_enqueue(): sys/kern/uipc_ktls.c against the TLS
+# record layer of the RFCs, on sessions ktls_create_session() makes.
+#
+h="$here/ktls/ktls.c"
+s="$top/sys/kern/uipc_ktls.c"
+# Chains of up to three records (MAXREC), so walks of four iterations;
+# keys of up to 64 bytes.
+dk="-DKERN_TLS"
+uk="ktls_frame.2:4,proof_frame.0:4,records.0:4,framed.0:4,randomized.0:5"
+uk="$uk,session.0:9,ktls_enqueue.3:4,ktls_enqueue.12:4,ktls_enqueue.13:4"
+uk="$uk,ktls_enqueue.18:4,ktls_batched_records.0:4,proof_enqueue.0:4"
+uk="$uk,proof_enqueue_turn.3:4,proof_enqueue_turn.4:4"
+uk="$uk,proof_enqueue_turn.5:4,proof_enqueue_turn.8:4,cbmc_memmove.0:65"
+
+if want ktls; then
+	proof ktls_frame "$h" "$s" proof_frame "$dk" "$uk"
+	proof ktls_enqueue "$h" "$s" proof_enqueue "$dk" "$uk"
+	proof ktls_enqueue_turn "$h" "$s" proof_enqueue_turn "$dk" "$uk"
+
+	# CBC pads to whole blocks ...
+	mutant ktls_frame_cbcpad "$h" "$s" proof_frame "$dk" "$uk" \
+	    's/m->m_epg_trllen -= delta;/;/'
+	# ... after a random explicit IV from TLS 1.1 on.
+	mutant ktls_frame_iv "$h" "$s" proof_frame "$dk" "$uk" \
+	    's/arc4rand(tlshdr + 1, AES_BLOCK_LEN, 0);/;/'
+	# Each GCM record has a nonce of its own.
+	mutant ktls_frame_nonce "$h" "$s" proof_frame "$dk" "$uk" \
+	    's/(\*noncep)++;/;/'
+	# The header gives the length of what follows it.
+	mutant ktls_frame_length "$h" "$s" proof_frame "$dk" "$uk" \
+	    's/htons(m->m_len - sizeof(\*tlshdr));/htons(m->m_len);/'
+	# TLS 1.3 records pass as TLS 1.2 application data ...
+	mutant ktls_frame_tls13ver "$h" "$s" proof_frame "$dk" "$uk" \
+	    's/tlshdr->tls_vminor = TLS_MINOR_VER_TWO;/tlshdr->tls_vminor = tls->params.tls_vminor;/'
+	# ... their real type in the trailer, which has room for it.
+	mutant ktls_frame_tls13type "$h" "$s" proof_frame "$dk" "$uk" \
+	    's/m->m_epg_trail\[0\] = record_type;/;/'
+	mutant ktls_frame_tls13tlen "$h" "$s" proof_frame "$dk" "$uk" \
+	    's/tls->params.tls_tlen += sizeof(uint8_t);/;/'
+	# A record holds a session reference.
+	mutant ktls_frame_hold "$h" "$s" proof_frame "$dk" "$uk" \
+	    's/m->m_epg_tls = ktls_hold(tls);/m->m_epg_tls = tls;/'
+	# An empty TLS 1.0 record has one page to encrypt.
+	mutant ktls_frame_empty "$h" "$s" proof_frame "$dk" "$uk" \
+	    's/m->m_epg_nrdy = 1;/m->m_epg_nrdy = m->m_epg_npgs;/'
+	# Only TLS 1.0 CBC records are encrypted in turn.
+	mutant ktls_create_sequential "$h" "$s" proof_frame "$dk" "$uk" \
+	    's/tls->sequential_records = true;/;/'
+
+	# An idle queue's thread is woken.
+	mutant ktls_enqueue_wakeup "$h" "$s" proof_enqueue "$dk" "$uk" \
+	    '/^ktls_enqueue(/,/^}/s/if (!running)$/if (0)/'
+	# A TLS 1.0 batch out of turn waits ...
+	mutant ktls_enqueue_outofturn "$h" "$s" proof_enqueue "$dk" "$uk" \
+	    's/if (m->m_epg_seqno != tls->next_seqno) {/if (0) {/'
+	# ... the next in turn being past every record of the batch ...
+	mutant ktls_enqueue_batched "$h" "$s" proof_enqueue "$dk" "$uk" \
+	    's/tls->next_seqno += ktls_batched_records(m);/tls->next_seqno++;/'
+	# ... in sequence with the others waiting ...
+	mutant ktls_enqueue_sorted "$h" "$s" proof_enqueue_turn "$dk" "$uk" \
+	    '/^ktls_enqueue(/,/^}/s/if (n == NULL)$/if (1)/'
+	# ... until those before it are queued, and is then counted so.
+	mutant ktls_enqueue_drain "$h" "$s" proof_enqueue_turn "$dk" "$uk" \
+	    's/while (!STAILQ_EMPTY(\&tls->pending_records)) {/while (0) {/'
+	mutant ktls_enqueue_pending "$h" "$s" proof_enqueue_turn "$dk" "$uk" \
+	    's/counter_u64_add(ktls_cnt_tx_pending, -(queued - 1));/;/'
 fi
 
 [ "$njobs" -gt 0 ] || { echo "run.sh: nothing selected" >&2; exit 2; }
