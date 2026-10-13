@@ -157,6 +157,13 @@ uma_zalloc_arg(uma_zone_t zone, void *arg, int flags)
 	struct mb_args *args = arg;
 	struct mbuf *m;
 
+#ifdef CBMC_UMA_HOOK
+	/* A harness allocating from a zone of its own, see ktls.c. */
+	void *q;
+
+	if ((q = CBMC_UMA_HOOK(zone, flags)) != NULL)
+		return (q);
+#endif
 	__CPROVER_assert(zone == zone_mbuf, "model: only mbufs from UMA");
 	/* Typed, so that cbmc does not access each field byte by byte. */
 	m = __CPROVER_allocate(sizeof(struct mbuf), 1);
@@ -206,8 +213,17 @@ counter_u64_alloc(int flags)
 	return (__CPROVER_allocate(sizeof(uint64_t), 1));
 }
 
-/* counter_u64_add() adds through %gs; run.sh replaces calls with this. */
-void cbmc_counter_u64_add(counter_u64_t c, int64_t inc) { }
+/*
+ * counter_u64_add() adds through %gs; run.sh replaces calls with this.  A
+ * harness proving what a counter counts defines CBMC_COUNTER_HOOK.
+ */
+void
+cbmc_counter_u64_add(counter_u64_t c, int64_t inc)
+{
+#ifdef CBMC_COUNTER_HOOK
+	CBMC_COUNTER_HOOK(c, inc);
+#endif
+}
 void counter_u64_zero(counter_u64_t c) { }
 uint64_t counter_u64_fetch(counter_u64_t c) { return (0); }
 
@@ -220,6 +236,12 @@ uint64_t counter_u64_fetch(counter_u64_t c) { return (0); }
 
 u_int
 cbmc_atomic_load_int(const volatile u_int *p)
+{
+	return (*p);
+}
+
+u_int
+cbmc_atomic_load_acq_int(const volatile u_int *p)
 {
 	return (*p);
 }
@@ -309,6 +331,27 @@ void *
 cbmc_memset(void *b, int c, size_t len)
 {
 	return (__builtin_memset(b, c, len));
+}
+
+/*
+ * bcopy(9) and memmove(3), byte by byte: cbmc's own copies the whole of an
+ * object at an unknown offset when the length is unknown, and every later
+ * read of the object turns into one from an array; the IV copied into a
+ * KTLS session so made a one record proof 5 million variables.  Forward,
+ * as no caller modelled copies over itself.
+ */
+void *
+cbmc_memmove(void *dst, const void *src, size_t len)
+{
+	char *d = dst;
+	const char *s = src;
+	size_t i;
+
+	__CPROVER_assert(!__CPROVER_same_object(d, s) || d + len <= s ||
+	    s + len <= d, "model: no overlapping copy");
+	for (i = 0; i < len; i++)
+		d[i] = s[i];
+	return (dst);
 }
 
 /* Locks. */

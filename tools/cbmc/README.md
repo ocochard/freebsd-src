@@ -6,9 +6,10 @@ page: a harness states what it promises as assertions, and CBMC checks
 them against the kernel's own source for every input within the bounds.
 
     pkg install cbmc
-    tools/cbmc/run.sh                # every proof, about 100 minutes
+    tools/cbmc/run.sh                # every proof, about three hours
     SLOW=1 tools/cbmc/run.sh         # and the ones over half an hour
     ONLY=nocache tools/cbmc/run.sh   # the jobs whose name matches
+    tools/cbmc/run.sh ktls           # one harness: sendfile or ktls
 
 ## sendfile(2): fixes
 
@@ -58,8 +59,40 @@ leaves no lock, page busy state or reference behind.  `offset` and
 Each property is shown to bite by a mutant, the source with one fix or
 check taken back, which `run.sh` requires to fail.
 
-Not covered: `ktls_frame()`/`ktls_enqueue()` themselves (modelled), a
-page busied by another thread (only as a short grab).
+Not covered: a page busied by another thread (only as a short grab);
+the KTLS worker threads, which sendfile's `ktls_enqueue()` model stands
+for by encrypting at once.
+
+## ktls_frame() and ktls_enqueue(): what is proven
+
+Harness `ktls/ktls.c`, for `sys/kern/uipc_ktls.c`, on sessions made by
+the kernel's own `ktls_create_session()` from any parameters it accepts.
+The reference is the TLS record layer: RFC 2246, 4346, 5246 and 8446,
+with RFC 5288 (AES-GCM) and RFC 7905 (ChaCha20-Poly1305).  No bug found.
+
+- `ktls_frame()`, on chains of up to three records, every cipher and
+  version: the header and trailer each takes, CBC padding of 1 to 16
+  bytes to whole blocks, the header's type, version and length, TLS 1.3
+  records passed as TLS 1.2 application data with the real type in the
+  trailer, a GCM nonce never used before, a random CBC IV from TLS 1.1
+  on, a session reference per record, and with software encryption the
+  pages left to encrypt.  This is what sendfile's model of it assumes.
+- `ktls_enqueue()`, on the session state `ktls_create_session()` leaves
+  (proven by the above): a batch of up to three records is queued to
+  its session's queue and the queue's thread woken when idle; TLS 1.0
+  records, whose CBC IVs chain them, are queued in sequence however
+  their I/O completes, by induction over one call from any state the
+  queue can be in.
+
+A TLS 1.0 sequence number past 2^64-1, which RFC 2246 forbids, would
+leave a record waiting for good; only a session set up within a few
+records of the end gets there, and the harness assumes none.
+
+Model choices: the enqueue proofs pass `ktls_enqueue()` a token for its
+socket, and one call each.  cbmc takes a pointer read from a union, as
+the `m_epg_` fields of an mbuf are, to be any pointer written to it, so
+every access through the session read back was also one to the socket
+and the other records: two calls on two records took over 40G.
 
 ## How it works
 
