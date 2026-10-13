@@ -59,11 +59,9 @@ leaves no lock, page busy state or reference behind.  `offset` and
 Each property is shown to bite by a mutant, the source with one fix or
 check taken back, which `run.sh` requires to fail.
 
-Not covered: a page busied by another thread (only as a short grab);
-the KTLS worker threads, which sendfile's `ktls_enqueue()` model stands
-for by encrypting at once.
+Not covered: a page busied by another thread (only as a short grab).
 
-## ktls_frame() and ktls_enqueue(): what is proven
+## KTLS: what is proven
 
 Harness `ktls/ktls.c`, for `sys/kern/uipc_ktls.c`, on sessions made by
 the kernel's own `ktls_create_session()` from any parameters it accepts.
@@ -83,6 +81,18 @@ with RFC 5288 (AES-GCM) and RFC 7905 (ChaCha20-Poly1305).  No bug found.
   records, whose CBC IVs chain them, are queued in sequence however
   their I/O completes, by induction over one call from any state the
   queue can be in.
+- The worker, `ktls_encrypt()` and `ktls_encrypt_async()` with its
+  completion, on a batch from either caller, then a record appended
+  after it: each record is encrypted once, in place when its pages are
+  anonymous, else into new pages or a contiguous buffer exactly over the
+  payload, then the trailer; an encrypted record holds no session, is
+  read-only and anonymous, its file pages let go once; the batch is
+  readied whole, or the connection dropped with EIO and the batch freed;
+  every page and buffer the worker took holds a record or is freed; the
+  socket and session references are dropped once; the next record is
+  left alone.  On a one record batch, and two synchronously (`SLOW=1`).
+  Encryption itself (`ktls_ocf_encrypt()`) is modelled by what it is
+  given; an asynchronous completion runs after the worker moves on.
 
 A TLS 1.0 sequence number past 2^64-1, which RFC 2246 forbids, would
 leave a record waiting for good; only a session set up within a few
@@ -92,7 +102,9 @@ Model choices: the enqueue proofs pass `ktls_enqueue()` a token for its
 socket, and one call each.  cbmc takes a pointer read from a union, as
 the `m_epg_` fields of an mbuf are, to be any pointer written to it, so
 every access through the session read back was also one to the socket
-and the other records: two calls on two records took over 40G.
+and the other records: two calls on two records took over 40G.  The
+worker reads through both, so its proofs bear that cost: two records
+asynchronously are past 100G.
 
 ## How it works
 
