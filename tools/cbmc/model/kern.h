@@ -174,6 +174,9 @@ uma_zalloc_arg(uma_zone_t zone, void *arg, int flags)
 void
 uma_zfree_arg(uma_zone_t zone, void *item, void *udata)
 {
+#ifdef CBMC_UMA_FREE_HOOK
+	CBMC_UMA_FREE_HOOK(zone, item);
+#endif
 	__CPROVER_deallocate(item);
 }
 

@@ -66,6 +66,9 @@ replace="counter_u64_add:cbmc_counter_u64_add
 	refcount_release_if_not_last:cbmc_refcount_release_if_not_last"
 replace_sendfile="vm_pager_has_page:cbmc_vm_pager_has_page
 	sf_buf_kva:cbmc_sf_buf_kva"
+replace_ktls="ktls_buffer_alloc:cbmc_ktls_buffer_alloc
+	ktls_drop:cbmc_ktls_drop
+	ktls_destroy:cbmc_ktls_destroy"
 
 # The targets of each indirect call, which goto-instrument would otherwise
 # resolve to every function of a compatible type: pr_abort() through an
@@ -78,6 +81,12 @@ restrict_sendfile="vn_sendfile.function_pointer_call.1/sendfile_wait
 	sendfile_iodone.function_pointer_call.1/pr_abort
 	sendfile_iodone.function_pointer_call.2/pr_ready
 	fo_sendfile.function_pointer_call.1/vn_sendfile"
+restrict_ktls="ktls_encrypt.function_pointer_call.1/cbmc_pr_ready
+	ktls_encrypt_cb.function_pointer_call.1/cbmc_pr_ready
+	ktls_finish_nonanon.function_pointer_call.1/cbmc_file_free"
+# cbmc flags of a harness: the KTLS worker turns physical addresses into
+# pointers, each an object, past cbmc's 256.
+cbmc_ktls="--object-bits 10"
 
 # A worker, which is this script run by xargs below: build and check job N
 # of the queue in WORK, leaving cbmc's status beside its log -- 0 proved,
@@ -95,6 +104,7 @@ if [ "${1:-}" = "--job" ]; then
 	ulimit -v $((CBMC_MEM * 1024))
 	h=$(basename "$harness" .c)
 	eval "hreplace=\${replace_$h:-} hrestrict=\${restrict_$h:-}"
+	eval "hcbmc=\${cbmc_$h:-}"
 	rflags=
 	for r in $replace $hreplace; do
 		rflags="$rflags --replace-calls $r"
@@ -116,7 +126,7 @@ if [ "${1:-}" = "--job" ]; then
 		goto-instrument $rflags "$work/$name.goto" \
 		    "$work/$name.i.goto" &&
 		cbmc "$work/$name.i.goto" --function "$function" \
-		    --unwind 2 --unwindset "$unwind"
+		    --unwind 2 --unwindset "$unwind" $hcbmc
 	} >"$work/$name.log" 2>&1 && rc=0 || rc=$?
 	echo "$rc" >"$work/$name.rc"
 	exit 0
@@ -629,6 +639,16 @@ uk="$uk,session.0:9,ktls_enqueue.3:4,ktls_enqueue.12:4,ktls_enqueue.13:4"
 uk="$uk,ktls_enqueue.18:4,ktls_batched_records.0:4,proof_enqueue.0:4"
 uk="$uk,proof_enqueue_turn.3:4,proof_enqueue_turn.4:4"
 uk="$uk,proof_enqueue_turn.5:4,proof_enqueue_turn.8:4,cbmc_memmove.0:65"
+# The worker on one record (WREC) of up to five pages.
+dw="-DKERN_TLS -DWREC=1"
+uw="ktls_encrypt.4:2,ktls_encrypt_async.5:2,ktls_encrypt_record.4:6"
+uw="$uw,ktls_encrypt_record.6:6,ktls_finish_nonanon.1:6"
+uw="$uw,ktls_finish_nonanon.2:6,mb_free_notready.0:7,mb_free_extpg.0:6"
+uw="$uw,widx.0:2,cbmc_pr_ready.0:2,ktls_ocf_encrypt.0:6,batch.0:3"
+uw="$uw,check_batch.0:2,check_batch.1:2,check_batch.2:6"
+uw="$uw,proof_encrypt_async.0:2,session.0:9,cbmc_memmove.0:65"
+dw2="-DKERN_TLS -DWREC=2"
+uw2=$(echo "$uw" | sed -E 's/(ktls_encrypt\.4|widx\.0|cbmc_pr_ready\.0|check_batch\.[01]):2/\1:3/g; s/mb_free_notready\.0:7/mb_free_notready.0:12/; s/batch\.0:3/batch.0:4/; s/check_batch\.2:6/check_batch.2:11/')
 
 if want ktls; then
 	proof ktls_frame "$h" "$s" proof_frame "$dk" "$uk"
@@ -682,6 +702,50 @@ if want ktls; then
 	    's/while (!STAILQ_EMPTY(\&tls->pending_records)) {/while (0) {/'
 	mutant ktls_enqueue_pending "$h" "$s" proof_enqueue_turn "$dk" "$uk" \
 	    's/counter_u64_add(ktls_cnt_tx_pending, -(queued - 1));/;/'
+
+	# The worker, on a batch of one record and the record after it.
+	proof ktls_encrypt "$h" "$s" proof_encrypt "$dw" "$uw"
+	proof ktls_encrypt_async "$h" "$s" proof_encrypt_async "$dw" "$uw"
+	# Two records, 54G (proven so, in 25 minutes); asynchronously, past
+	# 100G, out of reach.
+	slow proof ktls_encrypt2 "$h" "$s" proof_encrypt "$dw2" "$uw2"
+
+	# A record's pages count as many as it has unready ...
+	mutant ktls_encrypt_nrdy "$h" "$s" proof_encrypt "$dw" "$uw" \
+	    '/^ktls_encrypt(/,/^}/s/npages += m->m_epg_nrdy;/npages += m->m_epg_npgs;/'
+	# ... and once encrypted it holds no session, is read-only ...
+	mutant ktls_encrypt_session "$h" "$s" proof_encrypt "$dw" "$uw" \
+	    '/^ktls_encrypt(/,/^}/s/^		ktls_free(tls);/		;/'
+	mutant ktls_encrypt_rdonly "$h" "$s" proof_encrypt "$dw" "$uw" \
+	    '/^ktls_encrypt(/,/^}/s/m->m_flags |= M_RDONLY;/;/'
+	# ... and anonymous, its file pages let go for the new ones, freed
+	# by a routine of theirs.
+	mutant ktls_finish_anon "$h" "$s" proof_encrypt "$dw" "$uw" \
+	    's/m->m_epg_flags |= EPG_FLAG_ANON;/;/'
+	mutant ktls_finish_srcfree "$h" "$s" proof_encrypt "$dw" "$uw" \
+	    '/^ktls_finish_nonanon(/,/^}/s/^	m->m_ext.ext_free(m);/	if (0) m->m_ext.ext_free(m);/'
+	mutant ktls_finish_contig "$h" "$s" proof_encrypt "$dw" "$uw" \
+	    's/m->m_ext.ext_free = ktls_free_mext_contig;/m->m_ext.ext_free = mb_free_mext_pgs;/'
+	# The output covers the payload, page by page from its offset.
+	mutant ktls_record_iovlen "$h" "$s" proof_encrypt "$dw" "$uw" \
+	    's/state->dst_iov\[0\].iov_len = len;/state->dst_iov[0].iov_len = len - 1;/'
+	mutant ktls_record_offset "$h" "$s" proof_encrypt "$dw" "$uw" \
+	    's/for (i = 0; i < m->m_epg_npgs; i++, off = 0) {/for (i = 0; i < m->m_epg_npgs; i++) {/'
+	# A failed encryption frees the pages it took and the batch.
+	mutant ktls_record_pgfree "$h" "$s" proof_encrypt "$dw" "$uw" \
+	    '/^ktls_encrypt_record(/,/^}/s/vm_page_free(pg);/;/'
+	mutant ktls_encrypt_errfree "$h" "$s" proof_encrypt "$dw" "$uw" \
+	    '/^ktls_encrypt(/,/^}/s/mb_free_notready(top, total_pages);/;/'
+	# Asynchronously, each request holds a socket reference, and its
+	# completion drops the session's and frees what failed.
+	mutant ktls_async_soref "$h" "$s" proof_encrypt_async "$dw" "$uw" \
+	    '/^ktls_encrypt_async(/,/^}/s/^		soref(so);/		;/'
+	mutant ktls_async_errfree "$h" "$s" proof_encrypt_async "$dw" \
+	    "$uw" 's/mb_free_notready(m, total_pages - npages);/;/'
+	mutant ktls_cb_session "$h" "$s" proof_encrypt_async "$dw" "$uw" \
+	    '/^ktls_encrypt_cb(/,/^}/s/^	ktls_free(tls);/	;/'
+	mutant ktls_cb_errfree "$h" "$s" proof_encrypt_async "$dw" "$uw" \
+	    '/^ktls_encrypt_cb(/,/^}/s/mb_free_notready(m, npages);/;/'
 fi
 
 [ "$njobs" -gt 0 ] || { echo "run.sh: nothing selected" >&2; exit 2; }

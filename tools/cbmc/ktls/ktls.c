@@ -53,6 +53,11 @@
  *   proof_enqueue_turn	TLS 1.0 records completing in any order, as
  *			sendfile(2) I/O does, by induction: each is queued
  *			once, in sequence, as soon as those before it are
+ *   proof_encrypt	the worker, ktls_encrypt(), on a batch: each record
+ *   proof_encrypt_async encrypted once over its payload and trailer, and
+ *			readied, or the connection dropped and the batch
+ *			freed, without a page, buffer or reference left
+ *			behind; and ktls_encrypt_async() with completions
  */
 
 #include SOURCE
@@ -60,8 +65,12 @@
 #include <sys/endian.h>
 
 static void	*cbmc_uma(uma_zone_t, int);
+static void	 cbmc_uma_free(uma_zone_t, void *);
+static void	*cbmc_malloc(size_t, struct malloc_type *, int);
 static void	 cbmc_counter(counter_u64_t, int64_t);
 #define	CBMC_UMA_HOOK		cbmc_uma
+#define	CBMC_UMA_FREE_HOOK	cbmc_uma_free
+#define	CBMC_MALLOC_HOOK	cbmc_malloc
 #define	CBMC_COUNTER_HOOK	cbmc_counter
 #include "kern.h"
 
@@ -610,4 +619,463 @@ proof_enqueue_turn(void)
 	}
 	__CPROVER_assert(m == NULL, "TLS 1.0: nothing else waits");
 	__CPROVER_assert(g_pending == np, "the waiting are counted");
+}
+
+/*
+ * The worker: ktls_encrypt() and ktls_encrypt_async(), which the queue's
+ * thread runs on each batch ktls_enqueue() queued, against what their
+ * callers take of them.  A batch of n records, all left to encrypt, then
+ * a record appended after it, which the walk of m_next must not reach.
+ * Encryption, by ktls_ocf_encrypt(), is modelled by what it is given: the
+ * record in place when its pages are anonymous (sosend()'s), else new
+ * pages or a contiguous buffer covering the payload, then the trailer;
+ * it fails, or succeeds, and for an asynchronous backend completes after
+ * the worker moved on.
+ */
+#ifndef WREC
+#define	WREC	2
+#endif
+#define	WPAGES	(WREC * MBUF_PEXT_MAX_PGS)
+
+vm_paddr_t dmaplimit = ~0UL;	/* a direct map over every address */
+struct kva_layout_s kva_layout = { .dmap_low = 0, .dmap_high = ~0UL };
+
+static struct protosw g_proto;
+static char g_buffer_zone;
+static struct mbuf *g_w[WREC + 1];	/* the batch, then the next record */
+static int g_wn;			/* records in the batch */
+static int g_enc[WREC], g_ready[WREC], g_freed[WREC], g_srcfree[WREC];
+static bool g_file[WREC];		/* a record of file pages */
+static int g_dropped, g_nbuf, g_nbuffree;
+static struct ktls_ocf_encrypt_state *g_deferred[WREC];
+static int g_ndeferred;
+
+static int
+widx(struct mbuf *m)
+{
+	int i;
+
+	for (i = 0; i < WREC; i++)
+		if (i < g_wn && m == g_w[i])
+			return (i);
+	__CPROVER_assert(0, "a record of the batch");
+	return (0);
+}
+
+/* A record's payload: on one page, m_epg_last_len counts from the offset. */
+static int
+payload(struct mbuf *m)
+{
+	if (m->m_epg_npgs <= 1)
+		return (m->m_epg_last_len);
+	return (ptoa(m->m_epg_npgs - 1) + m->m_epg_last_len -
+	    m->m_epg_1st_off);
+}
+
+/* New pages: a page each, wired, at an address no file page has. */
+static struct vm_page *g_pg[WPAGES];
+static bool g_pgfreed[WPAGES];
+static int g_npg;
+#define	NEWPA(i)	((vm_paddr_t)(1UL << 40) + ptoa(i))
+
+vm_page_t
+vm_page_alloc_noobj(int req)
+{
+	vm_page_t pg;
+
+	__CPROVER_assert(g_npg < WPAGES, "model: pages allocated");
+	pg = __CPROVER_allocate(sizeof(struct vm_page), 1);
+	pg->phys_addr = NEWPA(g_npg);
+	pg->ref_count = 1;
+	g_pg[g_npg++] = pg;
+	return (pg);
+}
+
+/* By arithmetic: a loop here, at each of its many calls, cost 3600 steps. */
+static int
+pgidx(vm_paddr_t pa)
+{
+	__CPROVER_assert(pa >= NEWPA(0) && pa < NEWPA(g_npg) &&
+	    (pa & PAGE_MASK) == 0, "a page the worker allocated");
+	return ((pa - NEWPA(0)) >> PAGE_SHIFT);
+}
+
+vm_page_t
+PHYS_TO_VM_PAGE(vm_paddr_t pa)
+{
+	return (g_pg[pgidx(pa)]);
+}
+
+bool
+vm_page_unwire_noq(vm_page_t pg)
+{
+	__CPROVER_assert(pg->ref_count == 1, "a new page is unwired once");
+	pg->ref_count = 0;
+	return (true);
+}
+
+void
+vm_page_free(vm_page_t pg)
+{
+	int i = pgidx(pg->phys_addr);
+
+	__CPROVER_assert(pg->ref_count == 0 && !g_pgfreed[i],
+	    "a new page is freed once, unwired");
+	g_pgfreed[i] = true;
+}
+
+/*
+ * ktls_buffer_alloc() by its contract: no buffer for two pages or fewer,
+ * else a contiguous one of kern.ipc.tls.maxlen bytes, or none.  run.sh
+ * replaces calls to it: it reads the domain through %gs.
+ */
+void *
+cbmc_ktls_buffer_alloc(struct ktls_wq *wq, struct mbuf *m)
+{
+	void *buf;
+
+	if (m->m_epg_npgs <= 2 || nondet_bool())
+		return (NULL);
+	g_nbuf++;
+	buf = __CPROVER_allocate(ktls_maxlen, 0);
+	/* Pages of the direct map, as ktls_buffer_import() takes. */
+	__CPROVER_assume((uintptr_t)buf < dmaplimit);
+	return (buf);
+}
+
+static void
+cbmc_uma_free(uma_zone_t zone, void *item)
+{
+	if (zone == ktls_buffer_zone)
+		g_nbuffree++;
+}
+
+/* The asynchronous state, typed, as it is larger than the bucket. */
+static void *
+cbmc_malloc(size_t size, struct malloc_type *type, int flags)
+{
+	if (size != sizeof(struct ktls_ocf_encrypt_state))
+		return (NULL);
+	return (__CPROVER_allocate(size, (flags & M_ZERO) != 0));
+}
+
+/* The file's pages a sendfile(2) record holds, released. */
+static void
+cbmc_file_free(struct mbuf *m)
+{
+	g_srcfree[widx(m)]++;
+}
+
+/*
+ * The socket's pr_ready(): what it is given is whole records of the
+ * batch, encrypted, unready, and no longer holding a session.
+ */
+static int
+cbmc_pr_ready(struct socket *so, struct mbuf *m, int count)
+{
+	int c, i, r;
+
+	__CPROVER_assert(so == &g_so, "readies the socket's records");
+	c = count;
+	for (i = 0; i < WREC && c > 0; i++) {
+		r = widx(m);
+		__CPROVER_assert(g_enc[r] == 1 && g_ready[r] == 0 &&
+		    g_freed[r] == 0, "readies a record encrypted, once");
+		__CPROVER_assert((m->m_flags & (M_NOTREADY | M_RDONLY)) ==
+		    (M_NOTREADY | M_RDONLY) && m->m_epg_tls == NULL &&
+		    (m->m_epg_flags & EPG_FLAG_ANON) != 0,
+		    "an encrypted record is read-only, anonymous, sessionless");
+		g_ready[r] = 1;
+		c -= m->m_epg_nrdy;
+		m = m->m_next;
+	}
+	__CPROVER_assert(c == 0, "readies whole records");
+	return (0);
+}
+
+void
+cbmc_ktls_drop(struct socket *so, int error)
+{
+	__CPROVER_assert(so == &g_so && error == EIO,
+	    "a failed encryption drops the connection with EIO");
+	g_dropped++;
+}
+
+/* run.sh replaces calls to ktls_destroy(): never reached, it is large. */
+void
+cbmc_ktls_destroy(struct ktls_session *tls)
+{
+	__CPROVER_assert(0, "the socket keeps its session reference");
+}
+
+void
+sorele_locked(struct socket *so)
+{
+	__CPROVER_assert(0, "the socket keeps its owner's reference");
+}
+
+/* mb_free_extpg(), kern_mbuf.c: the storage, then the session. */
+void
+mb_free_extpg(struct mbuf *m)
+{
+	int i, r = widx(m);
+
+	__CPROVER_assert(g_freed[r] == 0, "a record is freed once");
+	g_freed[r] = 1;
+	if (m->m_ext.ext_free == cbmc_file_free)
+		g_srcfree[r]++;
+	else if (m->m_ext.ext_free == mb_free_mext_pgs) {
+		for (i = 0; i < MBUF_PEXT_MAX_PGS; i++)
+			if (i < m->m_epg_npgs &&
+			    (m->m_epg_flags & EPG_FLAG_ANON) != 0 &&
+			    m->m_epg_pa[i] >= NEWPA(0)) {
+				(void)vm_page_unwire_noq(
+				    PHYS_TO_VM_PAGE(m->m_epg_pa[i]));
+				vm_page_free(PHYS_TO_VM_PAGE(m->m_epg_pa[i]));
+			}
+	} else {
+		__CPROVER_assert(m->m_ext.ext_free == ktls_free_mext_contig,
+		    "a record's pages have a free routine of theirs");
+		g_nbuffree++;
+	}
+	if (m->m_epg_tls != NULL &&
+	    !refcount_release_if_not_last(&m->m_epg_tls->refcount))
+		__CPROVER_assert(0, "the socket keeps its session reference");
+}
+
+/* mb_free_notready(), kern_mbuf.c. */
+void
+mb_free_notready(struct mbuf *m, int count)
+{
+	int i;
+
+	for (i = 0; i < WREC * MBUF_PEXT_MAX_PGS + 1 && i < count &&
+	    m != NULL; i++) {
+		if ((m->m_flags & M_EXTPG) != 0) {
+			m->m_epg_nrdy--;
+			if (m->m_epg_nrdy != 0)
+				continue;
+		}
+		m = m_free(m);
+	}
+	__CPROVER_assert(i == count, "frees as many pages as asked");
+}
+
+int
+ktls_ocf_encrypt(struct ktls_ocf_encrypt_state *state,
+    struct ktls_session *tls, struct mbuf *m, struct iovec *outiov,
+    int outiovcnt)
+{
+	uintptr_t base;
+	int i, len, r = widx(m);
+
+	__CPROVER_assert(g_enc[r] == 0, "each record is encrypted once");
+	__CPROVER_assert(m->m_epg_tls == tls &&
+	    (m->m_flags & M_NOTREADY) != 0,
+	    "encrypts an unready record with its session");
+	g_enc[r] = 1;
+	if ((m->m_epg_flags & EPG_FLAG_ANON) != 0)
+		__CPROVER_assert(outiov == NULL,
+		    "anonymous pages are encrypted in place");
+	else {
+		__CPROVER_assert(outiov != NULL && outiovcnt >= 2 &&
+		    outiov[outiovcnt - 1].iov_base == m->m_epg_trail &&
+		    outiov[outiovcnt - 1].iov_len == m->m_epg_trllen,
+		    "the output ends with the trailer");
+		len = 0;
+		for (i = 0; i < MBUF_PEXT_MAX_PGS; i++) {
+			if (i >= outiovcnt - 1)
+				break;
+			base = (uintptr_t)outiov[i].iov_base;
+			if (state->cbuf != NULL)
+				__CPROVER_assert(outiovcnt == 2 &&
+				    outiov[0].iov_base == (char *)state->cbuf +
+				    m->m_epg_1st_off,
+				    "into the buffer, at the payload's offset");
+			else
+				__CPROVER_assert(outiovcnt == m->m_epg_npgs + 1 &&
+				    pgidx(state->parray[i]) == g_npg -
+				    m->m_epg_npgs + i &&
+				    base == state->parray[i] +
+				    (i == 0 ? m->m_epg_1st_off : 0) &&
+				    outiov[i].iov_len == m_epg_pagelen(m, i,
+				    i == 0 ? m->m_epg_1st_off : 0),
+				    "into new pages, each as the file page it "
+				    "replaces");
+			len += outiov[i].iov_len;
+		}
+		__CPROVER_assert(len == payload(m),
+		    "the output holds the payload");
+	}
+	if (nondet_bool())
+		return (nondet_bool() ? EIO : ENOMEM);
+	if (!tls->sync_dispatch) {
+		/*
+		 * Its callback runs after the worker is done.  Running it
+		 * at once instead changes nothing the worker reads: the
+		 * callback touches its record, the socket's counts and a
+		 * session reference, and the worker past this record only
+		 * the records after it and the same counts.  Running it
+		 * at both points doubled the proof, past 120G.
+		 */
+		__CPROVER_assert(state->m == m && state->so == &g_so,
+		    "the callback gets its record and socket");
+		g_deferred[g_ndeferred++] = state;
+	}
+	return (0);
+}
+
+/*
+ * A batch of n records as ktls_enqueue() queued it: from sendfile(2),
+ * file pages, from sosend(), anonymous ones, which an empty TLS 1.0
+ * record has none of; each no more pages than a frame, holding a session
+ * reference; the socket's reference donated with the batch.
+ */
+static struct ktls_session *
+batch(bool sync)
+{
+	struct ktls_session *tls;
+	struct mbuf *m;
+	int i, n, total;
+
+	setup();
+	ktls_buffer_zone = (uma_zone_t)&g_buffer_zone;
+	tls = sw_session(nondet_bool());
+	tls->sync_dispatch = sync;
+	g_proto.pr_ready = cbmc_pr_ready;
+	g_so.so_proto = &g_proto;
+	g_so.so_count = 2;
+	n = nondet_int();
+	__CPROVER_assume(n >= 1 && n <= WREC);
+	g_wn = n;
+	total = 0;
+	for (i = 0; i <= n; i++) {
+		m = __CPROVER_allocate(sizeof(struct mbuf), 1);
+		m->m_flags = M_EXT | M_EXTPG | M_NOTREADY;
+		m->m_ext.ext_flags = EXT_FLAG_EMBREF;
+		m->m_ext.ext_count = 1;
+		m->m_epg_tls = tls;
+		tls->refcount++;
+		m->m_epg_npgs = nondet_int();
+		__CPROVER_assume(m->m_epg_npgs <= MBUF_PEXT_MAX_PGS &&
+		    ptoa(m->m_epg_npgs) <= ktls_maxlen);
+		if (nondet_bool()) {
+			m->m_epg_flags = EPG_FLAG_ANON;
+			m->m_ext.ext_free = mb_free_mext_pgs;
+		} else {
+			__CPROVER_assume(m->m_epg_npgs > 0);
+			m->m_ext.ext_free = cbmc_file_free;
+			if (i < n)
+				g_file[i] = true;
+		}
+		m->m_epg_nrdy = m->m_epg_npgs == 0 ? 1 : m->m_epg_npgs;
+		m->m_epg_1st_off = nondet_int();
+		m->m_epg_last_len = nondet_int();
+		__CPROVER_assume(m->m_epg_npgs == 0 ? m->m_epg_1st_off == 0 &&
+		    m->m_epg_last_len == 0 :
+		    m->m_epg_1st_off < PAGE_SIZE && m->m_epg_last_len > 0 &&
+		    m->m_epg_last_len <= PAGE_SIZE &&
+		    (m->m_epg_npgs > 1 ||
+		    m->m_epg_1st_off + m->m_epg_last_len <= PAGE_SIZE));
+		m->m_epg_hdrlen = nondet_int();
+		m->m_epg_trllen = nondet_int();
+		__CPROVER_assume(m->m_epg_hdrlen <= MBUF_PEXT_HDR_LEN &&
+		    m->m_epg_trllen <= MBUF_PEXT_TRAIL_LEN);
+		m->m_len = m->m_epg_hdrlen + payload(m) + m->m_epg_trllen;
+		if (i < n)
+			total += m->m_epg_nrdy;
+		g_w[i] = m;
+		if (i > 0)
+			g_w[i - 1]->m_next = m;
+	}
+	g_w[0]->m_epg_enc_cnt = total;
+	g_w[0]->m_epg_so = &g_so;
+	return (tls);
+}
+
+/*
+ * After the batch: encrypted and readied whole, or with the connection
+ * dropped and all of it freed; every page the worker took either holds
+ * an encrypted record or is freed; the file's pages are let go once;
+ * the session and socket references the batch held are dropped; the
+ * next record untouched.
+ */
+static void
+check_batch(struct ktls_session *tls)
+{
+	int i, j, live, ok;
+	struct mbuf *m;
+
+	live = ok = 0;
+	for (i = 0; i < WREC; i++) {
+		if (i >= g_wn)
+			break;
+		__CPROVER_assert(g_ready[i] + g_freed[i] == 1,
+		    "each record is readied or freed");
+		ok += g_ready[i];
+		if (g_freed[i] == 0) {
+			m = g_w[i];
+			__CPROVER_assert(m->m_ext.ext_free ==
+			    mb_free_mext_pgs ||
+			    m->m_ext.ext_free == ktls_free_mext_contig,
+			    "a readied record frees its own pages");
+		}
+		__CPROVER_assert(g_srcfree[i] == (g_file[i] ? 1 : 0),
+		    "the file's pages are let go once");
+		if (g_freed[i] == 0 &&
+		    g_w[i]->m_ext.ext_free == ktls_free_mext_contig)
+			live++;
+	}
+	__CPROVER_assert(g_nbuf == g_nbuffree + live,
+	    "a buffer holds a record or is freed");
+	__CPROVER_assert(ok == g_wn || g_dropped == 1,
+	    "a batch not readied whole drops the connection");
+	__CPROVER_assert(g_dropped <= 1 || !tls->sync_dispatch,
+	    "dropped once");
+	for (j = 0; j < WPAGES; j++) {
+		if (j >= g_npg)
+			break;
+		live = 0;
+		for (i = 0; i < WREC; i++)
+			if (i < g_wn && g_freed[i] == 0 &&
+			    g_w[i]->m_ext.ext_free == mb_free_mext_pgs &&
+			    g_w[i]->m_epg_npgs > 0 &&
+			    g_w[i]->m_epg_pa[0] <= NEWPA(j) &&
+			    NEWPA(j) < g_w[i]->m_epg_pa[0] +
+			    ptoa(g_w[i]->m_epg_npgs))
+				live = 1;
+		__CPROVER_assert(live != g_pgfreed[j],
+		    "a new page holds a record or is freed");
+	}
+	__CPROVER_assert(tls->refcount == 2,
+	    "the session keeps the socket's and the next record's");
+	__CPROVER_assert(g_so.so_count == 1,
+	    "the socket keeps its owner's reference only");
+	__CPROVER_assert((g_w[g_wn]->m_flags & M_NOTREADY) != 0 &&
+	    g_w[g_wn]->m_epg_tls == tls, "the next record is untouched");
+}
+
+void
+proof_encrypt(void)
+{
+	struct ktls_session *tls;
+
+	tls = batch(true);
+	ktls_encrypt(&g_wq, g_w[0]);
+	check_batch(tls);
+}
+
+void
+proof_encrypt_async(void)
+{
+	struct ktls_session *tls;
+	int i;
+
+	tls = batch(false);
+	ktls_encrypt_async(&g_wq, g_w[0]);
+	/* The requests still running complete. */
+	for (i = 0; i < WREC; i++)
+		if (i < g_ndeferred)
+			ktls_encrypt_cb(g_deferred[i], nondet_bool() ? 0 : EIO);
+	check_batch(tls);
 }
