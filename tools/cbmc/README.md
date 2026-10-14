@@ -115,7 +115,11 @@ with RFC 5288 (AES-GCM) and RFC 7905 (ChaCha20-Poly1305).  No bug found.
   left in place when the mode cannot be set up, the send lock is not
   had, or another change won the race while the inpcb was unlocked;
   offload is refused twice, or once disabled; the inpcb is locked
-  again on return.
+  again on return.  `ktls_disable_ifnet()`, on too many retransmits,
+  disables offload once per connection by a task holding the session
+  and the socket, which switches an open connection to software and
+  tells the stack, leaves a closed one alone, and lets go of both
+  references and the inpcb.
 - `ktls_decrypt()` (harness `ktls/ktls_rx.c`), on one record in one
   mbuf decrypted by the NIC, AES-GCM TLS 1.2: delivered as a
   TLS_GET_RECORD control message and its payload, no more.  Only on

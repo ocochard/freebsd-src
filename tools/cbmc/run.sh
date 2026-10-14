@@ -87,7 +87,8 @@ restrict_sendfile="vn_sendfile.function_pointer_call.1/sendfile_wait
 restrict_ktls="ktls_encrypt.function_pointer_call.1/cbmc_pr_ready
 	ktls_encrypt_cb.function_pointer_call.1/cbmc_pr_ready
 	ktls_finish_nonanon.function_pointer_call.1/cbmc_file_free
-	ktls_set_tx_mode.function_pointer_call.1/cbmc_hwtls_change"
+	ktls_set_tx_mode.function_pointer_call.1/cbmc_hwtls_change
+	ktls_disable_ifnet_help.function_pointer_call.1/cbmc_hwtls_change"
 # cbmc flags of a harness: the KTLS worker turns physical addresses into
 # pointers, each an object, past cbmc's 256; and the kernel is built with
 # -fwrapv, so a signed overflow wraps (IFCAP_BIT(31) is 1 << 31).
@@ -875,6 +876,30 @@ if want ktls; then
 	# ... and it sleeps for the send lock with the inpcb unlocked.
 	mutant ktls_mode_unlock "$h" "$s" proof_set_tx_mode "$dk" "$ut" \
 	    '/^ktls_set_tx_mode(/,/^}/s/^	INP_WUNLOCK(inp);$/	;/'
+
+	# Offload disabled on too many retransmits, by a task.
+	proof ktls_disable_ifnet "$h" "$s" proof_disable_ifnet "$dk" "$ut"
+	# Once per connection ...
+	mutant ktls_disable_once "$h" "$s" proof_disable_ifnet "$dk" "$ut" \
+	    '/^ktls_disable_ifnet(void/,/^}/s/if (tp->t_nic_ktls_xmit_dis == 1) {/if (0) {/'
+	# ... the task holding the session and the socket, and letting
+	# both go ...
+	mutant ktls_disable_hold "$h" "$s" proof_disable_ifnet "$dk" "$ut" \
+	    '/^ktls_disable_ifnet(void/,/^}/s/(void)ktls_hold(tls);/;/'
+	mutant ktls_disable_soref "$h" "$s" proof_disable_ifnet "$dk" "$ut" \
+	    '/^ktls_disable_ifnet(void/,/^}/s/^	soref(so);/	;/'
+	mutant ktls_disable_sorele "$h" "$s" proof_disable_ifnet "$dk" "$ut" \
+	    '/^ktls_disable_ifnet_help(/,/^}/s/^	sorele(so);/	;/'
+	mutant ktls_disable_free "$h" "$s" proof_disable_ifnet "$dk" "$ut" \
+	    '/^ktls_disable_ifnet_help(/,/^}/s/^	ktls_free(tls);/	;/'
+	# ... and the inpcb; a closed connection left alone, an open one
+	# switched to software and the stack told offload is off.
+	mutant ktls_disable_unlock "$h" "$s" proof_disable_ifnet "$dk" "$ut" \
+	    '/^ktls_disable_ifnet_help(/,/^}/s/^	INP_WUNLOCK(inp);/	;/'
+	mutant ktls_disable_closed "$h" "$s" proof_disable_ifnet "$dk" "$ut" \
+	    '/^ktls_disable_ifnet_help(/,/^}/s/if (tp->t_flags \& TF_DISCONNECTED) {/if (0) {/'
+	mutant ktls_disable_off "$h" "$s" proof_disable_ifnet "$dk" "$ut" \
+	    '/^ktls_disable_ifnet_help(/,/^}/s/(\*tp->t_fb->tfb_hwtls_change)(tp, 0);/(*tp->t_fb->tfb_hwtls_change)(tp, 1);/'
 fi
 
 [ "$njobs" -gt 0 ] || { echo "run.sh: nothing selected" >&2; exit 2; }
