@@ -105,12 +105,16 @@ with RFC 5288 (AES-GCM) and RFC 7905 (ChaCha20-Poly1305).  No bug found.
   TLS_GET_RECORD control message and its payload, no more.  Only on
   fixed shapes: over a byte stream the proof is past 80G.
 
-Open question: a NIC-decrypted record shorter than its tag (20 bytes,
-where header and tag are 29) passes `ktls_decrypt()`'s header checks,
-which the software paths refuse with EMSGSIZE; its payload comes to -9
-bytes and the trailer trim walks off the chain to a NULL dereference
-(`run.sh` question `ktls_rx_decrypt_short`).  Whether a NIC can mark
-such a record decrypted is the hardware's; asked of the developer.
+Fix, waiting for the developer: a NIC-decrypted record shorter than its
+tag (20 bytes, where header and tag are 29) passed `ktls_decrypt()`'s
+header checks, which the software paths refuse with EMSGSIZE; its
+payload came to -9 bytes and the trailer trim walked off the chain to a
+NULL dereference.  The fix,
+[a482e648447b](https://github.com/ocochard/freebsd-src/commit/a482e648447b),
+refuses it with EMSGSIZE too (`run.sh` mutant `ktls_rx_decrypt_tagless`
+takes it back).  Whether a NIC can mark such a record decrypted is the
+hardware's: asked of the developer.  Report:
+[reports/ktls.md](reports/ktls.md).
 
 A TLS 1.0 sequence number past 2^64-1, which RFC 2246 forbids, would
 leave a record waiting for good; only a session set up within a few
