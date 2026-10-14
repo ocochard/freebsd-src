@@ -96,6 +96,7 @@ restrict_ktls="ktls_encrypt.function_pointer_call.1/cbmc_pr_ready
 cbmc_ktls="--object-bits 10 --no-signed-overflow-check"
 restrict_ktls_rx=$restrict_ktls
 cbmc_ktls_sb="--no-signed-overflow-check"
+cbmc_ktls_sbc="--no-signed-overflow-check --object-bits 10"
 # ktls_decrypt() walking off its chain goes on with what it reads there,
 # and fails further on: stop at the first property a trace violates.
 cbmc_ktls_rx="$cbmc_ktls --stop-on-fail"
@@ -956,6 +957,29 @@ if want ktls; then
 	    '/^sbappend_ktls_rx(/,/^}/s/^	ktls_check_rx(sb);/	;/'
 	mutant ktls_rx_append_mismatch "$hs" "$ss" proof_rx_append "$dk" \
 	    "$us" '/^sbappend_ktls_rx(/,/^}/s/sb->sb_tls_info->rx_ifp != ifp)/sb->sb_tls_info->rx_ifp == ifp)/'
+
+	# sbcompress_ktls_rx(), which sbappend_ktls_rx() appends with: the
+	# bytes kept in order, coalesced only into a tail with room, of the
+	# same decrypted state, and not when coalescing is off.  (Its
+	# M_WRITABLE() test is implied by M_TRAILINGSPACE(), which is 0 on a
+	# tail not writable: taking it back is no mutant.)
+	hc="$here/ktls/ktls_sbc.c"
+	uc="proof_rx_compress.0:7,proof_rx_compress.1:4,proof_rx_compress.2:19"
+	uc="$uc,proof_rx_compress.3:5,cbyte.0:5,sbcompress_ktls_rx.4:4"
+	uc="$uc,cbmc_memmove.0:7"
+	proof ktls_rx_compress "$hc" "$ss" proof_rx_compress "$dk" "$uc"
+	mutant ktls_rx_compress_mixed "$hc" "$ss" proof_rx_compress "$dk" "$uc" \
+	    '/^sbcompress_ktls_rx(/,/^}/s/!((m->m_flags ^ n->m_flags) \& M_DECRYPTED) \&\&/1 \&\&/'
+	mutant ktls_rx_compress_room "$hc" "$ss" proof_rx_compress "$dk" "$uc" \
+	    '/^sbcompress_ktls_rx(/,/^}/s/m->m_len <= M_TRAILINGSPACE(n)) {/1) {/'
+	mutant ktls_rx_compress_nocoal "$hc" "$ss" proof_rx_compress "$dk" \
+	    "$uc" '/^sbcompress_ktls_rx(/,/^}/s/((sb->sb_flags \& SB_NOCOALESCE) == 0) \&\&/1 \&\&/'
+	mutant ktls_rx_compress_empty "$hc" "$ss" proof_rx_compress "$dk" "$uc" \
+	    '/^sbcompress_ktls_rx(/,/^}/s/if (m->m_len == 0) {/if (0) {/'
+	mutant ktls_rx_compress_tlscc "$hc" "$ss" proof_rx_compress "$dk" "$uc" \
+	    '/^sbcompress_ktls_rx(/,/^}/s/sb->sb_tlscc += m->m_len;/;/'
+	mutant ktls_rx_compress_tail "$hc" "$ss" proof_rx_compress "$dk" "$uc" \
+	    '/^sbcompress_ktls_rx(/,/^}/s/sb->sb_mtlstail = m;/;/'
 fi
 
 [ "$njobs" -gt 0 ] || { echo "run.sh: nothing selected" >&2; exit 2; }

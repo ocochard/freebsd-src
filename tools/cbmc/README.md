@@ -132,6 +132,11 @@ with RFC 5288 (AES-GCM) and RFC 7905 (ChaCha20-Poly1305).  No bug found.
   plain data, not ready, each mbuf decrypted as its packet was, then the
   buffer is checked for a whole record, and the session told when the
   last packet came in on another interface than its receive tag's.
+  `sbcompress_ktls_rx()` (harness `ktls/ktls_sbc.c`), which appends the
+  chain: the bytes follow those already there, in order, none moved
+  between decrypted and encrypted data; empty mbufs are dropped and small
+  ones copied into a tail that has the room, unless coalescing is off;
+  a read-only tail is not written; the counts and the tail are kept.
 - `ktls_decrypt()` (harness `ktls/ktls_rx.c`), on one record in one
   mbuf decrypted by the NIC, AES-GCM TLS 1.2: delivered as a
   TLS_GET_RECORD control message and its payload, no more.  Only on
