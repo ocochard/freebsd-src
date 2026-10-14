@@ -58,6 +58,11 @@
  *			readied, or the connection dropped and the batch
  *			freed, without a page, buffer or reference left
  *			behind; and ktls_encrypt_async() with completions
+ *   proof_rx_type	tls13_find_record_type(), against RFC 8446 5.4
+ *   proof_rx_detach	ktls_detach_record(): the record's bytes, no more,
+ *			off the TLS chain, the rest and its counts kept
+ *   proof_rx_check	ktls_check_rx(): a socket queued for decryption
+ *			once a whole record is in, once, referenced
  */
 
 #include SOURCE
@@ -166,6 +171,7 @@ setup(void)
 	ktls_cpuid_lookup[0] = 0;
 	ktls_wq = &g_wq;
 	STAILQ_INIT(&g_wq.m_head);
+	STAILQ_INIT(&g_wq.so_head);
 	g_wq.running = nondet_bool();
 	ktls_cnt_tx_pending = counter_u64_alloc(M_WAITOK);
 	ktls_cnt_tx_queued = counter_u64_alloc(M_WAITOK);
@@ -646,7 +652,7 @@ static struct mbuf *g_w[WREC + 1];	/* the batch, then the next record */
 static int g_wn;			/* records in the batch */
 static int g_enc[WREC], g_ready[WREC], g_freed[WREC], g_srcfree[WREC];
 static bool g_file[WREC];		/* a record of file pages */
-static int g_dropped, g_nbuf, g_nbuffree;
+static int g_dropped, g_droperr, g_nbuf, g_nbuffree;
 static struct ktls_ocf_encrypt_state *g_deferred[WREC];
 static int g_ndeferred;
 
@@ -796,8 +802,8 @@ cbmc_pr_ready(struct socket *so, struct mbuf *m, int count)
 void
 cbmc_ktls_drop(struct socket *so, int error)
 {
-	__CPROVER_assert(so == &g_so && error == EIO,
-	    "a failed encryption drops the connection with EIO");
+	__CPROVER_assert(so == &g_so, "drops the socket's connection");
+	g_droperr = error;
 	g_dropped++;
 }
 
@@ -1028,6 +1034,8 @@ check_batch(struct ktls_session *tls)
 	}
 	__CPROVER_assert(g_nbuf == g_nbuffree + live,
 	    "a buffer holds a record or is freed");
+	__CPROVER_assert(g_dropped == 0 || g_droperr == EIO,
+	    "a failed encryption drops the connection with EIO");
 	__CPROVER_assert(ok == g_wn || g_dropped == 1,
 	    "a batch not readied whole drops the connection");
 	__CPROVER_assert(g_dropped <= 1 || !tls->sync_dispatch,
@@ -1078,4 +1086,316 @@ proof_encrypt_async(void)
 		if (i < g_ndeferred)
 			ktls_encrypt_cb(g_deferred[i], nondet_bool() ? 0 : EIO);
 	check_batch(tls);
+}
+
+/*
+ * Receive.  A record as it sits in the socket buffer: RLEN bytes, the
+ * header first, split over up to RMBUF mbufs whose data lies in buffers
+ * of their own, as clusters do, so that writing a byte does not rewrite
+ * an mbuf.
+ */
+#ifndef RLEN
+#define	RLEN	40
+#endif
+#ifndef RMBUF
+#define	RMBUF	3
+#endif
+
+static uint8_t g_rbytes[RLEN];
+static struct mbuf *g_rm[RMBUF];
+
+static struct mbuf *
+rx_chain(int len)
+{
+	struct mbuf *m;
+	int cut, i, off;
+	char *buf;
+
+	off = 0;
+	for (i = 0; i < RMBUF; i++) {
+		m = __CPROVER_allocate(sizeof(struct mbuf), 1);
+		buf = __CPROVER_allocate(RLEN, 0);
+		cut = nondet_int();
+		__CPROVER_assume(cut >= 0 && cut <= len - off);
+		if (i == RMBUF - 1)
+			cut = len - off;
+		m->m_flags = M_EXT;
+		m->m_ext.ext_buf = buf;
+		m->m_ext.ext_size = RLEN;
+		m->m_data = buf;
+		m->m_len = cut;
+		memcpy(buf, g_rbytes + off, cut);
+		off += cut;
+		g_rm[i] = m;
+		if (i > 0)
+			g_rm[i - 1]->m_next = m;
+	}
+	return (g_rm[0]);
+}
+
+/*
+ * tls13_find_record_type(), against RFC 8446 5.4: the record holds the
+ * header, the content, the real content type, zeros of padding, then the
+ * tag; the type is the last byte before the tag that is not zero, and a
+ * record whose bytes past the header are all zero is to be refused.
+ */
+void
+proof_rx_type(void)
+{
+	struct ktls_session *tls;
+	uint8_t type;
+	int error, i, last, len, tag, trailer;
+
+	tls = &g_session;
+	tls->params.tls_vminor = TLS_MINOR_VER_THREE;
+	tls->params.tls_hlen = sizeof(struct tls_record_layer);
+	tag = 16;
+	len = nondet_int();
+	__CPROVER_assume(len >= tls->params.tls_hlen + tag && len <= RLEN);
+	for (i = 0; i < RLEN; i++)
+		g_rbytes[i] = nondet_int();
+	last = -1;
+	for (i = 0; i < RLEN; i++)
+		if (i >= tls->params.tls_hlen && i < len - tag &&
+		    g_rbytes[i] != 0)
+			last = i;
+	trailer = tag;
+
+	error = tls13_find_record_type(tls, rx_chain(len), len, &trailer,
+	    &type);
+
+	if (last < 0)
+		__CPROVER_assert(error == EBADMSG,
+		    "content with no type is refused");
+	else
+		__CPROVER_assert(error == 0 && type == g_rbytes[last] &&
+		    trailer == len - last,
+		    "the type is the last byte not zero before the tag, the "
+		    "trailer from it on");
+}
+
+/* The socket buffer's TLS accounting, uipc_sockbuf.c, as it is. */
+void
+sballoc_ktls_rx(struct sockbuf *sb, struct mbuf *m)
+{
+	sb->sb_ccc += m->m_len;
+	sb->sb_tlscc += m->m_len;
+	sb->sb_mbcnt += MSIZE;
+	if (m->m_flags & M_EXT)
+		sb->sb_mbcnt += m->m_ext.ext_size;
+}
+
+void
+sbfree_ktls_rx(struct sockbuf *sb, struct mbuf *m)
+{
+	sb->sb_ccc -= m->m_len;
+	sb->sb_tlscc -= m->m_len;
+	sb->sb_mbcnt -= MSIZE;
+	if (m->m_flags & M_EXT)
+		sb->sb_mbcnt -= m->m_ext.ext_size;
+}
+
+/* mb_dupcl(), kern_mbuf.c: n shares m's cluster. */
+void
+mb_dupcl(struct mbuf *n, struct mbuf *m)
+{
+	__CPROVER_assert((m->m_flags & M_EXT) != 0 &&
+	    (n->m_flags & (M_EXT | M_EXTPG)) == 0,
+	    "shares a cluster into an mbuf without one");
+	n->m_ext.ext_buf = m->m_ext.ext_buf;
+	n->m_ext.ext_size = m->m_ext.ext_size;
+	n->m_flags |= M_EXT;
+}
+
+/* m_length(), uipc_mbuf.c. */
+u_int
+m_length(struct mbuf *m0, struct mbuf **last)
+{
+	struct mbuf *m;
+	u_int len;
+	int i;
+
+	len = 0;
+	m = m0;
+	for (i = 0; i < RMBUF + 1 && m != NULL; i++) {
+		len += m->m_len;
+		if (last != NULL)
+			*last = m;
+		m = m->m_next;
+	}
+	__CPROVER_assert(m == NULL, "model: chain length");
+	return (len);
+}
+
+/* Byte k of a chain, and whether it has one. */
+static bool
+chain_byte(struct mbuf *m, int k, uint8_t *b)
+{
+	int i;
+
+	for (i = 0; i < RMBUF + 1 && m != NULL; i++) {
+		if (k < m->m_len) {
+			*b = mtod(m, uint8_t *)[k];
+			return (true);
+		}
+		k -= m->m_len;
+		m = m->m_next;
+	}
+	return (false);
+}
+
+/* The sb_mtls chain holds the bytes from..to, and its tail is its last. */
+static void
+check_tls_chain(struct sockbuf *sb, int from, int to)
+{
+	struct mbuf *last;
+	uint8_t b;
+	int k;
+
+	__CPROVER_assert(m_length(sb->sb_mtls, &last) == to - from &&
+	    sb->sb_tlscc == to - from,
+	    "the TLS chain holds what is left, and is counted so");
+	__CPROVER_assert(sb->sb_mtls == NULL ? sb->sb_mtlstail == NULL :
+	    sb->sb_mtlstail == last && last->m_next == NULL,
+	    "the TLS chain's tail is its last mbuf");
+	for (k = 0; k < RLEN; k++)
+		if (k < to - from)
+			__CPROVER_assert(chain_byte(sb->sb_mtls, k, &b) &&
+			    b == g_rbytes[from + k],
+			    "what is left is the bytes after the record");
+}
+
+/*
+ * ktls_detach_record() of a record of len bytes from the TLS chain
+ * of L: the record's bytes come out, those after it stay, split mbuf
+ * included, and the socket buffer counts both: sb_ccc unchanged, the
+ * record in sb_tlsdcc, what is left in sb_tlscc, and every mbuf left and
+ * the cluster it holds in sb_mbcnt.
+ */
+static int
+mbcnt(struct mbuf *m)
+{
+	int i, n;
+
+	n = 0;
+	for (i = 0; i < RMBUF + 1 && m != NULL; i++) {
+		n += MSIZE + ((m->m_flags & M_EXT) != 0 ?
+		    m->m_ext.ext_size : 0);
+		m = m->m_next;
+	}
+	return (n);
+}
+
+void
+proof_rx_detach(void)
+{
+	struct sockbuf *sb = &g_so.so_rcv;
+	struct mbuf *top;
+	u_int ccc, other;
+	uint8_t b;
+	int k, L, len;
+
+	setup();
+	L = nondet_int();
+	__CPROVER_assume(L > 0 && L <= RLEN);
+	for (k = 0; k < RLEN; k++)
+		g_rbytes[k] = nondet_int();
+	sb->sb_mtls = rx_chain(L);
+	sb->sb_mtlstail = g_rm[RMBUF - 1];
+	sb->sb_tlscc = L;
+	other = nondet_u_int();
+	__CPROVER_assume(other <= 65536);
+	sb->sb_ccc = L + other;
+	sb->sb_mbcnt = mbcnt(sb->sb_mtls) + other;
+	sb->sb_tlsdcc = 0;
+	ccc = sb->sb_ccc;
+	len = nondet_int();
+	__CPROVER_assume(len > 0 && len <= L);
+
+	top = ktls_detach_record(sb, len);
+
+	__CPROVER_assert(top != NULL, "model: the chain does not change");
+	for (k = 0; k < RLEN; k++)
+		if (k < len)
+			__CPROVER_assert(chain_byte(top, k, &b) &&
+			    b == g_rbytes[k], "the record's bytes come out");
+	__CPROVER_assert(m_length(top, NULL) == len,
+	    "and no more");
+	check_tls_chain(sb, len, L);
+	__CPROVER_assert(sb->sb_ccc == ccc && sb->sb_tlsdcc == len,
+	    "the record moves from sb_tlscc to sb_tlsdcc");
+	__CPROVER_assert(sb->sb_mbcnt == mbcnt(sb->sb_mtls) + other,
+	    "sb_mbcnt counts the mbufs left and their clusters");
+}
+
+/* m_copydata(), uipc_mbuf.c, for the chains of these proofs. */
+void
+m_copydata(const struct mbuf *m, int off, int len, caddr_t cp)
+{
+	uint8_t b;
+	int i;
+
+	for (i = 0; i < RLEN; i++) {
+		if (i >= len)
+			break;
+		__CPROVER_assert(chain_byte((struct mbuf *)m, off + i, &b),
+		    "copies bytes the chain holds");
+		cp[i] = b;
+	}
+	__CPROVER_assert(i == len, "model: bytes copied");
+}
+
+/*
+ * ktls_check_rx(), on each append to a TLS receive buffer: the socket is
+ * queued for decryption once a whole record is in, the record's length
+ * read from its header, and only once while it is; it holds a socket
+ * reference for the worker.  A partial record when nothing more can come
+ * is an error.
+ */
+void
+proof_rx_check(void)
+{
+	struct sockbuf *sb = &g_so.so_rcv;
+	bool eof, queued, running, was;
+	u_int count;
+	int k, L, rlen;
+
+	setup();
+	L = nondet_int();
+	__CPROVER_assume(L >= 0 && L <= RLEN);
+	for (k = 0; k < RLEN; k++)
+		g_rbytes[k] = nondet_int();
+	sb->sb_mtls = L > 0 ? rx_chain(L) : NULL;
+	sb->sb_tlscc = L;
+	sb->sb_tls_info = sw_session(false);
+	sb->sb_flags = SB_TLS_RX | (nondet_bool() ? SB_TLS_RX_RUNNING : 0);
+	eof = nondet_bool();
+	sb->sb_state = eof ? SBS_CANTRCVMORE : 0;
+	g_so.so_error = 0;
+	g_so.so_count = count = 1 + nondet_bool();
+	was = (sb->sb_flags & SB_TLS_RX_RUNNING) != 0;
+	running = g_wq.running;
+	g_nwakeups = 0;
+	rlen = L >= 5 ? 5 + (g_rbytes[3] << 8 | g_rbytes[4]) : -1;
+
+	ktls_check_rx(sb);
+
+	queued = !STAILQ_EMPTY(&g_wq.so_head);
+	if (was)
+		__CPROVER_assert(!queued && g_so.so_count == count &&
+		    g_so.so_error == 0, "a socket decrypting is left alone");
+	else if (rlen < 0 || L < rlen)
+		__CPROVER_assert(!queued && g_so.so_count == count &&
+		    (sb->sb_flags & SB_TLS_RX_RUNNING) == 0 &&
+		    g_so.so_error == (eof && L > 0 ? EMSGSIZE : 0),
+		    "a partial record waits, or is an error past the end");
+	else
+		__CPROVER_assert(queued &&
+		    STAILQ_FIRST(&g_wq.so_head) == &g_so &&
+		    STAILQ_NEXT(&g_so, so_ktls_rx_list) == NULL &&
+		    (sb->sb_flags & SB_TLS_RX_RUNNING) != 0 &&
+		    g_so.so_count == count + 1 &&
+		    g_nwakeups == (running ? 0 : 1),
+		    "a whole record queues the socket once, referenced, its "
+		    "thread woken when idle");
 }

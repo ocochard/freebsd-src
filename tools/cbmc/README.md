@@ -93,6 +93,14 @@ with RFC 5288 (AES-GCM) and RFC 7905 (ChaCha20-Poly1305).  No bug found.
   left alone.  On a one record batch, and two synchronously (`SLOW=1`).
   Encryption itself (`ktls_ocf_encrypt()`) is modelled by what it is
   given; an asynchronous completion runs after the worker moves on.
+- Receive: `tls13_find_record_type()` against RFC 8446 5.4 (the type is
+  the last byte not zero before the tag, content with none refused);
+  `ktls_detach_record()` takes exactly the record's bytes off the TLS
+  chain, splitting an mbuf if need be, leaves the rest with its tail,
+  and keeps the socket buffer's counts; `ktls_check_rx()` queues the
+  socket once a whole record is in, once, with a reference, an error if
+  only part of one is and no more can come.  Not covered:
+  `ktls_decrypt()` itself, whose one record proof is past 70G.
 
 A TLS 1.0 sequence number past 2^64-1, which RFC 2246 forbids, would
 leave a record waiting for good; only a session set up within a few
