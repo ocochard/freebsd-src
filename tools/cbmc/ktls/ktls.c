@@ -73,6 +73,8 @@
  *   proof_set_tx_mode	ktls_set_tx_mode(): an open connection switched
  *			between software and NIC offload, by a clone of its
  *			session, or left as it was, whatever race it loses
+ *   proof_disable_ifnet ktls_disable_ifnet() and its task: offload off
+ *			once per connection, by a switch to software
  */
 
 #include SOURCE
@@ -1485,11 +1487,13 @@ mtx_pool_find(struct mtx_pool *pool, void *ptr)
 	return (&g_poolmtx);
 }
 
+/* The task scheduled last, and how many. */
+static struct task *g_task;
+
 int
 taskqueue_enqueue(struct taskqueue *queue, struct task *task)
 {
-	__CPROVER_assert(task == &g_session.reset_tag_task,
-	    "schedules the session's tag reset");
+	g_task = task;
 	g_nreset++;
 	return (0);
 }
@@ -1604,6 +1608,7 @@ proof_tag_eagain(void)
 	    "the packet is refused for now");
 	__CPROVER_assert(tls->reset_pending &&
 	    g_nreset == (pending ? 0 : 1) &&
+	    (pending || g_task == &tls->reset_tag_task) &&
 	    tls->refcount == refs + (pending ? 0 : 1),
 	    "a reset is scheduled once, referenced");
 }
@@ -1716,11 +1721,13 @@ soiolock(struct socket *so, struct sx *sx, int flags)
 
 void soiounlock(struct sx *sx) { }
 
+static int g_hwtls_on;
+
 static void
 cbmc_hwtls_change(struct tcpcb *tp, int on)
 {
-	__CPROVER_assert(tp == &g_tp && on == 1,
-	    "the stack is told offload is on");
+	__CPROVER_assert(tp == &g_tp, "the stack of the connection");
+	g_hwtls_on = on;
 	g_hwtls++;
 }
 
@@ -1812,6 +1819,88 @@ proof_set_tx_mode(void)
 	    "the old session loses the buffer's reference");
 	__CPROVER_assert(mode != TCP_TLS_MODE_IFNET ||
 	    (g_tp.t_nic_ktls_xmit &&
-	    g_hwtls == (g_fb.tfb_hwtls_change != NULL ? 1 : 0)),
+	    g_hwtls == (g_fb.tfb_hwtls_change != NULL ? 1 : 0) &&
+	    (g_hwtls == 0 || g_hwtls_on == 1)),
 	    "offload is marked on the connection, the stack told");
+}
+
+/*
+ * ktls_disable_ifnet(), from tcp_account_for_send() when retransmits of
+ * NIC-encrypted data pass kern.ipc.tls.ifnet_max_rexmit_pct, with the
+ * inpcb locked and so a session in the buffer: offload is disabled once
+ * per connection, by a task holding a reference on the session and the
+ * socket.  The task, ktls_disable_ifnet_help(), switches the connection
+ * to software, by ktls_set_tx_mode() (proof_set_tx_mode), and on success
+ * tells the stack offload is off; on a closed connection it does
+ * nothing.  It drops both references and leaves the inpcb unlocked.
+ */
+void
+proof_disable_ifnet(void)
+{
+	struct ktls_session *tls = &g_old;
+	u_int refs, socount;
+	bool closed, dis;
+
+	setup();
+	g_so.so_options = 0;
+	g_so.so_pcb = tptoinpcb(&g_tp);
+	g_tp.t_inpcb.inp_socket = &g_so;
+	g_tp.t_fb = &g_fb;
+	g_fb.tfb_hwtls_change = nondet_bool() ? cbmc_hwtls_change : NULL;
+	closed = nondet_bool();
+	g_tp.t_flags = closed ? TF_DISCONNECTED : 0;
+	g_tp.t_pacing_rate = -1;
+	g_ocf_err = nondet_bool() ? 0 : EINVAL;
+	g_tp.t_nic_ktls_xmit = 1;
+	dis = g_tp.t_nic_ktls_xmit_dis = nondet_bool();
+	tls->mode = nondet_bool() ? TCP_TLS_MODE_IFNET : TCP_TLS_MODE_SW;
+	tls->tx = true;
+	tls->inp = tptoinpcb(&g_tp);
+	tls->params.cipher_key = g_ckey;
+	tls->params.cipher_key_len = sizeof(g_ckey);
+	tls->refcount = refs = 1 + nondet_bool();
+	g_so.so_snd.sb_tls_info = tls;
+	g_so.so_count = socount = 1 + nondet_bool();
+	g_other.refcount = 1;
+	g_inpwl = true;
+
+	ktls_disable_ifnet(&g_tp);
+
+	__CPROVER_assert(g_inpwl, "the caller's inpcb lock is kept");
+	__CPROVER_assert(g_tp.t_nic_ktls_xmit_dis, "offload is disabled");
+	if (dis) {
+		__CPROVER_assert(g_nreset == 0 && tls->refcount == refs &&
+		    g_so.so_count == socount, "and only once");
+		return;
+	}
+	__CPROVER_assert(g_nreset == 1 && g_task == &tls->disable_ifnet_task &&
+	    tls->refcount == refs + 1 && g_so.so_count == socount + 1,
+	    "by a task, which holds the session and the socket");
+
+	/* The task, later, on its thread. */
+	g_inpwl = false;
+	ktls_disable_ifnet_help(tls, 1);
+
+	__CPROVER_assert(!g_inpwl, "the task leaves the inpcb unlocked");
+	__CPROVER_assert(g_so.so_count == socount,
+	    "the task drops its socket reference");
+	if (closed) {
+		__CPROVER_assert(g_so.so_snd.sb_tls_info == tls &&
+		    tls->refcount == refs && g_hwtls == 0,
+		    "a closed connection is left alone");
+		return;
+	}
+	if (g_so.so_snd.sb_tls_info->mode == TCP_TLS_MODE_SW &&
+	    g_so.so_snd.sb_tls_info != &g_other) {
+		__CPROVER_assert(g_hwtls == (g_fb.tfb_hwtls_change != NULL ?
+		    1 : 0) && (g_hwtls == 0 || g_hwtls_on == 0),
+		    "on a switch to software the stack is told it is off");
+	} else
+		__CPROVER_assert(g_hwtls == 0,
+		    "the stack is told nothing when the switch failed");
+	__CPROVER_assert(g_so.so_snd.sb_tls_info == tls ?
+	    tls->refcount == refs :
+	    tls->refcount == refs - 1 &&
+	    (refs > 1 || g_destroyed[g_ndestroyed - 1] == tls),
+	    "the task drops its session reference, the old one let go");
 }
