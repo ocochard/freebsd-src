@@ -120,6 +120,13 @@ with RFC 5288 (AES-GCM) and RFC 7905 (ChaCha20-Poly1305).  No bug found.
   and the socket, which switches an open connection to software and
   tells the stack, leaves a closed one alone, and lets go of both
   references and the inpcb.
+- The receive tag: `ktls_alloc_rcv_tag()` allocates it on the route's
+  interface or fails with the error of what is missing;
+  `ktls_input_ifp_mismatch()` follows packets to another interface and
+  schedules a reset once, referenced; `ktls_reset_receive_tag()` lets
+  the old tag go and asks for a new one where the interface can receive
+  TLS for the connection's family, leaving decryption to software
+  where not.
 - `ktls_decrypt()` (harness `ktls/ktls_rx.c`), on one record in one
   mbuf decrypted by the NIC, AES-GCM TLS 1.2: delivered as a
   TLS_GET_RECORD control message and its payload, no more.  Only on
@@ -135,6 +142,15 @@ refuses it with EMSGSIZE too (`run.sh` mutant `ktls_rx_decrypt_tagless`
 takes it back).  Whether a NIC can mark such a record decrypted is the
 hardware's: asked of the developer.  Report:
 [reports/ktls.md](reports/ktls.md).
+
+Fix [a0d672151d9e](https://github.com/ocochard/freebsd-src/commit/a0d672151d9e):
+`ktls_reset_receive_tag()` tested the receive TLS capabilities with
+`IFCAP2_RXTLS4` and `IFCAP2_RXTLS6`, which are bit numbers (0 and 1),
+not masks: an IPv4 connection never got a new receive tag after packets
+moved to another interface, and an IPv6 one got one where the interface
+had RXTLS4 but not RXTLS6.  `ktls_alloc_rcv_tag()` had the same mistake,
+fixed in c721694a1ca8 (`run.sh` mutants `ktls_rx_tag_v4` and
+`ktls_rx_tag_v6` take this fix back).
 
 A TLS 1.0 sequence number past 2^64-1, which RFC 2246 forbids, would
 leave a record waiting for good; only a session set up within a few

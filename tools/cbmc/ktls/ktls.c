@@ -75,6 +75,10 @@
  *			session, or left as it was, whatever race it loses
  *   proof_disable_ifnet ktls_disable_ifnet() and its task: offload off
  *			once per connection, by a switch to software
+ *   proof_rx_tag_alloc	ktls_alloc_rcv_tag(): a receive tag, or the error
+ *   proof_rx_tag_mismatch ktls_input_ifp_mismatch(): a tag reset, once
+ *   proof_rx_tag_reset	ktls_reset_receive_tag(): a new receive tag where
+ *			the interface can receive TLS for the family
  */
 
 #include SOURCE
@@ -1431,7 +1435,8 @@ static struct tcpcb g_tp;
 static struct nhop_object g_nh;
 static struct ifnet g_ifp;
 static int g_ifrefs, g_ntags, g_ntagsfreed, g_nreset, g_tcpdrop;
-static int g_tagtype;
+static int g_tagtype, g_tagvlan, g_tagtries;
+static struct ifnet *g_tagifp;
 static int g_caps;
 static struct m_snd_tag g_tags[2];
 static struct mtx g_poolmtx;
@@ -1443,19 +1448,39 @@ if_getcapenable(const if_t ifp)
 	return (g_caps);
 }
 
+/* A second interface, the one received packets moved to. */
+static struct ifnet g_ifp2;
+static int g_ifrefs2, g_caps2;
+
 void
 if_ref(struct ifnet *ifp)
 {
-	__CPROVER_assert(ifp == &g_ifp, "references the route's interface");
-	g_ifrefs++;
+	__CPROVER_assert(ifp == &g_ifp || ifp == &g_ifp2,
+	    "references an interface of the connection");
+	if (ifp == &g_ifp)
+		g_ifrefs++;
+	else
+		g_ifrefs2++;
 }
 
 void
 if_rele(struct ifnet *ifp)
 {
-	__CPROVER_assert(ifp == &g_ifp && g_ifrefs > 0,
+	__CPROVER_assert((ifp == &g_ifp && g_ifrefs > 0) ||
+	    (ifp == &g_ifp2 && g_ifrefs2 > 0),
 	    "releases an interface it referenced");
-	g_ifrefs--;
+	if (ifp == &g_ifp)
+		g_ifrefs--;
+	else
+		g_ifrefs2--;
+}
+
+int
+if_getcapenable2(const if_t ifp)
+{
+	__CPROVER_assert(ifp == &g_ifp || ifp == &g_ifp2,
+	    "an interface of the connection");
+	return (ifp == &g_ifp ? g_caps : g_caps2);
 }
 
 /* m_snd_tag_alloc(), kern_mbuf.c: the driver gives a tag, or fails. */
@@ -1463,8 +1488,13 @@ int
 m_snd_tag_alloc(struct ifnet *ifp, union if_snd_tag_alloc_params *params,
     struct m_snd_tag **mstp)
 {
-	__CPROVER_assert(ifp == &g_ifp, "a tag on the route's interface");
+	__CPROVER_assert(ifp == &g_ifp || ifp == &g_ifp2,
+	    "a tag on an interface of the connection");
+	g_tagifp = ifp;
+	g_tagtries++;
 	g_tagtype = params->hdr.type;
+	g_tagvlan = params->hdr.type == IF_SND_TAG_TYPE_TLS_RX ?
+	    params->tls_rx.vlan_id : 0;
 	if (nondet_bool())
 		return (nondet_bool() ? ENOMEM : EOPNOTSUPP);
 	__CPROVER_assert(g_ntags < 2, "model: tags");
@@ -1903,4 +1933,175 @@ proof_disable_ifnet(void)
 	    tls->refcount == refs - 1 &&
 	    (refs > 1 || g_destroyed[g_ndestroyed - 1] == tls),
 	    "the task drops its session reference, the old one let go");
+}
+
+/*
+ * The receive tag: a session decrypted by the NIC holds a receive tag on
+ * the interface packets come in on.  When they come in on another,
+ * ktls_input_ifp_mismatch() has ktls_reset_receive_tag() swap the tag
+ * for one there; without one, decryption goes on in software.  The
+ * interfaces' receive TLS capabilities (if_capenable2) are free.
+ */
+static bool g_recrypt;
+
+bool
+ktls_ocf_recrypt_supported(struct ktls_session *tls)
+{
+	return (g_recrypt);
+}
+
+static struct ktls_session *
+rx_session(void)
+{
+	struct ktls_session *tls = &g_old;
+
+	setup();
+	g_so.so_pcb = tptoinpcb(&g_tp);
+	g_tp.t_inpcb.inp_socket = &g_so;
+	g_tp.t_flags = nondet_bool() ? TF_DISCONNECTED : 0;
+	g_tp.t_inpcb.inp_vflag = nondet_bool() ? INP_IPV6 : INP_IPV4;
+	g_tp.t_inpcb.inp_route.ro_nh = nondet_bool() ? &g_nh : NULL;
+	g_nh.nh_ifp = &g_ifp;
+	g_caps = nondet_int();
+	g_caps2 = nondet_int();
+	g_recrypt = nondet_bool();
+	ktls_ifnet_permitted = nondet_bool();
+	tls->mode = TCP_TLS_MODE_IFNET;
+	tls->refcount = 1;
+	tls->so = &g_so;		/* a receive session's, not inp */
+	g_so.so_rcv.sb_tls_info = tls;
+	g_so.so_rcv.sb_flags = SB_TLS_RX;
+	g_so.so_count = 1;
+	return (tls);
+}
+
+/* The receive offload capability bit for the connection's family. */
+static int
+rxcap(void)
+{
+	return ((g_tp.t_inpcb.inp_vflag & INP_IPV6) ?
+	    IFCAP2_BIT(IFCAP2_RXTLS6) : IFCAP2_BIT(IFCAP2_RXTLS4));
+}
+
+/*
+ * ktls_alloc_rcv_tag(), on enabling receive offload: a TLS_RX tag on the
+ * route's interface, which the session keeps a reference on, or the
+ * error of what is missing: decryption the NIC can hand back (recrypt),
+ * a connection, leave to offload, a route, receive offload for the
+ * address family.
+ */
+void
+proof_rx_tag_alloc(void)
+{
+	struct ktls_session *tls = rx_session();
+	struct m_snd_tag *mst = NULL;
+	int error;
+
+	tls->rx_ifp = NULL;
+
+	error = ktls_alloc_rcv_tag(g_so.so_pcb, tls, &mst);
+
+	if (!g_recrypt)
+		__CPROVER_assert(error == ENXIO && g_ntags == 0 &&
+		    g_ifrefs == 0, "no tag the NIC cannot hand back");
+	else if (g_tp.t_flags & TF_DISCONNECTED)
+		__CPROVER_assert(error == ECONNRESET && g_ntags == 0 &&
+		    g_ifrefs == 0, "no tag for a closed connection");
+	else if (!ktls_ifnet_permitted ||
+	    g_tp.t_inpcb.inp_route.ro_nh == NULL)
+		__CPROVER_assert(error == ENXIO && g_ntags == 0 &&
+		    g_ifrefs == 0, "no tag where offload is off, or no route");
+	else {
+		__CPROVER_assert(tls->rx_ifp == &g_ifp && g_ifrefs == 1,
+		    "the session holds the route's interface");
+		if ((g_caps & rxcap()) == 0)
+			__CPROVER_assert(error == EOPNOTSUPP && g_ntags == 0,
+			    "no tag where the interface cannot");
+		else
+			__CPROVER_assert(g_tagtype == IF_SND_TAG_TYPE_TLS_RX &&
+			    (error != 0 ? g_ntags == 0 : mst == &g_tags[0]),
+			    "a receive tag, or the driver's error");
+	}
+}
+
+/*
+ * ktls_input_ifp_mismatch(), on a packet in from another interface: the
+ * session follows it, holding the new interface, and a reset of the tag
+ * is scheduled once, with a reference on the session and the socket.
+ */
+void
+proof_rx_tag_mismatch(void)
+{
+	struct ktls_session *tls = rx_session();
+	bool pending = nondet_bool();
+	u_int refs, socount;
+
+	tls->rx_ifp = &g_ifp;
+	g_ifrefs = 1;
+	tls->reset_pending = pending;
+	refs = tls->refcount;
+	socount = g_so.so_count;
+
+	ktls_input_ifp_mismatch(&g_so.so_rcv, &g_ifp2);
+
+	__CPROVER_assert(tls->rx_ifp == &g_ifp2 && g_ifrefs == 0 &&
+	    g_ifrefs2 == 1, "the session moves to the new interface");
+	__CPROVER_assert(tls->reset_pending &&
+	    g_nreset == (pending ? 0 : 1) &&
+	    (pending || g_task == &tls->reset_tag_task) &&
+	    tls->refcount == refs + (pending ? 0 : 1) &&
+	    g_so.so_count == socount + (pending ? 0 : 1),
+	    "a reset is scheduled once, holding the session and the socket");
+}
+
+/*
+ * ktls_reset_receive_tag(), the task: on an open connection the old tag
+ * is let go, and a new one asked for on the session's interface when it
+ * can receive TLS for the connection's family, else decryption is left
+ * to software; on a closed one nothing changes.  The reset is done, and
+ * the task's references let go.
+ */
+void
+proof_rx_tag_reset(void)
+{
+	struct ktls_session *tls = rx_session();
+	bool old = nondet_bool();
+	bool closed = (g_tp.t_flags & TF_DISCONNECTED) != 0;
+
+	tls->rx_ifp = &g_ifp2;
+	g_ifrefs2 = 1;
+	tls->rx_vlan_id = nondet_int();
+	tls->reset_pending = true;
+	tls->refcount = 2;		/* the socket's, and the task's */
+	g_so.so_count = 2;
+	if (old) {
+		g_tags[1].refcount = 1;
+		tls->snd_tag = &g_tags[1];
+	}
+
+	ktls_reset_receive_tag(tls, 1);
+
+	__CPROVER_assert(!tls->reset_pending && tls->refcount == 1 &&
+	    g_so.so_count == 1 && g_ifrefs2 == 1,
+	    "the reset is done, the task's references let go");
+	if (closed) {
+		__CPROVER_assert(g_ntagsfreed == 0 && g_ntags == 0,
+		    "a closed connection is left alone");
+		return;
+	}
+	__CPROVER_assert(g_ntagsfreed == (old ? 1 : 0),
+	    "the old tag is let go");
+	if ((g_caps2 & rxcap()) == 0)
+		__CPROVER_assert(g_tagtries == 0 && tls->snd_tag == NULL,
+		    "no tag where the interface cannot receive TLS");
+	else {
+		__CPROVER_assert(g_tagtries == 1,
+		    "a new tag is asked for where it can");
+		__CPROVER_assert(g_ntags == 0 || (g_tagifp == &g_ifp2 &&
+		    g_tagtype == IF_SND_TAG_TYPE_TLS_RX &&
+		    g_tagvlan == tls->rx_vlan_id),
+		    "a receive tag on the session's interface and VLAN");
+		__CPROVER_assert(tls->snd_tag == NULL ||
+		    tls->snd_tag == &g_tags[0], "the new tag is installed");
+	}
 }
