@@ -69,6 +69,9 @@ replace_sendfile="vm_pager_has_page:cbmc_vm_pager_has_page
 replace_ktls="ktls_buffer_alloc:cbmc_ktls_buffer_alloc
 	ktls_drop:cbmc_ktls_drop
 	ktls_destroy:cbmc_ktls_destroy"
+replace_ktls_rx="$replace_ktls
+	ktls_resync_ifnet:cbmc_ktls_resync_ifnet
+	m_free:cbmc_m_free"
 
 # The targets of each indirect call, which goto-instrument would otherwise
 # resolve to every function of a compatible type: pr_abort() through an
@@ -87,6 +90,10 @@ restrict_ktls="ktls_encrypt.function_pointer_call.1/cbmc_pr_ready
 # cbmc flags of a harness: the KTLS worker turns physical addresses into
 # pointers, each an object, past cbmc's 256.
 cbmc_ktls="--object-bits 10"
+restrict_ktls_rx=$restrict_ktls
+# ktls_decrypt() walking off its chain goes on with what it reads there,
+# and fails further on: stop at the first property a trace violates.
+cbmc_ktls_rx="$cbmc_ktls --stop-on-fail"
 
 # A worker, which is this script run by xargs below: build and check job N
 # of the queue in WORK, leaving cbmc's status beside its log -- 0 proved,
@@ -656,6 +663,17 @@ dr12="-DKERN_TLS -DRLEN=12"
 ur12="proof_rx_detach.0:13,proof_rx_detach.1:13,m_length.0:5,chain_byte.0:5"
 ur12="$ur12,check_tls_chain.0:13,mbcnt.0:5,rx_chain.0:4"
 ur12="$ur12,ktls_detach_record.1:5,ktls_detach_record.3:5,cbmc_memmove.0:13"
+hr="$here/ktls/ktls_rx.c"
+drn="-DKERN_TLS -DRMBUF=1 -DRX_RECORD -DRX_NIC -DRX_CIPHER=CRYPTO_AES_NIST_GCM_16"
+drn="$drn -DRX_VMINOR=TLS_MINOR_VER_TWO"
+urn="proof_rx_decrypt.1:2,proof_rx_decrypt.3:3,ktls_decrypt.8:3"
+urn="$urn,ktls_decrypt.6:3,ktls_decrypt.7:3,m_freem.0:5,ktls_detach_record.1:4"
+urn="$urn,ktls_detach_record.3:4,tls13_find_record_type.1:3,m_copydata.0:22"
+urn="$urn,m_length.0:3,chain_byte.0:3,rx_chain.0:2,ktls_mbuf_crypto_state.0:2"
+urn32="$urn,proof_rx_decrypt.0:33,proof_rx_decrypt.2:33"
+urn32="$urn32,tls13_find_record_type.0:33,cbmc_memmove.0:33"
+urn20="$urn,proof_rx_decrypt.0:21,proof_rx_decrypt.2:21"
+urn20="$urn20,tls13_find_record_type.0:21,cbmc_memmove.0:21"
 uw2=$(echo "$uw" | sed -E 's/(ktls_encrypt\.4|widx\.0|cbmc_pr_ready\.0|check_batch\.[01]):2/\1:3/g; s/mb_free_notready\.0:7/mb_free_notready.0:12/; s/batch\.0:3/batch.0:4/; s/check_batch\.2:6/check_batch.2:11/')
 
 if want ktls; then
@@ -783,6 +801,17 @@ if want ktls; then
 	    '/^ktls_check_rx(/,/^}/s/if (sb->sb_flags \& SB_TLS_RX_RUNNING)$/if (0)/'
 	mutant ktls_rx_soref "$h" "$s" proof_rx_check "$dk" "$ur" \
 	    '/^ktls_check_rx(/,/^}/s/^	soref(so);/	;/'
+
+	# ktls_decrypt(), on one record in one mbuf, decrypted by the NIC,
+	# AES-GCM TLS 1.2 (header 13, tag 16): one of 32 bytes is delivered;
+	# one of 20 is shorter than its tag, which the software paths refuse
+	# but this one trims to a payload of -9 bytes and walks off the chain
+	# (uipc_ktls.c, the trailer trim): open until the developer says
+	# whether the NIC can mark such a record decrypted.
+	proof ktls_rx_decrypt_nic "$hr" "$s" proof_rx_decrypt "$drn -DRX_LEN=32 -DRLEN=32" \
+	    "$urn32"
+	question ktls_rx_decrypt_short "$hr" "$s" proof_rx_decrypt \
+	    "$drn -DRX_LEN=20 -DRLEN=20" "$urn20"
 fi
 
 [ "$njobs" -gt 0 ] || { echo "run.sh: nothing selected" >&2; exit 2; }
@@ -892,8 +921,13 @@ while read -r kind name; do
 		fail=1
 		;;
 	question:10)
-		why=$(grep -m1 ': FAILURE$' "$work/$name.log" |
-		    sed 's/^\[[^]]*\] //; s/: FAILURE$//')
+		# The property the trace violates, under --stop-on-fail.
+		why=$( (awk '/^Violated property:/{getline;
+		    sub(/.* line /, ""); l=$1; getline;
+		    sub(/^ */, ""); print "line " l " " $0; exit}' \
+		    "$work/$name.log"; grep -m1 ': FAILURE$' \
+		    "$work/$name.log" | sed 's/^\[[^]]*\] //; s/: FAILURE$//') |
+		    head -1)
 		echo "open question $name: $why"
 		;;
 	question:0)

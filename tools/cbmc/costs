@@ -34,6 +34,8 @@ ktls_record_iovlen 305 6213
 ktls_record_offset 304 6280
 ktls_record_pgfree 284 6336
 ktls_rx_check 31 269
+ktls_rx_decrypt_nic 979 44470
+ktls_rx_decrypt_short 917 36496
 ktls_rx_detach 138 1468
 ktls_rx_notype 62 350
 ktls_rx_once 27 270
