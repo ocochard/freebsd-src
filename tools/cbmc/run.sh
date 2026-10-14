@@ -803,15 +803,17 @@ if want ktls; then
 	    '/^ktls_check_rx(/,/^}/s/^	soref(so);/	;/'
 
 	# ktls_decrypt(), on one record in one mbuf, decrypted by the NIC,
-	# AES-GCM TLS 1.2 (header 13, tag 16): one of 32 bytes is delivered;
-	# one of 20 is shorter than its tag, which the software paths refuse
-	# but this one trims to a payload of -9 bytes and walks off the chain
-	# (uipc_ktls.c, the trailer trim): open until the developer says
-	# whether the NIC can mark such a record decrypted.
-	proof ktls_rx_decrypt_nic "$hr" "$s" proof_rx_decrypt "$drn -DRX_LEN=32 -DRLEN=32" \
-	    "$urn32"
-	question ktls_rx_decrypt_short "$hr" "$s" proof_rx_decrypt \
+	# AES-GCM TLS 1.2 (header 13, tag 16): one of 32 bytes is delivered,
+	# one of 20, shorter than its tag, refused.
+	proof ktls_rx_decrypt_nic "$hr" "$s" proof_rx_decrypt \
+	    "$drn -DRX_LEN=32 -DRLEN=32" "$urn32"
+	proof ktls_rx_decrypt_short "$hr" "$s" proof_rx_decrypt \
 	    "$drn -DRX_LEN=20 -DRLEN=20" "$urn20"
+	# The fix taken back: the payload comes to -9 bytes and the trailer
+	# trim walks off the chain to a NULL dereference.
+	mutant ktls_rx_decrypt_tagless "$hr" "$s" proof_rx_decrypt \
+	    "$drn -DRX_LEN=20 -DRLEN=20" "$urn20" \
+	    's/if (tls_len < tls->params.tls_hlen +$/if (0 \&\& tls_len < tls->params.tls_hlen +/'
 fi
 
 [ "$njobs" -gt 0 ] || { echo "run.sh: nothing selected" >&2; exit 2; }
@@ -893,6 +895,14 @@ if [ -s "$work/costs.new" ]; then
 	cp "$work/costs.all" "$costs"
 fi
 
+# violated LOG: the property a trace violates, which is all cbmc says of
+# a failure under --stop-on-fail.
+violated()
+{
+	awk '/^Violated property:/{getline; sub(/.* line /, ""); l=$1;
+	    getline; sub(/^ */, ""); print "line " l " " $0; exit}' "$1"
+}
+
 while read -r kind name; do
 	case $kind in
 	unapplied)
@@ -909,10 +919,11 @@ while read -r kind name; do
 	mutant:10)
 		# The property that caught it, rather than a loop bound
 		# the mutant ran past, when there is one.
-		why=$( (grep ': FAILURE$' "$work/$name.log" |
+		why=$( (violated "$work/$name.log"
+		    (grep ': FAILURE$' "$work/$name.log" |
 		    grep -v 'unwinding assertion'; grep -m1 ': FAILURE$' \
-		    "$work/$name.log") | head -1 |
-		    sed 's/^\[[^]]*\] //; s/: FAILURE$//')
+		    "$work/$name.log") | sed 's/^\[[^]]*\] //; s/: FAILURE$//') |
+		    head -1)
 		echo "ok   mutant $name: caught by $why"
 		;;
 	proof:10)
@@ -921,11 +932,7 @@ while read -r kind name; do
 		fail=1
 		;;
 	question:10)
-		# The property the trace violates, under --stop-on-fail.
-		why=$( (awk '/^Violated property:/{getline;
-		    sub(/.* line /, ""); l=$1; getline;
-		    sub(/^ */, ""); print "line " l " " $0; exit}' \
-		    "$work/$name.log"; grep -m1 ': FAILURE$' \
+		why=$( (violated "$work/$name.log"; grep -m1 ': FAILURE$' \
 		    "$work/$name.log" | sed 's/^\[[^]]*\] //; s/: FAILURE$//') |
 		    head -1)
 		echo "open question $name: $why"
