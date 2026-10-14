@@ -127,6 +127,11 @@ with RFC 5288 (AES-GCM) and RFC 7905 (ChaCha20-Poly1305).  No bug found.
   the old tag go and asks for a new one where the interface can receive
   TLS for the connection's family, leaving decryption to software
   where not.
+- `sbappend_ktls_rx()` (harness `ktls/ktls_sb.c`, for
+  `sys/kern/uipc_sockbuf.c`): TCP data lands in a TLS receive buffer as
+  plain data, not ready, each mbuf decrypted as its packet was, then the
+  buffer is checked for a whole record, and the session told when the
+  last packet came in on another interface than its receive tag's.
 - `ktls_decrypt()` (harness `ktls/ktls_rx.c`), on one record in one
   mbuf decrypted by the NIC, AES-GCM TLS 1.2: delivered as a
   TLS_GET_RECORD control message and its payload, no more.  Only on
@@ -151,6 +156,13 @@ moved to another interface, and an IPv6 one got one where the interface
 had RXTLS4 but not RXTLS6.  `ktls_alloc_rcv_tag()` had the same mistake,
 fixed in c721694a1ca8 (`run.sh` mutants `ktls_rx_tag_v4` and
 `ktls_rx_tag_v6` take this fix back).
+
+Fix [447cba6c6808](https://github.com/ocochard/freebsd-src/commit/447cba6c6808):
+`sbappend_ktls_rx()` read each packet's receiving interface from the
+chain's first mbuf, whose packet header it had demoted by then, so a
+chain of two packets or more had no interface and a change of input
+interface went unnoticed (`run.sh` mutant `ktls_rx_append_first` takes
+the fix back).
 
 A TLS 1.0 sequence number past 2^64-1, which RFC 2246 forbids, would
 leave a record waiting for good; only a session set up within a few
