@@ -70,6 +70,9 @@
  *   proof_tag_reset	ktls_reset_send_tag(): the old tag let go, a new
  *			one installed or the connection aborted
  *   proof_tag_try	ktls_try_ifnet(): offloaded with its tag, or not
+ *   proof_set_tx_mode	ktls_set_tx_mode(): an open connection switched
+ *			between software and NIC offload, by a clone of its
+ *			session, or left as it was, whatever race it loses
  */
 
 #include SOURCE
@@ -815,10 +818,17 @@ cbmc_ktls_drop(struct socket *so, int error)
 }
 
 /* run.sh replaces calls to ktls_destroy(): never reached, it is large. */
+static struct ktls_session *g_destroyed[2];
+static int g_ndestroyed;
+
 void
 cbmc_ktls_destroy(struct ktls_session *tls)
 {
-	__CPROVER_assert(0, "the socket keeps its session reference");
+	__CPROVER_assert(tls != &g_session,
+	    "the socket keeps its session reference");
+	__CPROVER_assert(tls->refcount == 0 && g_ndestroyed < 2,
+	    "a session is destroyed unreferenced");
+	g_destroyed[g_ndestroyed++] = tls;
 }
 
 void
@@ -1484,9 +1494,22 @@ taskqueue_enqueue(struct taskqueue *queue, struct task *task)
 	return (0);
 }
 
-void _rw_wlock_cookie(volatile uintptr_t *c, const char *file, int line) { }
-void _rw_wunlock_cookie(volatile uintptr_t *c, const char *file,
-    int line) { }
+/* The inpcb's write lock, the only one taken: who holds it. */
+static bool g_inpwl;
+
+void
+_rw_wlock_cookie(volatile uintptr_t *c, const char *file, int line)
+{
+	__CPROVER_assert(!g_inpwl, "the inpcb is not write-locked twice");
+	g_inpwl = true;
+}
+
+void
+_rw_wunlock_cookie(volatile uintptr_t *c, const char *file, int line)
+{
+	__CPROVER_assert(g_inpwl, "the inpcb is write-unlocked when held");
+	g_inpwl = false;
+}
 void epoch_enter_preempt(epoch_t epoch, epoch_tracker_t et) { }
 void epoch_exit_preempt(epoch_t epoch, epoch_tracker_t et) { }
 
@@ -1497,7 +1520,10 @@ tcp_drop(struct tcpcb *tp, int error)
 	    "a connection without a tag is aborted");
 	g_tcpdrop++;
 	tp->t_flags |= TF_DISCONNECTED;
-	return (nondet_bool() ? tp : NULL);
+	if (nondet_bool())
+		return (tp);
+	g_inpwl = false;	/* tcp_close() freed it, unlocked */
+	return (NULL);
 }
 
 /* An offloaded session on the harness's connection, and its tag. */
@@ -1641,4 +1667,151 @@ proof_tag_try(void)
 		__CPROVER_assert(tls->mode == TCP_TLS_MODE_SW &&
 		    tls->snd_tag == NULL && g_ntags == 0,
 		    "left as it was");
+}
+
+/*
+ * ktls_set_tx_mode(), TCP_TXTLS_MODE: switch an open connection between
+ * software and NIC offload.  It drops the inpcb lock to make the new
+ * session, so another change may win the race to the send buffer.  The
+ * call is refused with EINVAL for a listening socket or an unknown mode,
+ * and offload asked for again (EALREADY) or after it was disabled
+ * (ENXIO); with no session or one in the mode asked for, it does
+ * nothing.  Else a clone of the session gets the mode, or the error the
+ * mode's set up, the send lock's, or EBUSY if the race was lost, and the
+ * session in place stays; on success the clone replaces it and offload is
+ * marked on the connection.  Every way, the inpcb is locked again on
+ * return, no reference is left behind, and each session let go of is
+ * destroyed.
+ */
+static struct ktls_session g_old, g_other;
+static struct tcp_function_block g_fb;
+static int g_hwtls, g_ocf_err;
+static bool g_raced;
+static uint8_t g_ckey[16];
+
+int
+ktls_ocf_try(struct ktls_session *tls, int direction)
+{
+	return (g_ocf_err);
+}
+
+int
+soiolock(struct socket *so, struct sx *sx, int flags)
+{
+	__CPROVER_assert(!g_inpwl, "sleeps for the send lock unlocked");
+	if (nondet_bool())
+		return (EINTR);
+	/*
+	 * While the inpcb was unlocked, another change may have won: its
+	 * session in the buffer, and the buffer's reference on the one it
+	 * replaced dropped.
+	 */
+	if (nondet_bool()) {
+		so->so_snd.sb_tls_info->refcount--;
+		so->so_snd.sb_tls_info = &g_other;
+		g_raced = true;
+	}
+	return (0);
+}
+
+void soiounlock(struct sx *sx) { }
+
+static void
+cbmc_hwtls_change(struct tcpcb *tp, int on)
+{
+	__CPROVER_assert(tp == &g_tp && on == 1,
+	    "the stack is told offload is on");
+	g_hwtls++;
+}
+
+void
+proof_set_tx_mode(void)
+{
+	struct ktls_session *now, *tls = NULL;
+	struct sockbuf *sb = &g_so.so_snd;
+	u_int refs = 0;
+	int error, mode, oldmode;
+	bool xmit, dis, has;
+
+	setup();
+	g_so.so_options = nondet_bool() ? SO_ACCEPTCONN : 0;
+	g_so.so_pcb = tptoinpcb(&g_tp);
+	g_tp.t_inpcb.inp_socket = &g_so;
+	g_tp.t_fb = &g_fb;
+	g_fb.tfb_hwtls_change = nondet_bool() ? cbmc_hwtls_change : NULL;
+	g_tp.t_flags = 0;
+	g_tp.t_pacing_rate = -1;
+	g_tp.t_inpcb.inp_route.ro_nh = nondet_bool() ? &g_nh : NULL;
+	g_nh.nh_ifp = &g_ifp;
+	g_caps = nondet_int();
+	ktls_ifnet_permitted = nondet_bool();
+	g_ocf_err = nondet_bool() ? 0 : EINVAL;
+	xmit = g_tp.t_nic_ktls_xmit = nondet_bool();
+	dis = g_tp.t_nic_ktls_xmit_dis = nondet_bool();
+	has = nondet_bool();
+	oldmode = nondet_bool() ? TCP_TLS_MODE_SW : TCP_TLS_MODE_IFNET;
+	if (has) {
+		tls = &g_old;
+		tls->mode = oldmode;
+		tls->tx = true;
+		tls->inp = tptoinpcb(&g_tp);
+		tls->params.cipher_key = g_ckey;
+		tls->params.cipher_key_len = sizeof(g_ckey);
+		tls->refcount = refs = 1 + nondet_bool();
+		/* The session with offload on marks the connection. */
+		__CPROVER_assume(oldmode != TCP_TLS_MODE_IFNET || xmit);
+	} else
+		__CPROVER_assume(!xmit);
+	sb->sb_tls_info = tls;
+	g_other.refcount = 1;
+	mode = nondet_int();
+	g_inpwl = true;
+
+	error = ktls_set_tx_mode(&g_so, mode);
+
+	now = sb->sb_tls_info;
+	__CPROVER_assert(g_inpwl, "returns with the inpcb locked");
+	if (SOLISTENING(&g_so) ||
+	    (mode != TCP_TLS_MODE_SW && mode != TCP_TLS_MODE_IFNET)) {
+		__CPROVER_assert(error == EINVAL && now == tls,
+		    "a listening socket or unknown mode is refused");
+		return;
+	}
+	if (mode == TCP_TLS_MODE_IFNET && (xmit || dis)) {
+		__CPROVER_assert(error == (xmit ? EALREADY : ENXIO) &&
+		    now == tls, "offload again or after disabled is refused");
+		return;
+	}
+	if (!has || oldmode == mode) {
+		__CPROVER_assert(error == 0 && now == tls &&
+		    (!has || tls->refcount == refs),
+		    "nothing to change, nothing changed");
+		return;
+	}
+	if (error != 0) {
+		__CPROVER_assert(now == tls || now == &g_other,
+		    "a failed switch leaves the session in place");
+		__CPROVER_assert(tls->refcount == refs - (g_raced ? 1 : 0) &&
+		    g_ndestroyed == (g_raced && refs == 1 ? 2 : 1) &&
+		    g_destroyed[0] != tls,
+		    "the clone is destroyed, the old session as it was");
+		__CPROVER_assert(g_raced == (error == EBUSY) &&
+		    (now == &g_other) == g_raced && g_other.refcount == 1,
+		    "EBUSY when another change won, whose session stays");
+		__CPROVER_assert(g_tp.t_nic_ktls_xmit == xmit && g_hwtls == 0,
+		    "the connection is not marked");
+		return;
+	}
+	__CPROVER_assert(!g_raced, "a switch that lost the race fails");
+	__CPROVER_assert(now != tls && now != &g_other && now->mode == mode &&
+	    now->refcount == 1 && now->inp == tls->inp,
+	    "the clone, in the mode asked for, replaces the session");
+	__CPROVER_assert(tls->refcount == refs - 1 &&
+	    g_ndestroyed == (refs == 1 ? 1 : 0) &&
+	    (refs > 1 || g_destroyed[0] == tls),
+	    "the old session loses the buffer's reference");
+	__CPROVER_assert(mode != TCP_TLS_MODE_IFNET ||
+	    (g_tp.t_nic_ktls_xmit &&
+	    g_hwtls == (g_fb.tfb_hwtls_change != NULL ? 1 : 0)),
+	    "offload is marked on the connection, the stack told");
 }

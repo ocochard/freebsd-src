@@ -86,7 +86,8 @@ restrict_sendfile="vn_sendfile.function_pointer_call.1/sendfile_wait
 	fo_sendfile.function_pointer_call.1/vn_sendfile"
 restrict_ktls="ktls_encrypt.function_pointer_call.1/cbmc_pr_ready
 	ktls_encrypt_cb.function_pointer_call.1/cbmc_pr_ready
-	ktls_finish_nonanon.function_pointer_call.1/cbmc_file_free"
+	ktls_finish_nonanon.function_pointer_call.1/cbmc_file_free
+	ktls_set_tx_mode.function_pointer_call.1/cbmc_hwtls_change"
 # cbmc flags of a harness: the KTLS worker turns physical addresses into
 # pointers, each an object, past cbmc's 256; and the kernel is built with
 # -fwrapv, so a signed overflow wraps (IFCAP_BIT(31) is 1 << 31).
@@ -853,6 +854,27 @@ if want ktls; then
 	# An offloaded session holds its tag.
 	mutant ktls_tag_install "$h" "$s" proof_tag_try "$dk" "$ut" \
 	    '/^ktls_try_ifnet(/,/^}/s/tls->snd_tag = mst;/;/'
+
+	# Switching an open connection between software and NIC offload.
+	proof ktls_set_tx_mode "$h" "$s" proof_set_tx_mode "$dk" "$ut"
+	# Offload is enabled once ...
+	mutant ktls_mode_again "$h" "$s" proof_set_tx_mode "$dk" "$ut" \
+	    '/^ktls_set_tx_mode(/,/^}/s/if (tp->t_nic_ktls_xmit)$/if (0)/'
+	# ... a switch that lost the race to another fails and frees its
+	# clone ...
+	mutant ktls_mode_race "$h" "$s" proof_set_tx_mode "$dk" "$ut" \
+	    '/^ktls_set_tx_mode(/,/^}/s/if (tls != so->so_snd.sb_tls_info) {/if (0) {/'
+	mutant ktls_mode_busyfree "$h" "$s" proof_set_tx_mode "$dk" "$ut" \
+	    '/^ktls_set_tx_mode(/,/^}/{/SOCK_IO_SEND_UNLOCK(so);$/{n;s/ktls_free(tls_new);/;/;};}'
+	# ... one that won lets the old session go and marks the
+	# connection ...
+	mutant ktls_mode_oldref "$h" "$s" proof_set_tx_mode "$dk" "$ut" \
+	    '/KASSERT(tls->refcount >= 2/{n;s/ktls_free(tls);/;/;}'
+	mutant ktls_mode_mark "$h" "$s" proof_set_tx_mode "$dk" "$ut" \
+	    '/^ktls_set_tx_mode(/,/^}/s/tp->t_nic_ktls_xmit = 1;/;/'
+	# ... and it sleeps for the send lock with the inpcb unlocked.
+	mutant ktls_mode_unlock "$h" "$s" proof_set_tx_mode "$dk" "$ut" \
+	    '/^ktls_set_tx_mode(/,/^}/s/^	INP_WUNLOCK(inp);$/	;/'
 fi
 
 [ "$njobs" -gt 0 ] || { echo "run.sh: nothing selected" >&2; exit 2; }
