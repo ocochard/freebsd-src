@@ -100,6 +100,16 @@ with RFC 5288 (AES-GCM) and RFC 7905 (ChaCha20-Poly1305).  No bug found.
   and keeps the socket buffer's counts; `ktls_check_rx()` queues the
   socket once a whole record is in, once, with a reference, an error if
   only part of one is and no more can come.
+- The ifnet send tag: `ktls_alloc_snd_tag()` allocates it on the
+  route's interface, rate limited for a paced connection when the
+  interface can, or fails with the error of what is missing (a
+  connection, leave to offload unless forced, a route, unmapped mbufs,
+  TLS offload for the address family), the interface reference let go;
+  `ktls_output_eagain()` schedules a reset once, referenced;
+  `ktls_reset_send_tag()` releases the old tag and installs a new one,
+  or aborts the connection and leaves the reset pending, dropping its
+  reference; `ktls_try_ifnet()` offloads the session with its tag, or
+  leaves it as it was.
 - `ktls_decrypt()` (harness `ktls/ktls_rx.c`), on one record in one
   mbuf decrypted by the NIC, AES-GCM TLS 1.2: delivered as a
   TLS_GET_RECORD control message and its payload, no more.  Only on

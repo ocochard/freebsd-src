@@ -88,8 +88,9 @@ restrict_ktls="ktls_encrypt.function_pointer_call.1/cbmc_pr_ready
 	ktls_encrypt_cb.function_pointer_call.1/cbmc_pr_ready
 	ktls_finish_nonanon.function_pointer_call.1/cbmc_file_free"
 # cbmc flags of a harness: the KTLS worker turns physical addresses into
-# pointers, each an object, past cbmc's 256.
-cbmc_ktls="--object-bits 10"
+# pointers, each an object, past cbmc's 256; and the kernel is built with
+# -fwrapv, so a signed overflow wraps (IFCAP_BIT(31) is 1 << 31).
+cbmc_ktls="--object-bits 10 --no-signed-overflow-check"
 restrict_ktls_rx=$restrict_ktls
 # ktls_decrypt() walking off its chain goes on with what it reads there,
 # and fails further on: stop at the first property a trace violates.
@@ -664,6 +665,8 @@ ur12="proof_rx_detach.0:13,proof_rx_detach.1:13,m_length.0:5,chain_byte.0:5"
 ur12="$ur12,check_tls_chain.0:13,mbcnt.0:5,rx_chain.0:4"
 ur12="$ur12,ktls_detach_record.1:5,ktls_detach_record.3:5,cbmc_memmove.0:13"
 hr="$here/ktls/ktls_rx.c"
+# The send tag proofs have no loop of their own.
+ut="cbmc_memmove.0:65"
 drn="-DKERN_TLS -DRMBUF=1 -DRX_RECORD -DRX_NIC -DRX_CIPHER=CRYPTO_AES_NIST_GCM_16"
 drn="$drn -DRX_VMINOR=TLS_MINOR_VER_TWO"
 urn="proof_rx_decrypt.1:2,proof_rx_decrypt.3:3,ktls_decrypt.8:3"
@@ -814,6 +817,42 @@ if want ktls; then
 	mutant ktls_rx_decrypt_tagless "$hr" "$s" proof_rx_decrypt \
 	    "$drn -DRX_LEN=20 -DRLEN=20" "$urn20" \
 	    's/if (tls_len < tls->params.tls_hlen +$/if (0 \&\& tls_len < tls->params.tls_hlen +/'
+
+	# The ifnet send tag: allocated on the route's interface, or the
+	# error of what is missing; a reset scheduled once on a route
+	# change, which installs a new tag or aborts the connection.
+	proof ktls_tag_alloc "$h" "$s" proof_tag_alloc "$dk" "$ut"
+	proof ktls_tag_eagain "$h" "$s" proof_tag_eagain "$dk" "$ut"
+	proof ktls_tag_reset "$h" "$s" proof_tag_reset "$dk" "$ut"
+	proof ktls_tag_try "$h" "$s" proof_tag_try "$dk" "$ut"
+
+	# Forced requests pass the administrative switch ...
+	mutant ktls_tag_force "$h" "$s" proof_tag_alloc "$dk" "$ut" \
+	    's/if (!force \&\& ktls_ifnet_permitted == 0) {/if (ktls_ifnet_permitted == 0) {/'
+	# ... the interface is let go, can offload the address family, and
+	# rate limits a paced connection.
+	mutant ktls_tag_ifrele "$h" "$s" proof_tag_alloc "$dk" "$ut" \
+	    '/^ktls_alloc_snd_tag(/,/^}/s/^	if_rele(ifp);/	;/'
+	mutant ktls_tag_inet6 "$h" "$s" proof_tag_alloc "$dk" "$ut" \
+	    '/^ktls_alloc_snd_tag(/,/^}/s/IFCAP_TXTLS6) == 0) {/IFCAP_TXTLS4) == 0) {/'
+	mutant ktls_tag_rtlmt "$h" "$s" proof_tag_alloc "$dk" "$ut" \
+	    '/^ktls_alloc_snd_tag(/,/^}/s/if (tp->t_pacing_rate != -1 \&\&/if (tp->t_pacing_rate == -1 \&\&/'
+	# A reset is scheduled once, with a reference ...
+	mutant ktls_tag_once "$h" "$s" proof_tag_eagain "$dk" "$ut" \
+	    '/^ktls_output_eagain(/,/^}/s/if (!tls->reset_pending) {/if (1) {/'
+	mutant ktls_tag_hold "$h" "$s" proof_tag_eagain "$dk" "$ut" \
+	    '/^ktls_output_eagain(/,/^}/s/(void) ktls_hold(tls);/;/'
+	# ... and lets the old tag go, is done once it has a new one, and
+	# drops its reference.
+	mutant ktls_tag_oldrele "$h" "$s" proof_tag_reset "$dk" "$ut" \
+	    '/^ktls_reset_send_tag(/,/^}/s/^		m_snd_tag_rele(old);/		;/'
+	mutant ktls_tag_done "$h" "$s" proof_tag_reset "$dk" "$ut" \
+	    '/^ktls_reset_send_tag(/,/^}/s/tls->reset_pending = false;/;/'
+	mutant ktls_tag_taskref "$h" "$s" proof_tag_reset "$dk" "$ut" \
+	    '/^ktls_reset_send_tag(/,/^}/s/^	ktls_free(tls);/	;/'
+	# An offloaded session holds its tag.
+	mutant ktls_tag_install "$h" "$s" proof_tag_try "$dk" "$ut" \
+	    '/^ktls_try_ifnet(/,/^}/s/tls->snd_tag = mst;/;/'
 fi
 
 [ "$njobs" -gt 0 ] || { echo "run.sh: nothing selected" >&2; exit 2; }

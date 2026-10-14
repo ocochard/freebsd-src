@@ -63,6 +63,13 @@
  *			off the TLS chain, the rest and its counts kept
  *   proof_rx_check	ktls_check_rx(): a socket queued for decryption
  *			once a whole record is in, once, referenced
+ *   proof_tag_alloc	ktls_alloc_snd_tag(): an ifnet send tag on the
+ *			route's interface, of the kind the connection takes,
+ *			or the error of what is missing
+ *   proof_tag_eagain	ktls_output_eagain(): a tag reset scheduled once
+ *   proof_tag_reset	ktls_reset_send_tag(): the old tag let go, a new
+ *			one installed or the connection aborted
+ *   proof_tag_try	ktls_try_ifnet(): offloaded with its tag, or not
  */
 
 #include SOURCE
@@ -1398,4 +1405,240 @@ proof_rx_check(void)
 		    g_nwakeups == (running ? 0 : 1),
 		    "a whole record queues the socket once, referenced, its "
 		    "thread woken when idle");
+}
+
+/*
+ * The ifnet send tag: a session offloaded to a NIC holds a send tag on
+ * the interface the connection is routed over, and when ip_output() finds
+ * the route changed, ktls_output_eagain() has ktls_reset_send_tag() swap
+ * it for one on the new interface, or drop the connection.  The TCP
+ * control block is the harness's, its inpcb the session's; the route,
+ * the interface's capabilities and whether a tag can be had are free.
+ */
+static struct tcpcb g_tp;
+static struct nhop_object g_nh;
+static struct ifnet g_ifp;
+static int g_ifrefs, g_ntags, g_ntagsfreed, g_nreset, g_tcpdrop;
+static int g_tagtype;
+static int g_caps;
+static struct m_snd_tag g_tags[2];
+static struct mtx g_poolmtx;
+
+int
+if_getcapenable(const if_t ifp)
+{
+	__CPROVER_assert(ifp == &g_ifp, "the interface of the route");
+	return (g_caps);
+}
+
+void
+if_ref(struct ifnet *ifp)
+{
+	__CPROVER_assert(ifp == &g_ifp, "references the route's interface");
+	g_ifrefs++;
+}
+
+void
+if_rele(struct ifnet *ifp)
+{
+	__CPROVER_assert(ifp == &g_ifp && g_ifrefs > 0,
+	    "releases an interface it referenced");
+	g_ifrefs--;
+}
+
+/* m_snd_tag_alloc(), kern_mbuf.c: the driver gives a tag, or fails. */
+int
+m_snd_tag_alloc(struct ifnet *ifp, union if_snd_tag_alloc_params *params,
+    struct m_snd_tag **mstp)
+{
+	__CPROVER_assert(ifp == &g_ifp, "a tag on the route's interface");
+	g_tagtype = params->hdr.type;
+	if (nondet_bool())
+		return (nondet_bool() ? ENOMEM : EOPNOTSUPP);
+	__CPROVER_assert(g_ntags < 2, "model: tags");
+	g_tags[g_ntags].ifp = ifp;
+	g_tags[g_ntags].refcount = 1;
+	*mstp = &g_tags[g_ntags++];
+	return (0);
+}
+
+void
+m_snd_tag_destroy(struct m_snd_tag *mst)
+{
+	__CPROVER_assert(mst->refcount == 0, "a tag is destroyed unreferenced");
+	g_ntagsfreed++;
+}
+
+struct mtx *
+mtx_pool_find(struct mtx_pool *pool, void *ptr)
+{
+	return (&g_poolmtx);
+}
+
+int
+taskqueue_enqueue(struct taskqueue *queue, struct task *task)
+{
+	__CPROVER_assert(task == &g_session.reset_tag_task,
+	    "schedules the session's tag reset");
+	g_nreset++;
+	return (0);
+}
+
+void _rw_wlock_cookie(volatile uintptr_t *c, const char *file, int line) { }
+void _rw_wunlock_cookie(volatile uintptr_t *c, const char *file,
+    int line) { }
+void epoch_enter_preempt(epoch_t epoch, epoch_tracker_t et) { }
+void epoch_exit_preempt(epoch_t epoch, epoch_tracker_t et) { }
+
+struct tcpcb *
+tcp_drop(struct tcpcb *tp, int error)
+{
+	__CPROVER_assert(tp == &g_tp && error == ECONNABORTED,
+	    "a connection without a tag is aborted");
+	g_tcpdrop++;
+	tp->t_flags |= TF_DISCONNECTED;
+	return (nondet_bool() ? tp : NULL);
+}
+
+/* An offloaded session on the harness's connection, and its tag. */
+static struct ktls_session *
+ifnet_session(void)
+{
+	struct ktls_session *tls = &g_session;
+
+	setup();
+	tls->mode = TCP_TLS_MODE_IFNET;
+	tls->refcount = 2;		/* the socket's, and the task's */
+	tls->inp = tptoinpcb(&g_tp);
+	tls->reset_pending = nondet_bool();
+	g_tp.t_flags = nondet_bool() ? TF_DISCONNECTED : 0;
+	g_tp.t_pacing_rate = nondet_bool() ? -1 : 1000000;
+	g_tp.t_inpcb.inp_vflag = nondet_bool() ? INP_IPV6 : INP_IPV4;
+	g_tp.t_inpcb.inp_route.ro_nh = nondet_bool() ? &g_nh : NULL;
+	g_nh.nh_ifp = &g_ifp;
+	g_caps = nondet_int();
+	ktls_ifnet_permitted = nondet_bool();
+	return (tls);
+}
+
+/*
+ * ktls_alloc_snd_tag(): a tag on the route's interface, of the rate
+ * limited kind when the connection is paced and the interface can, or
+ * the error of the first thing missing: a connection, leave to offload,
+ * a route, unmapped mbufs, TLS offload for the address family.  The
+ * interface reference it takes is dropped.
+ */
+void
+proof_tag_alloc(void)
+{
+	struct ktls_session *tls = ifnet_session();
+	struct m_snd_tag *mst = NULL;
+	bool force = nondet_bool();
+	int error, fam;
+
+	error = ktls_alloc_snd_tag(tls->inp, tls, force, &mst);
+
+	fam = (g_tp.t_inpcb.inp_vflag & INP_IPV6) ? IFCAP_TXTLS6 :
+	    IFCAP_TXTLS4;
+	__CPROVER_assert(g_ifrefs == 0, "the interface reference is dropped");
+	if (g_tp.t_flags & TF_DISCONNECTED)
+		__CPROVER_assert(error == ECONNRESET && g_ntags == 0,
+		    "no tag for a closed connection");
+	else if (!force && !ktls_ifnet_permitted)
+		__CPROVER_assert(error == ENXIO && g_ntags == 0,
+		    "no tag where ifnet TLS is off, unless forced");
+	else if (g_tp.t_inpcb.inp_route.ro_nh == NULL)
+		__CPROVER_assert(error == ENXIO && g_ntags == 0,
+		    "no tag without a route");
+	else if ((g_caps & IFCAP_MEXTPG) == 0 || (g_caps & fam) == 0)
+		__CPROVER_assert(error == EOPNOTSUPP && g_ntags == 0,
+		    "no tag where the interface cannot");
+	else {
+		__CPROVER_assert(g_tagtype == (g_tp.t_pacing_rate != -1 &&
+		    (g_caps & IFCAP_TXTLS_RTLMT) != 0 ?
+		    IF_SND_TAG_TYPE_TLS_RATE_LIMIT : IF_SND_TAG_TYPE_TLS),
+		    "a rate limited tag for a paced connection that can");
+		__CPROVER_assert(error != 0 ? g_ntags == 0 :
+		    mst == &g_tags[0], "the driver's tag, or its error");
+	}
+}
+
+/*
+ * ktls_output_eagain(), on a route change: the reset is scheduled once
+ * while one is pending, with a session reference for it.
+ */
+void
+proof_tag_eagain(void)
+{
+	struct ktls_session *tls = ifnet_session();
+	bool pending = tls->reset_pending;
+	u_int refs = tls->refcount;
+
+	__CPROVER_assert(ktls_output_eagain(tls->inp, tls) == ENOBUFS,
+	    "the packet is refused for now");
+	__CPROVER_assert(tls->reset_pending &&
+	    g_nreset == (pending ? 0 : 1) &&
+	    tls->refcount == refs + (pending ? 0 : 1),
+	    "a reset is scheduled once, referenced");
+}
+
+/*
+ * ktls_reset_send_tag(), the task: the old tag is released, and either
+ * a new one installed and the reset done, or the connection aborted and
+ * the reset left pending, so that no other is scheduled; the task's
+ * session reference is dropped.
+ */
+void
+proof_tag_reset(void)
+{
+	struct ktls_session *tls = ifnet_session();
+	bool old = nondet_bool();
+	bool closed = (g_tp.t_flags & TF_DISCONNECTED) != 0;
+
+	tls->reset_pending = true;
+	if (old) {
+		g_tags[1].refcount = 1;
+		tls->snd_tag = &g_tags[1];
+	}
+
+	ktls_reset_send_tag(tls, 1);
+
+	__CPROVER_assert(g_ntagsfreed == (old ? 1 : 0),
+	    "the old tag is released");
+	__CPROVER_assert(g_ifrefs == 0, "the interface reference is dropped");
+	if (tls->snd_tag != NULL)
+		__CPROVER_assert(tls->snd_tag == &g_tags[0] &&
+		    !tls->reset_pending && g_tcpdrop == 0,
+		    "a new tag, the reset done");
+	else
+		__CPROVER_assert(tls->reset_pending &&
+		    g_tcpdrop == (closed ? 0 : 1),
+		    "no tag: the connection aborted, the reset left pending");
+	__CPROVER_assert(tls->refcount == 1,
+	    "the task's session reference is dropped");
+}
+
+/*
+ * ktls_try_ifnet(), on enabling or switching to NIC offload: the session
+ * is offloaded with the tag it got, or left as it was.
+ */
+void
+proof_tag_try(void)
+{
+	struct ktls_session *tls = ifnet_session();
+	int error;
+
+	tls->mode = TCP_TLS_MODE_SW;
+	tls->snd_tag = NULL;
+	g_so.so_pcb = tls->inp;
+
+	error = ktls_try_ifnet(&g_so, tls, KTLS_TX, nondet_bool());
+
+	if (error == 0)
+		__CPROVER_assert(tls->mode == TCP_TLS_MODE_IFNET &&
+		    tls->snd_tag == &g_tags[0], "offloaded, with its tag");
+	else
+		__CPROVER_assert(tls->mode == TCP_TLS_MODE_SW &&
+		    tls->snd_tag == NULL && g_ntags == 0,
+		    "left as it was");
 }
