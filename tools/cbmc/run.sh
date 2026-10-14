@@ -69,6 +69,7 @@ replace_sendfile="vm_pager_has_page:cbmc_vm_pager_has_page
 replace_ktls="ktls_buffer_alloc:cbmc_ktls_buffer_alloc
 	ktls_drop:cbmc_ktls_drop
 	ktls_destroy:cbmc_ktls_destroy"
+replace_ktls_sb="sbcompress_ktls_rx:cbmc_sbcompress_ktls_rx"
 replace_ktls_rx="$replace_ktls
 	ktls_resync_ifnet:cbmc_ktls_resync_ifnet
 	m_free:cbmc_m_free"
@@ -94,6 +95,7 @@ restrict_ktls="ktls_encrypt.function_pointer_call.1/cbmc_pr_ready
 # -fwrapv, so a signed overflow wraps (IFCAP_BIT(31) is 1 << 31).
 cbmc_ktls="--object-bits 10 --no-signed-overflow-check"
 restrict_ktls_rx=$restrict_ktls
+cbmc_ktls_sb="--no-signed-overflow-check"
 # ktls_decrypt() walking off its chain goes on with what it reads there,
 # and fails further on: stop at the first property a trace violates.
 cbmc_ktls_rx="$cbmc_ktls --stop-on-fail"
@@ -170,7 +172,8 @@ mkdir -p "$work/inc"
 	ln -s "$top/sys/x86/include" x86
 ) >/dev/null
 for f in $(sed -n 's/^#include "\(opt_[a-z0-9_]*\.h\)"/\1/p' \
-    "$top/sys/kern/kern_sendfile.c" "$top/sys/kern/uipc_ktls.c"); do
+    "$top/sys/kern/kern_sendfile.c" "$top/sys/kern/uipc_ktls.c" \
+    "$top/sys/kern/uipc_sockbuf.c"); do
 	: >"$work/inc/$f"
 done
 
@@ -931,6 +934,28 @@ if want ktls; then
 	    's/if (!ktls_ocf_recrypt_supported(tls))/if (0)/'
 	mutant ktls_rx_tag_alloc6 "$h" "$s" proof_rx_tag_alloc "$dk" "$ut" \
 	    '/^ktls_alloc_rcv_tag(/,/^}/s/IFCAP2_BIT(IFCAP2_RXTLS6)/IFCAP2_BIT(IFCAP2_RXTLS4)/'
+
+	# sbappend_ktls_rx(), uipc_sockbuf.c: TCP data into a TLS receive
+	# buffer, and the check for packets in on another interface.
+	hs="$here/ktls/ktls_sb.c"
+	ss="$top/sys/kern/uipc_sockbuf.c"
+	us="sbappend_ktls_rx.3:4,proof_rx_append.0:4,proof_rx_append.1:4"
+	proof ktls_rx_append "$hs" "$ss" proof_rx_append "$dk" "$us"
+	# The fix taken back: the interface read from the first mbuf, whose
+	# packet header is demoted by then, so NULL past one packet.
+	mutant ktls_rx_append_first "$hs" "$ss" proof_rx_append "$dk" "$us" \
+	    's/ifp = n->m_pkthdr.leaf_rcvif;/ifp = m->m_pkthdr.leaf_rcvif;/'
+	# Each mbuf decrypted as its packet, demoted to plain data ...
+	mutant ktls_rx_append_decrypted "$hs" "$ss" proof_rx_append "$dk" \
+	    "$us" '/^sbappend_ktls_rx(/,/^}/s/flags = M_NOTREADY | M_DECRYPTED;/flags = M_NOTREADY;/'
+	mutant ktls_rx_append_demote "$hs" "$ss" proof_rx_append "$dk" "$us" \
+	    '/^sbappend_ktls_rx(/,/^}/s/n->m_flags \&= M_DEMOTEFLAGS;/;/'
+	# ... the buffer checked for a whole record, and the session told
+	# of another interface only.
+	mutant ktls_rx_append_check "$hs" "$ss" proof_rx_append "$dk" "$us" \
+	    '/^sbappend_ktls_rx(/,/^}/s/^	ktls_check_rx(sb);/	;/'
+	mutant ktls_rx_append_mismatch "$hs" "$ss" proof_rx_append "$dk" \
+	    "$us" '/^sbappend_ktls_rx(/,/^}/s/sb->sb_tls_info->rx_ifp != ifp)/sb->sb_tls_info->rx_ifp == ifp)/'
 fi
 
 [ "$njobs" -gt 0 ] || { echo "run.sh: nothing selected" >&2; exit 2; }

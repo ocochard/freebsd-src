@@ -9,6 +9,7 @@ again before filing.
 |---|---|---|---|
 | 1 | a NIC-decrypted record shorter than its tag is a NULL dereference | [a482e648447b](https://github.com/ocochard/freebsd-src/commit/a482e648447b) | waiting for the developer |
 | 2 | a receive tag reset tests the wrong capability bits | [a0d672151d9e](https://github.com/ocochard/freebsd-src/commit/a0d672151d9e) | ready |
+| 3 | a chain of packets loses its receiving interface | [447cba6c6808](https://github.com/ocochard/freebsd-src/commit/447cba6c6808) | ready |
 
 ---
 
@@ -86,3 +87,36 @@ interface cannot give.
 **Found by:** the properties of `ktls_reset_receive_tag()`, "a new tag is
 asked for where it can" and "no tag where the interface cannot receive
 TLS" (`proof_rx_tag_reset`).
+
+---
+
+## 3. sbappend_ktls_rx() loses the interface of a chain of packets
+
+**Fix:** 447cba6c6808 "ktls: Take the receiving interface of each packet in sbappend_ktls_rx()"
+(`Fixes: fe8c78f0d202`)
+
+**What happens:** `sbappend_ktls_rx()` turns the mbuf chain TCP appends
+to a TLS receive buffer into plain data, one packet header at a time,
+and remembers the interface the packets came in on to see whether it is
+still the one the session's receive tag is on.  It reads that interface
+as `m->m_pkthdr.leaf_rcvif`, from the chain's first mbuf, inside the
+loop over the packet headers `n`.  The first pass demotes `m`'s packet
+header, and `m_demote_pkthdr()` zeroes it: when the chain holds a second
+packet header, the interface read is NULL, and the check that calls
+`ktls_input_ifp_mismatch()` is skipped.  A change of input interface is
+then not noticed on that append, and the receive tag stays on the old
+interface until a later append of a single packet.  TCP reassembly
+appends such chains (`tcp_reass.c`).  The same loop reads the decrypted
+mark from `n`, as intended.
+
+**Fix detail:** read `n->m_pkthdr.leaf_rcvif`, the interface of the
+packet whose header is being demoted, so the last packet's is kept.
+
+**Reproduce:** no test: it needs a NIC with TLS receive offload and a
+change of input interface during reassembly.  The CBMC counterexample
+(`run.sh` mutant `ktls_rx_append_first`): a chain of two packets, the
+last in on another interface than the session's; `ktls_input_ifp_mismatch()`
+is not called.
+
+**Found by:** the property of `sbappend_ktls_rx()` "the session is told
+the last packet came in elsewhere" (`proof_rx_append`, `ktls/ktls_sb.c`).
