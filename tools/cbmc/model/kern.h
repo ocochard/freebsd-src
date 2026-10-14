@@ -357,6 +357,13 @@ cbmc_memmove(void *dst, const void *src, size_t len)
 	return (dst);
 }
 
+/* memcpy(3), the same: no caller copies over itself. */
+void *
+cbmc_memcpy(void *dst, const void *src, size_t len)
+{
+	return (cbmc_memmove(dst, src, len));
+}
+
 /* Locks. */
 
 void __mtx_lock_flags(volatile uintptr_t *c, int opts, const char *file,

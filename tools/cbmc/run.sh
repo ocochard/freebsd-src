@@ -648,6 +648,14 @@ uw="$uw,widx.0:2,cbmc_pr_ready.0:2,ktls_ocf_encrypt.0:6,batch.0:3"
 uw="$uw,check_batch.0:2,check_batch.1:2,check_batch.2:6"
 uw="$uw,proof_encrypt_async.0:2,session.0:9,cbmc_memmove.0:65"
 dw2="-DKERN_TLS -DWREC=2"
+# Receive: records of up to 40 bytes (RLEN) over three mbufs.
+ur="proof_rx_type.0:41,proof_rx_type.1:41,rx_chain.0:4"
+ur="$ur,tls13_find_record_type.0:41,tls13_find_record_type.1:4"
+ur="$ur,proof_rx_check.0:41,m_copydata.0:22,chain_byte.0:5,cbmc_memmove.0:41"
+dr12="-DKERN_TLS -DRLEN=12"
+ur12="proof_rx_detach.0:13,proof_rx_detach.1:13,m_length.0:5,chain_byte.0:5"
+ur12="$ur12,check_tls_chain.0:13,mbcnt.0:5,rx_chain.0:4"
+ur12="$ur12,ktls_detach_record.1:5,ktls_detach_record.3:5,cbmc_memmove.0:13"
 uw2=$(echo "$uw" | sed -E 's/(ktls_encrypt\.4|widx\.0|cbmc_pr_ready\.0|check_batch\.[01]):2/\1:3/g; s/mb_free_notready\.0:7/mb_free_notready.0:12/; s/batch\.0:3/batch.0:4/; s/check_batch\.2:6/check_batch.2:11/')
 
 if want ktls; then
@@ -746,6 +754,35 @@ if want ktls; then
 	    '/^ktls_encrypt_cb(/,/^}/s/^	ktls_free(tls);/	;/'
 	mutant ktls_cb_errfree "$h" "$s" proof_encrypt_async "$dw" "$uw" \
 	    '/^ktls_encrypt_cb(/,/^}/s/mb_free_notready(m, npages);/;/'
+
+	# Receive: the TLS 1.3 record type, a record detached from the TLS
+	# chain (on chains of 12 bytes, which is enough for its splits),
+	# and a socket queued for decryption.
+	proof ktls_rx_type "$h" "$s" proof_rx_type "$dk" "$ur"
+	proof ktls_rx_detach "$h" "$s" proof_rx_detach "$dr12" "$ur12"
+	proof ktls_rx_check "$h" "$s" proof_rx_check "$dk" "$ur"
+
+	# Content with no type is refused ...
+	mutant ktls_rx_notype "$h" "$s" proof_rx_type "$dk" "$ur" \
+	    's/if (last_offset < tls->params.tls_hlen)/if (0)/'
+	# ... and the trailer starts at the type.
+	mutant ktls_rx_trailer "$h" "$s" proof_rx_type "$dk" "$ur" \
+	    's/\*trailer_len = tls_len - last_offset;/*trailer_len = tls_len - last_offset - 1;/'
+	# What is left after a split record starts after it, is counted,
+	# and its tail kept.
+	mutant ktls_rx_split "$h" "$s" proof_rx_detach "$dr12" "$ur12" \
+	    's/n->m_data = m->m_data + remain;/n->m_data = m->m_data;/'
+	mutant ktls_rx_tlscc "$h" "$s" proof_rx_detach "$dr12" "$ur12" \
+	    '/^ktls_detach_record(/,/^}/s/sb->sb_tlscc -= n->m_len;/;/'
+	mutant ktls_rx_tail "$h" "$s" proof_rx_detach "$dr12" "$ur12" \
+	    '/^ktls_detach_record(/,/^}/s/sb->sb_mtlstail = n;/;/'
+	# A socket is queued for a whole record only, once, referenced.
+	mutant ktls_rx_whole "$h" "$s" proof_rx_check "$dk" "$ur" \
+	    's/if (sb->sb_tlscc < sizeof(hdr) + ntohs(hdr.tls_length)) {/if (sb->sb_tlscc < sizeof(hdr)) {/'
+	mutant ktls_rx_once "$h" "$s" proof_rx_check "$dk" "$ur" \
+	    '/^ktls_check_rx(/,/^}/s/if (sb->sb_flags \& SB_TLS_RX_RUNNING)$/if (0)/'
+	mutant ktls_rx_soref "$h" "$s" proof_rx_check "$dk" "$ur" \
+	    '/^ktls_check_rx(/,/^}/s/^	soref(so);/	;/'
 fi
 
 [ "$njobs" -gt 0 ] || { echo "run.sh: nothing selected" >&2; exit 2; }
