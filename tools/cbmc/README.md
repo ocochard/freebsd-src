@@ -99,8 +99,18 @@ with RFC 5288 (AES-GCM) and RFC 7905 (ChaCha20-Poly1305).  No bug found.
   chain, splitting an mbuf if need be, leaves the rest with its tail,
   and keeps the socket buffer's counts; `ktls_check_rx()` queues the
   socket once a whole record is in, once, with a reference, an error if
-  only part of one is and no more can come.  Not covered:
-  `ktls_decrypt()` itself, whose one record proof is past 70G.
+  only part of one is and no more can come.
+- `ktls_decrypt()` (harness `ktls/ktls_rx.c`), on one record in one
+  mbuf decrypted by the NIC, AES-GCM TLS 1.2: delivered as a
+  TLS_GET_RECORD control message and its payload, no more.  Only on
+  fixed shapes: over a byte stream the proof is past 80G.
+
+Open question: a NIC-decrypted record shorter than its tag (20 bytes,
+where header and tag are 29) passes `ktls_decrypt()`'s header checks,
+which the software paths refuse with EMSGSIZE; its payload comes to -9
+bytes and the trailer trim walks off the chain to a NULL dereference
+(`run.sh` question `ktls_rx_decrypt_short`).  Whether a NIC can mark
+such a record decrypted is the hardware's; asked of the developer.
 
 A TLS 1.0 sequence number past 2^64-1, which RFC 2246 forbids, would
 leave a record waiting for good; only a session set up within a few
