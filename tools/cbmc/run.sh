@@ -900,6 +900,37 @@ if want ktls; then
 	    '/^ktls_disable_ifnet_help(/,/^}/s/if (tp->t_flags \& TF_DISCONNECTED) {/if (0) {/'
 	mutant ktls_disable_off "$h" "$s" proof_disable_ifnet "$dk" "$ut" \
 	    '/^ktls_disable_ifnet_help(/,/^}/s/(\*tp->t_fb->tfb_hwtls_change)(tp, 0);/(*tp->t_fb->tfb_hwtls_change)(tp, 1);/'
+
+	# The receive tag: allocated on the route's interface, or the error
+	# of what is missing; reset once when packets come in on another,
+	# a new tag where that interface can receive TLS for the family.
+	proof ktls_rx_tag_alloc "$h" "$s" proof_rx_tag_alloc "$dk" "$ut"
+	proof ktls_rx_tag_mismatch "$h" "$s" proof_rx_tag_mismatch "$dk" "$ut"
+	proof ktls_rx_tag_reset "$h" "$s" proof_rx_tag_reset "$dk" "$ut"
+
+	# The fix taken back, for each family: IFCAP2_RXTLS4/6 are bit
+	# numbers, not masks.
+	mutant ktls_rx_tag_v4 "$h" "$s" proof_rx_tag_reset "$dk" "$ut" \
+	    '/^ktls_reset_receive_tag(/,/^}/s/IFCAP2_BIT(IFCAP2_RXTLS4))/IFCAP2_RXTLS4)/'
+	mutant ktls_rx_tag_v6 "$h" "$s" proof_rx_tag_reset "$dk" "$ut" \
+	    '/^ktls_reset_receive_tag(/,/^}/s/IFCAP2_BIT(IFCAP2_RXTLS6))/IFCAP2_RXTLS6)/'
+	# The reset is done, and lets go of the socket and interface.
+	mutant ktls_rx_tag_done "$h" "$s" proof_rx_tag_reset "$dk" "$ut" \
+	    '/^ktls_reset_receive_tag(/,/^}/s/tls->reset_pending = false;/;/'
+	mutant ktls_rx_tag_sorele "$h" "$s" proof_rx_tag_reset "$dk" "$ut" \
+	    '/^ktls_reset_receive_tag(/,/^}/s/^	sorele(so);/	;/'
+	mutant ktls_rx_tag_ifrele "$h" "$s" proof_rx_tag_reset "$dk" "$ut" \
+	    '/^ktls_reset_receive_tag(/,/^}/s/^		if_rele(ifp);/		;/'
+	# It is scheduled once, with a socket reference.
+	mutant ktls_rx_tag_once "$h" "$s" proof_rx_tag_mismatch "$dk" "$ut" \
+	    '/^ktls_input_ifp_mismatch(/,/^}/s/if (!tls->reset_pending) {/if (1) {/'
+	mutant ktls_rx_tag_soref "$h" "$s" proof_rx_tag_mismatch "$dk" "$ut" \
+	    '/^ktls_input_ifp_mismatch(/,/^}/s/^		soref(so);/		;/'
+	# No tag the NIC cannot hand back, or for the wrong family.
+	mutant ktls_rx_tag_recrypt "$h" "$s" proof_rx_tag_alloc "$dk" "$ut" \
+	    's/if (!ktls_ocf_recrypt_supported(tls))/if (0)/'
+	mutant ktls_rx_tag_alloc6 "$h" "$s" proof_rx_tag_alloc "$dk" "$ut" \
+	    '/^ktls_alloc_rcv_tag(/,/^}/s/IFCAP2_BIT(IFCAP2_RXTLS6)/IFCAP2_BIT(IFCAP2_RXTLS4)/'
 fi
 
 [ "$njobs" -gt 0 ] || { echo "run.sh: nothing selected" >&2; exit 2; }
