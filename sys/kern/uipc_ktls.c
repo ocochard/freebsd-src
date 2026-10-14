@@ -2604,8 +2604,14 @@ ktls_decrypt(struct socket *so)
 			/*
 			 * NIC TLS is only supported for AEAD
 			 * ciphersuites which used a fixed sized
-			 * trailer.
+			 * trailer.  The record must hold it, as the
+			 * software paths check.
 			 */
+			if (tls_len < tls->params.tls_hlen +
+			    tls->params.tls_tlen) {
+				error = EMSGSIZE;
+				break;
+			}
 			if (tls13) {
 				trail_len = tls->params.tls_tlen - 1;
 				error = tls13_find_record_type(tls, data,
