@@ -109,7 +109,13 @@ with RFC 5288 (AES-GCM) and RFC 7905 (ChaCha20-Poly1305).  No bug found.
   `ktls_reset_send_tag()` releases the old tag and installs a new one,
   or aborts the connection and leaves the reset pending, dropping its
   reference; `ktls_try_ifnet()` offloads the session with its tag, or
-  leaves it as it was.
+  leaves it as it was.  `ktls_set_tx_mode()` switches an open
+  connection between software and NIC offload by a clone of its
+  session, which replaces the old one, or is destroyed with the old one
+  left in place when the mode cannot be set up, the send lock is not
+  had, or another change won the race while the inpcb was unlocked;
+  offload is refused twice, or once disabled; the inpcb is locked
+  again on return.
 - `ktls_decrypt()` (harness `ktls/ktls_rx.c`), on one record in one
   mbuf decrypted by the NIC, AES-GCM TLS 1.2: delivered as a
   TLS_GET_RECORD control message and its payload, no more.  Only on
