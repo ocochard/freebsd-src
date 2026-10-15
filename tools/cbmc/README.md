@@ -137,6 +137,11 @@ with RFC 5288 (AES-GCM) and RFC 7905 (ChaCha20-Poly1305).  No bug found.
   between decrypted and encrypted data; empty mbufs are dropped and small
   ones copied into a tail that has the room, unless coalescing is off;
   a read-only tail is not written; the counts and the tail are kept.
+  `sbcut_internal()`, which soreceive() and the flushes drop data with,
+  on a TLS receive buffer: decrypted records, the one being decrypted,
+  the TLS chain; each part counts out the bytes cut from it, the record
+  being decrypted is let go so its worker frees it, the mbufs cut whole
+  come back once each, and what is left stays in place.
 - `ktls_decrypt()` (harness `ktls/ktls_rx.c`), on one record in one
   mbuf decrypted by the NIC, AES-GCM TLS 1.2: delivered as a
   TLS_GET_RECORD control message and its payload, no more.  Only on

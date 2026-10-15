@@ -980,6 +980,30 @@ if want ktls; then
 	    '/^sbcompress_ktls_rx(/,/^}/s/sb->sb_tlscc += m->m_len;/;/'
 	mutant ktls_rx_compress_tail "$hc" "$ss" proof_rx_compress "$dk" "$uc" \
 	    '/^sbcompress_ktls_rx(/,/^}/s/sb->sb_mtlstail = m;/;/'
+
+	# sbcut_internal() on a TLS receive buffer: the decrypted records,
+	# the record being decrypted, then the TLS chain.
+	ux="sbcut_internal.5:6,proof_rx_cut.0:5,proof_rx_cut.1:3"
+	ux="$ux,proof_rx_cut.2:3,proof_rx_cut.3:5,proof_rx_cut.4:6"
+	ux="$ux,proof_rx_cut.5:6,proof_rx_cut.6:5"
+	proof ktls_rx_cut "$hc" "$ss" proof_rx_cut "$dk" "$ux"
+	# The record being decrypted is let go, counted out ...
+	mutant ktls_rx_cut_dccclear "$hc" "$ss" proof_rx_cut "$dk" "$ux" \
+	    '/^sbcut_internal(/,/^}/s/sb->sb_tlsdcc = 0;/;/'
+	mutant ktls_rx_cut_dcclen "$hc" "$ss" proof_rx_cut "$dk" "$ux" \
+	    '/^sbcut_internal(/,/^}/s/len -= sb->sb_tlsdcc;/;/'
+	# ... the TLS chain freed as TLS data, all of it handed back ...
+	mutant ktls_rx_cut_tlsfree "$hc" "$ss" proof_rx_cut "$dk" "$ux" \
+	    '/^sbcut_internal(/,/^}/s/sbfree_ktls_rx(sb, m);/sbfree(sb, m);/'
+	mutant ktls_rx_cut_tlslist "$hc" "$ss" proof_rx_cut "$dk" "$ux" \
+	    '/^sbcut_internal(/,/^}/s/if (m->m_flags \& M_NOTREADY \&\& !is_tls)/if (m->m_flags \& M_NOTREADY)/'
+	# ... and what is left of it, and of the records, kept in place.
+	mutant ktls_rx_cut_mtls "$hc" "$ss" proof_rx_cut "$dk" "$ux" \
+	    '/^sbcut_internal(/,/^}/s/sb->sb_mtls = m;/;/'
+	mutant ktls_rx_cut_mtlstail "$hc" "$ss" proof_rx_cut "$dk" "$ux" \
+	    '/^sbcut_internal(/,/^}/s/sb->sb_mtlstail = NULL;/;/'
+	mutant ktls_rx_cut_sbmb "$hc" "$ss" proof_rx_cut "$dk" "$ux" \
+	    '/^sbcut_internal(/,/^}/s/^		sb->sb_mb = NULL;/		;/'
 fi
 
 [ "$njobs" -gt 0 ] || { echo "run.sh: nothing selected" >&2; exit 2; }

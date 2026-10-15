@@ -38,6 +38,12 @@
  *			writable tail where they fit unless coalescing is
  *			off; the counts and the tail kept
  *
+
+ *   proof_rx_cut	sbcut_internal() on a TLS receive buffer: decrypted
+ *			records, the one being decrypted, the TLS chain;
+ *			the bytes cut leave each part's count, the mbufs cut
+ *			come back once, the rest is kept
+ *
  * The mbufs hold their data, as small receive mbufs do; a few bytes each.
  */
 
@@ -161,4 +167,137 @@ proof_rx_compress(void)
 	if (nocoal)
 		__CPROVER_assert(i == (tail ? 1 : 0) + full,
 		    "with coalescing off, each mbuf with data is kept");
+}
+
+/*
+ * sbcut_internal() on a TLS receive buffer, as soreceive() and the flushes
+ * of sbdrop() and sbflush() call it: two decrypted records in sb_mb, of an
+ * mbuf each, data or control (ktls_decrypt() appends the TLS_GET_RECORD
+ * control message and its data); a record being decrypted, counted in
+ * sb_tlsdcc; the TLS chain of two mbufs not ready.  The cut is any length
+ * within the records, as soreceive() takes, or one that ends past the
+ * record being decrypted on an mbuf of the TLS chain, a flush whole:
+ * sbcut_internal() asserts it is given no other.  Four mbufs, not two
+ * records of two: cbmc takes each pointer the walk reads from an mbuf's
+ * union to be any mbuf, and six went past half an hour.
+ */
+#define	XN	4	/* two records, two mbufs of the TLS chain */
+#define	XR	2	/* the records' */
+
+void
+proof_rx_cut(void)
+{
+	struct sockbuf *sb = &g_so.so_rcv;
+	struct mbuf *m, *mfree, *x[XN];
+	u_int ccc, acc, ctl, tlscc, mbcnt, dcc;
+	int cut[XN], olen[XN], i, j, k, len, mb, ctlcut, tlscut, nfree;
+	char *odata[XN];
+	bool freed[XN];
+
+	for (i = 0; i < XN; i++) {
+		m = __CPROVER_allocate(sizeof(struct mbuf), 1);
+		m->m_len = nondet_int();
+		__CPROVER_assume(m->m_len >= 1 && m->m_len <= 64);
+		m->m_data = m->m_dat;
+		m->m_type = i < XR && nondet_bool() ? MT_CONTROL : MT_DATA;
+		m->m_flags = i >= XR ? M_NOTREADY : 0;
+		olen[i] = m->m_len;
+		odata[i] = m->m_data;
+		x[i] = m;
+	}
+	x[0]->m_nextpkt = x[1];
+	x[2]->m_next = x[3];
+	sb->sb_mb = x[0];
+	sb->sb_lastrecord = x[1];
+	sb->sb_mbtail = x[1];
+	sb->sb_mtls = x[2];
+	sb->sb_mtlstail = x[3];
+	sb->sb_fnrdy = NULL;
+	sb->sb_sndptr = NULL;
+	sb->sb_sndptroff = 0;
+	dcc = nondet_u_int() % 64;
+	sb->sb_tlsdcc = dcc;
+	mb = x[0]->m_len + x[1]->m_len;
+	sb->sb_tlscc = tlscc = x[2]->m_len + x[3]->m_len;
+	sb->sb_acc = acc = mb;
+	sb->sb_ctl = ctl = (x[0]->m_type == MT_CONTROL ? x[0]->m_len : 0) +
+	    (x[1]->m_type == MT_CONTROL ? x[1]->m_len : 0);
+	sb->sb_ccc = ccc = mb + dcc + tlscc;
+	sb->sb_mbcnt = mbcnt = XN * MSIZE;
+	sb->sb_flags = SB_TLS_RX;
+
+	len = nondet_int();
+	__CPROVER_assume((len >= 0 && len <= mb) ||
+	    len == mb + dcc + x[2]->m_len || len == ccc);
+
+	mfree = sbcut_internal(sb, len);
+
+	__CPROVER_assert(sb->sb_ccc == ccc - len, "sb_ccc loses the cut");
+	/* What each mbuf lost, in order: the records, then the TLS chain. */
+	k = len < mb ? len : mb;
+	ctlcut = 0;
+	for (i = 0; i < XR; i++) {
+		cut[i] = k < olen[i] ? k : olen[i];
+		k -= cut[i];
+		if (x[i]->m_type == MT_CONTROL)
+			ctlcut += cut[i];
+	}
+	k = len > mb + (int)dcc ? len - mb - (int)dcc : 0;
+	for (i = XR; i < XN; i++) {
+		cut[i] = k < olen[i] ? k : olen[i];
+		k -= cut[i];
+	}
+	__CPROVER_assert(sb->sb_acc == acc - (len < mb ? len : mb) &&
+	    sb->sb_ctl == ctl - ctlcut,
+	    "sb_acc and sb_ctl lose what the records lost");
+	if (len <= mb) {
+		__CPROVER_assert(sb->sb_tlsdcc == dcc && sb->sb_tlscc == tlscc &&
+		    sb->sb_mtls == x[2] && sb->sb_mtlstail == x[3],
+		    "a cut within the records leaves the TLS data alone");
+	} else {
+		tlscut = len - mb - dcc;
+		__CPROVER_assert(sb->sb_tlsdcc == 0,
+		    "the record being decrypted is let go, so its worker "
+		    "frees it");
+		__CPROVER_assert(sb->sb_tlscc == tlscc - tlscut &&
+		    sb->sb_mb == NULL && sb->sb_lastrecord == NULL &&
+		    sb->sb_mbtail == NULL,
+		    "the records are gone, the TLS chain counted as cut");
+		__CPROVER_assert(len == ccc ? sb->sb_mtls == NULL &&
+		    sb->sb_mtlstail == NULL :
+		    sb->sb_mtls == x[3] && sb->sb_mtlstail == x[3],
+		    "the TLS chain starts after the cut, its tail kept");
+	}
+	/* The mbufs cut whole are handed back, once each; the rest kept. */
+	for (i = 0; i < XN; i++)
+		freed[i] = false;
+	nfree = 0;
+	for (m = mfree, j = 0; j < XN + 1 && m != NULL; j++, m = m->m_next) {
+		for (i = 0; i < XN; i++)
+			if (m == x[i]) {
+				__CPROVER_assert(!freed[i],
+				    "an mbuf is handed back once");
+				freed[i] = true;
+			}
+		nfree++;
+	}
+	__CPROVER_assert(m == NULL, "the free list ends");
+	k = 0;
+	for (i = 0; i < XN; i++) {
+		__CPROVER_assert(freed[i] == (cut[i] == olen[i]),
+		    "an mbuf is handed back when cut whole, else kept");
+		if (!freed[i])
+			__CPROVER_assert(x[i]->m_len == olen[i] - cut[i] &&
+			    x[i]->m_data == odata[i] + cut[i],
+			    "an mbuf cut in part keeps the rest");
+		if (freed[i])
+			k++;
+	}
+	__CPROVER_assert(nfree == k, "only mbufs of the buffer come back");
+	__CPROVER_assert(sb->sb_mbcnt == mbcnt - MSIZE * nfree,
+	    "sb_mbcnt counts the mbufs kept");
+	if (len < mb)
+		__CPROVER_assert(sb->sb_mb == (cut[0] < olen[0] ? x[0] : x[1]) &&
+		    sb->sb_lastrecord == x[1] && sb->sb_mbtail == x[1],
+		    "the records left start where the cut ended");
 }
