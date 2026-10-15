@@ -43,6 +43,10 @@
  *			it a decrypted record: the control message, then
  *			the payload, linked as the last record and counted
  *			ready, the TLS data left alone
+ *   proof_tx_ready	sbready() on a TLS send buffer, as the KTLS worker
+ *			readies encrypted records: the pages counted, the
+ *			bytes made readable when the first record not
+ *			ready is, headers moved into trailers in order
  *   proof_rx_cut	sbcut_internal() on a TLS receive buffer: decrypted
  *			records, the one being decrypted, the TLS chain;
  *			the bytes cut leave each part's count, the mbufs cut
@@ -395,4 +399,209 @@ proof_rx_record(void)
 	    sb->sb_tlscc == tlscc && sb->sb_tlsdcc == dcc &&
 	    tls->m_flags == M_NOTREADY && tls->m_next == NULL,
 	    "the TLS data is left alone");
+}
+
+/*
+ * sbready(), as tcp_usr_ready() calls it for the KTLS worker once records
+ * are encrypted (pr_ready() in ktls_encrypt() and ktls_encrypt_cb()), on
+ * the send buffer: a ready mbuf, then two unmapped records not ready,
+ * the first of them sb_fnrdy, each of any pages, none for an empty TLS 1.0
+ * record, which counts one; a record holds its session or not, readied
+ * or not: software TLS readies encrypted records it took the session off,
+ * sendfile(2) with NIC TLS readies records whose pages were read, the
+ * session kept for the NIC.  count pages are readied from the first
+ * record, or from the second, readied before the first as an asynchronous
+ * worker or a completing read can.  Small
+ * unmapped mbufs are not turned into plain ones (mb_unmapped_compress()
+ * declines): that path is not covered.
+ */
+#define	TN	3	/* a ready mbuf, then two records */
+/*
+ * Headers of a few bytes; trailers of TLEN bytes, which run.sh sets for
+ * each job: none, room for a header, and too little for one.  The header
+ * is copied to the end of the trailer before it, through a pointer cbmc
+ * takes to be any mbuf of the chain: at an offset it cannot settle, with
+ * the trailer's length free, two records went past 60G.
+ */
+#define	TH	4
+
+/*
+ * A record's session: a token, not a struct ktls_session, which
+ * sbready() and sbready_compress() only test for NULL.  cbmc takes a
+ * pointer read from an mbuf's union to be any written to it, and with a
+ * session there each write through a record was one to the session too.
+ */
+static char g_tlstoken;
+
+int
+mb_unmapped_compress(struct mbuf *m)
+{
+	return (EINVAL);
+}
+
+void
+proof_tx_ready(void)
+{
+	struct sockbuf *sb = &g_so.so_snd;
+	struct mbuf *m, *m0, *x[TN], *fnrdy;
+	u_int acc, ccc, mbcnt;
+	int count, cnt, i, j, k, first, total, error, olen[TN], hlen[TN];
+	int tlen[TN], left[TN];
+	uint8_t ohdr[TN][TH];
+	bool sess[TN], nocoal, whole[TN], pre;
+
+	total = 0;
+	for (i = 0; i < TN; i++) {
+		m = __CPROVER_allocate(sizeof(struct mbuf), 1);
+		m->m_type = MT_DATA;
+		x[i] = m;
+		if (i > 0)
+			x[i - 1]->m_next = m;
+		if (i == 0) {
+			m->m_len = nondet_int();
+			__CPROVER_assume(m->m_len >= 1 && m->m_len <= 64);
+			m->m_data = m->m_dat;
+			olen[0] = m->m_len;
+			total += m->m_len;
+			sess[0] = false;
+			continue;
+		}
+		m->m_flags = M_EXT | M_EXTPG | M_NOTREADY;
+		m->m_ext.ext_flags = EXT_FLAG_EMBREF;
+		m->m_ext.ext_count = 1;
+		m->m_epg_npgs = nondet_int();
+		__CPROVER_assume(m->m_epg_npgs <= 2);
+		m->m_epg_nrdy = m->m_epg_npgs;
+		m->m_epg_hdrlen = hlen[i] = nondet_int();
+#ifdef TLEN
+		tlen[i] = TLEN;
+#else
+		tlen[i] = nondet_int();
+#endif
+		m->m_epg_trllen = tlen[i];
+		__CPROVER_assume(hlen[i] >= 0 && hlen[i] <= TH &&
+		    tlen[i] >= 0 && tlen[i] <= MBUF_PEXT_TRAIL_LEN);
+		for (k = 0; k < TH; k++)
+			m->m_epg_hdr[k] = ohdr[i][k] = nondet_int();
+		m->m_len = hlen[i] + (m->m_epg_npgs == 0 ? 0 :
+		    m->m_epg_npgs * PAGE_SIZE) + tlen[i];
+		/* A record still to encrypt holds its session. */
+		sess[i] = nondet_bool();
+		m->m_epg_tls = sess[i] ? (struct ktls_session *)&g_tlstoken :
+		    NULL;
+		olen[i] = m->m_len;
+		total += m->m_len;
+	}
+	nocoal = nondet_bool();
+	sb->sb_flags = nocoal ? SB_NOCOALESCE : 0;
+	sb->sb_mb = x[0];
+	sb->sb_lastrecord = x[0];
+	sb->sb_mbtail = x[TN - 1];
+	sb->sb_fnrdy = x[1];
+	sb->sb_acc = acc = x[0]->m_len;
+	sb->sb_ccc = ccc = total;
+	sb->sb_mbcnt = mbcnt = nondet_u_int() % 65536;
+
+	first = nondet_bool() ? 1 : 2;
+	m0 = x[first];
+	/*
+	 * Readying the first record, the second may be ready already, readied
+	 * earlier behind it, as an asynchronous worker does: readying the
+	 * first then makes both readable.
+	 */
+	pre = first == 1 && nondet_bool();
+	if (pre) {
+		x[TN - 1]->m_flags &= ~M_NOTREADY;
+		x[TN - 1]->m_epg_nrdy = 0;
+	}
+	/* The pages the worker readies: whole records, or part of one. */
+	count = nondet_int();
+	__CPROVER_assume(count >= 1 && count <= 4);
+	cnt = count;
+	for (i = 1; i < TN; i++) {
+		left[i] = x[i]->m_epg_npgs == 0 ? 1 : x[i]->m_epg_npgs;
+		whole[i] = false;
+		if (pre && i == TN - 1) {
+			left[i] = 0;
+			whole[i] = true;	/* ready, before the call */
+			continue;
+		}
+		if (i < first || cnt == 0)
+			continue;
+		if (cnt >= left[i]) {
+			cnt -= left[i];
+			left[i] = 0;
+			whole[i] = true;
+		} else {
+			left[i] -= cnt;
+			cnt = 0;
+		}
+	}
+	/* No more than the records hold. */
+	__CPROVER_assume(cnt == 0);
+
+	error = sbready(sb, m0, count);
+
+	for (i = 1; i < TN; i++) {
+		__CPROVER_assert(((x[i]->m_flags & M_NOTREADY) == 0) == whole[i],
+		    "a record is ready when its pages all are");
+		__CPROVER_assert(x[i]->m_epg_npgs == 0 || (pre && i == TN - 1) ?
+		    true : x[i]->m_epg_nrdy == left[i],
+		    "a record counts the pages still to ready");
+	}
+	/* The first record not ready: blocking, readied whole or not. */
+	fnrdy = NULL;
+	for (i = 1; i < TN; i++)
+		if (!whole[i]) {
+			fnrdy = x[i];
+			break;
+		}
+	if (first == 1 && whole[1]) {
+		k = x[0]->m_len;
+		for (i = 1; i < TN; i++) {
+			if (!whole[i])
+				break;
+			k += x[i]->m_len;
+		}
+		__CPROVER_assert(error == 0 && sb->sb_fnrdy == fnrdy &&
+		    sb->sb_acc == k,
+		    "readying the first record not ready makes the bytes up "
+		    "to the next readable");
+	} else
+		__CPROVER_assert(error == EINPROGRESS && sb->sb_fnrdy == x[1] &&
+		    sb->sb_acc == acc,
+		    "readying a record behind one not ready makes nothing "
+		    "readable");
+	/* The bytes are all there, in order, headers moved into trailers. */
+	k = 0;
+	for (m = sb->sb_mb, j = 0; j < TN + 1 && m != NULL; j++, m = m->m_next)
+		k += m->m_len;
+	__CPROVER_assert(m == NULL && k == total && sb->sb_ccc == ccc &&
+	    sb->sb_mbcnt == mbcnt, "no byte lost, none counted twice");
+	for (i = 1; i < TN - 1; i++) {
+		m = x[i];
+		if (x[i + 1]->m_epg_hdrlen == hlen[i + 1]) {
+			__CPROVER_assert(m->m_len == olen[i] &&
+			    m->m_epg_trllen == tlen[i],
+			    "a record not merged into keeps its trailer");
+			continue;
+		}
+		/* The next record's header moved to the end of this trailer. */
+		__CPROVER_assert(!nocoal && !sess[i] && !sess[i + 1] &&
+		    (x[i]->m_flags & M_NOTREADY) == 0 &&
+		    (x[i + 1]->m_flags & M_NOTREADY) == 0,
+		    "headers move only between ready records out of a session, "
+		    "where coalescing is on");
+		__CPROVER_assert(x[i + 1]->m_epg_hdrlen == 0 &&
+		    m->m_epg_trllen == tlen[i] + hlen[i + 1] &&
+		    m->m_epg_trllen <= MBUF_PEXT_TRAIL_LEN &&
+		    m->m_len == olen[i] + hlen[i + 1] &&
+		    x[i + 1]->m_len == olen[i + 1] - hlen[i + 1],
+		    "the header goes to the end of the trailer before it");
+		for (k = 0; k < TH; k++)
+			if (k < hlen[i + 1])
+				__CPROVER_assert((uint8_t)m->m_epg_trail[tlen[i] +
+				    k] == ohdr[i + 1][k],
+				    "byte for byte");
+	}
 }
