@@ -39,6 +39,10 @@
  *			off; the counts and the tail kept
  *
 
+ *   proof_rx_record	sbappendcontrol_locked(), as ktls_decrypt() hands
+ *			it a decrypted record: the control message, then
+ *			the payload, linked as the last record and counted
+ *			ready, the TLS data left alone
  *   proof_rx_cut	sbcut_internal() on a TLS receive buffer: decrypted
  *			records, the one being decrypted, the TLS chain;
  *			the bytes cut leave each part's count, the mbufs cut
@@ -300,4 +304,95 @@ proof_rx_cut(void)
 		__CPROVER_assert(sb->sb_mb == (cut[0] < olen[0] ? x[0] : x[1]) &&
 		    sb->sb_lastrecord == x[1] && sb->sb_mbtail == x[1],
 		    "the records left start where the cut ended");
+}
+
+/*
+ * sbappendcontrol_locked(), as ktls_decrypt() appends a decrypted record:
+ * its TLS_GET_RECORD control message, then its payload, ready, none for
+ * an empty record (sbcreatecontrol() and ktls_decrypt(), flags 0), to a
+ * TLS receive buffer with a record or none before it, the record being
+ * decrypted counted out already (sb_tlsdcc), and the TLS chain.
+ */
+void
+proof_rx_record(void)
+{
+	struct sockbuf *sb = &g_so.so_rcv;
+	struct mbuf *prev, *ctl, *d[2], *tls, *m, *data;
+	u_int ccc, acc, sctl, mbcnt, tlscc, dcc;
+	int i, nd, len, pflags[2];
+
+	prev = nondet_bool() ? __CPROVER_allocate(sizeof(struct mbuf), 1) :
+	    NULL;
+	if (prev != NULL) {
+		prev->m_type = MT_DATA;
+		prev->m_len = nondet_int();
+		__CPROVER_assume(prev->m_len >= 1 && prev->m_len <= 64);
+	}
+	tls = __CPROVER_allocate(sizeof(struct mbuf), 1);
+	tls->m_type = MT_DATA;
+	tls->m_flags = M_NOTREADY;
+	tls->m_len = nondet_int();
+	__CPROVER_assume(tls->m_len >= 1 && tls->m_len <= 64);
+	ctl = __CPROVER_allocate(sizeof(struct mbuf), 1);
+	ctl->m_type = MT_CONTROL;
+	ctl->m_len = sizeof(struct cmsghdr) + sizeof(struct tls_get_record);
+	nd = nondet_int();
+	__CPROVER_assume(nd >= 0 && nd <= 2);
+	len = 0;
+	for (i = 0; i < 2; i++) {
+		d[i] = NULL;
+		if (i >= nd)
+			continue;
+		m = __CPROVER_allocate(sizeof(struct mbuf), 1);
+		m->m_type = MT_DATA;
+		/* Ready, as ktls_decrypt() leaves it; any other flag. */
+		m->m_flags = nondet_int() & ~(M_NOTREADY | M_DECRYPTED |
+		    M_PKTHDR | M_EXT | M_EXTPG);
+		pflags[i] = m->m_flags;
+		m->m_len = nondet_int();
+		__CPROVER_assume(m->m_len >= 1 && m->m_len <= 64);
+		len += m->m_len;
+		d[i] = m;
+		if (i > 0)
+			d[i - 1]->m_next = m;
+	}
+	data = d[0];
+	sb->sb_mb = sb->sb_lastrecord = sb->sb_mbtail = prev;
+	sb->sb_mtls = sb->sb_mtlstail = tls;
+	sb->sb_fnrdy = NULL;
+	dcc = 0;
+	sb->sb_tlsdcc = dcc;
+	sb->sb_tlscc = tlscc = tls->m_len;
+	sb->sb_acc = acc = prev != NULL ? prev->m_len : 0;
+	sb->sb_ctl = sctl = 0;
+	sb->sb_ccc = ccc = acc + tlscc;
+	sb->sb_mbcnt = mbcnt = (prev != NULL ? 2 : 1) * MSIZE;
+	sb->sb_flags = SB_TLS_RX;
+
+	sbappendcontrol_locked(sb, data, ctl, 0);
+
+	__CPROVER_assert(prev != NULL ? sb->sb_mb == prev &&
+	    prev->m_nextpkt == ctl : sb->sb_mb == ctl,
+	    "the record is linked after the last one, or is the first");
+	__CPROVER_assert(sb->sb_lastrecord == ctl && ctl->m_nextpkt == NULL,
+	    "and is the last record");
+	__CPROVER_assert(ctl->m_next == data &&
+	    (nd < 2 || d[0]->m_next == d[1]) &&
+	    sb->sb_mbtail == (nd == 0 ? ctl : d[nd - 1]) &&
+	    sb->sb_mbtail->m_next == NULL,
+	    "the control message, then the payload, its tail the last mbuf");
+	__CPROVER_assert(sb->sb_ccc == ccc + ctl->m_len + len &&
+	    sb->sb_acc == acc + ctl->m_len + len &&
+	    sb->sb_ctl == sctl + ctl->m_len &&
+	    sb->sb_mbcnt == mbcnt + MSIZE * (1 + nd) && sb->sb_fnrdy == NULL,
+	    "counted, all of it ready to read");
+	for (i = 0; i < 2; i++)
+		if (i < nd)
+			__CPROVER_assert(d[i]->m_flags ==
+			    (pflags[i] & ~M_PROTOFLAGS),
+			    "the payload loses its protocol flags only");
+	__CPROVER_assert(sb->sb_mtls == tls && sb->sb_mtlstail == tls &&
+	    sb->sb_tlscc == tlscc && sb->sb_tlsdcc == dcc &&
+	    tls->m_flags == M_NOTREADY && tls->m_next == NULL,
+	    "the TLS data is left alone");
 }
