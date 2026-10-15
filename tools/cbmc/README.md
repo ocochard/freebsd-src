@@ -146,6 +146,15 @@ with RFC 5288 (AES-GCM) and RFC 7905 (ChaCha20-Poly1305).  No bug found.
   record: the control message then the payload, linked as the last
   record, counted and ready to read, its protocol flags cleared, the TLS
   data left alone.
+- `sbready()` on TLS send records, as the KTLS worker readies encrypted
+  records and sendfile(2) records whose pages were read: a record counts
+  its unready pages, one for an empty TLS 1.0 record, and is ready when
+  they all are; readying the first record not ready makes it and the
+  ready ones behind it readable, readying one behind it nothing; and
+  `sbready_compress()` moves a header to the end of the trailer before
+  it, byte for byte, only out of a session, where it fits and coalescing
+  is on.  Two records, on trailers of a fixed length; small unmapped
+  mbufs are not turned plain (`mb_unmapped_compress()` declines).
 - `ktls_decrypt()` (harness `ktls/ktls_rx.c`), on one record in one
   mbuf decrypted by the NIC, AES-GCM TLS 1.2: delivered as a
   TLS_GET_RECORD control message and its payload, no more.  Only on

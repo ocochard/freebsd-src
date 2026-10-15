@@ -1024,6 +1024,48 @@ if want ktls; then
 	    "$ur" '/^sbappendcontrol_locked(/,/^}/s/^	sballoc(sb, m);/	;/'
 	mutant ktls_rx_record_proto "$hc" "$ss" proof_rx_record "$dk" "$ur" \
 	    '/^sbappendcontrol_locked(/,/^}/s/sbm_clrprotoflags(m0, flags);/;/'
+
+	# sbready() on TLS send records, as the KTLS worker and sendfile(2)
+	# ready them, and the headers sbready_compress() then moves into the
+	# trailer before: on trailers of no byte, room for a header, and too
+	# little room (TLEN), each about 36G.
+	ub="sbready.3:3,sbready.5:4,sbready_compress.3:4,sbready_compress.2:3"
+	ub="$ub,proof_tx_ready.0:5,proof_tx_ready.1:4,proof_tx_ready.2:3"
+	ub="$ub,proof_tx_ready.3:3,proof_tx_ready.4:3,proof_tx_ready.5:3"
+	ub="$ub,proof_tx_ready.6:5,proof_tx_ready.7:5,proof_tx_ready.8:2"
+	ub="$ub,cbmc_memmove.0:5"
+	for t in 0 16 62; do
+		proof ktls_tx_ready_$t "$hc" "$ss" proof_tx_ready \
+		    "$dk -DTLEN=$t" "$ub"
+	done
+	db="$dk -DTLEN=16"
+	# A record counts its unready pages, one if it has none ...
+	mutant ktls_tx_ready_pages "$hc" "$ss" proof_tx_ready "$db" "$ub" \
+	    '/^sbready(/,/^}/s/count -= m->m_epg_nrdy;/count--;/'
+	mutant ktls_tx_ready_part "$hc" "$ss" proof_tx_ready "$db" "$ub" \
+	    '/^sbready(/,/^}/s/m->m_epg_nrdy -= count;/m->m_epg_nrdy = 0;/'
+	mutant ktls_tx_ready_empty "$hc" "$ss" proof_tx_ready "$db" "$ub" \
+	    '/^sbready(/,/^}/s/if ((m->m_flags \& M_EXTPG) != 0 \&\& m->m_epg_npgs != 0) {/if ((m->m_flags \& M_EXTPG) != 0) {/'
+	# ... readying the first record not ready makes it and the ready
+	# ones after it readable ...
+	mutant ktls_tx_ready_accrec "$hc" "$ss" proof_tx_ready "$db" "$ub" \
+	    '/^sbready(/,/^}/s/^			sb->sb_acc += m->m_len;/			;/'
+	mutant ktls_tx_ready_accnext "$hc" "$ss" proof_tx_ready "$db" "$ub" \
+	    '/^sbready(/,/^}/s/^		sb->sb_acc += m->m_len;/		;/'
+	mutant ktls_tx_ready_fnrdy "$hc" "$ss" proof_tx_ready "$db" "$ub" \
+	    '/^sbready(/,/^}/s/sb->sb_fnrdy = m;/;/'
+	# ... and a header moves to the end of the trailer before it, out
+	# of a session, where it fits and coalescing is on.
+	mutant ktls_tx_ready_sess "$hc" "$ss" proof_tx_ready "$db" "$ub" \
+	    '/Try to coalesce adjacent ktls/,/int hdr_len, trail_len;/s/!mbuf_has_tls_session(m) \&\&/1 \&\&/'
+	mutant ktls_tx_ready_room "$hc" "$ss" proof_tx_ready "$dk -DTLEN=62" \
+	    "$ub" '/^sbready_compress(/,/^}/s/trail_len + hdr_len <= MBUF_PEXT_TRAIL_LEN) {/1) {/'
+	mutant ktls_tx_ready_nocoal "$hc" "$ss" proof_tx_ready "$db" "$ub" \
+	    '/^sbready_compress(/,/^}/s/if ((sb->sb_flags \& SB_NOCOALESCE) != 0)/if (0)/'
+	mutant ktls_tx_ready_offset "$hc" "$ss" proof_tx_ready "$db" "$ub" \
+	    '/^sbready_compress(/,/^}/s/memcpy(\&m->m_epg_trail\[trail_len\],/memcpy(\&m->m_epg_trail[0],/'
+	mutant ktls_tx_ready_hdrzero "$hc" "$ss" proof_tx_ready "$db" "$ub" \
+	    '/^sbready_compress(/,/^}/s/n->m_epg_hdrlen = 0;/;/'
 fi
 
 [ "$njobs" -gt 0 ] || { echo "run.sh: nothing selected" >&2; exit 2; }
