@@ -1004,6 +1004,26 @@ if want ktls; then
 	    '/^sbcut_internal(/,/^}/s/sb->sb_mtlstail = NULL;/;/'
 	mutant ktls_rx_cut_sbmb "$hc" "$ss" proof_rx_cut "$dk" "$ux" \
 	    '/^sbcut_internal(/,/^}/s/^		sb->sb_mb = NULL;/		;/'
+
+	# sbappendcontrol_locked(), as ktls_decrypt() appends a record: its
+	# control message, then its payload ...
+	ur="proof_rx_record.0:3,proof_rx_record.1:3,sbappendcontrol_locked.1:4"
+	ur="$ur,m_last.0:4,sbm_clrprotoflags.0:4"
+	proof ktls_rx_record "$hc" "$ss" proof_rx_record "$dk" "$ur"
+	mutant ktls_rx_record_link "$hc" "$ss" proof_rx_record "$dk" "$ur" \
+	    '/^sbappendcontrol_locked(/,/^}/s/m_last(control)->m_next = m0;/;/'
+	mutant ktls_rx_record_tail "$hc" "$ss" proof_rx_record "$dk" "$ur" \
+	    '/^sbappendcontrol_locked(/,/^}/s/sb->sb_mbtail = mlast;/;/'
+	# ... the last record (SBLINKRECORD(), which it alone uses here) ...
+	mutant ktls_rx_record_last "$hc" "$ss" proof_rx_record "$dk" "$ur" \
+	    's/^\t(sb)->sb_lastrecord = (m0);/\t;/'
+	# ... every mbuf counted, the payload's protocol flags cleared.
+	mutant ktls_rx_record_count "$hc" "$ss" proof_rx_record "$dk" "$ur" \
+	    '/^sbappendcontrol_locked(/,/^}/s/^		sballoc(sb, m);/		;/'
+	mutant ktls_rx_record_countlast "$hc" "$ss" proof_rx_record "$dk" \
+	    "$ur" '/^sbappendcontrol_locked(/,/^}/s/^	sballoc(sb, m);/	;/'
+	mutant ktls_rx_record_proto "$hc" "$ss" proof_rx_record "$dk" "$ur" \
+	    '/^sbappendcontrol_locked(/,/^}/s/sbm_clrprotoflags(m0, flags);/;/'
 fi
 
 [ "$njobs" -gt 0 ] || { echo "run.sh: nothing selected" >&2; exit 2; }

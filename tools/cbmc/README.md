@@ -142,6 +142,10 @@ with RFC 5288 (AES-GCM) and RFC 7905 (ChaCha20-Poly1305).  No bug found.
   the TLS chain; each part counts out the bytes cut from it, the record
   being decrypted is let go so its worker frees it, the mbufs cut whole
   come back once each, and what is left stays in place.
+  `sbappendcontrol_locked()`, as `ktls_decrypt()` appends a decrypted
+  record: the control message then the payload, linked as the last
+  record, counted and ready to read, its protocol flags cleared, the TLS
+  data left alone.
 - `ktls_decrypt()` (harness `ktls/ktls_rx.c`), on one record in one
   mbuf decrypted by the NIC, AES-GCM TLS 1.2: delivered as a
   TLS_GET_RECORD control message and its payload, no more.  Only on
