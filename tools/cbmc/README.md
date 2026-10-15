@@ -7,7 +7,7 @@ them against the kernel's own source for every input within the bounds.
 
     pkg install cbmc
     tools/cbmc/run.sh                # every proof, about three hours
-    SLOW=1 tools/cbmc/run.sh         # and the ones over half an hour
+    SLOW=1 tools/cbmc/run.sh         # and the longest or largest
     ONLY=nocache tools/cbmc/run.sh   # the jobs whose name matches
     tools/cbmc/run.sh ktls           # one harness: sendfile or ktls
 
@@ -154,7 +154,8 @@ with RFC 5288 (AES-GCM) and RFC 7905 (ChaCha20-Poly1305).  No bug found.
   `sbready_compress()` moves a header to the end of the trailer before
   it, byte for byte, only out of a session, where it fits and coalescing
   is on.  Two records, on trailers of a fixed length; small unmapped
-  mbufs are not turned plain (`mb_unmapped_compress()` declines).
+  mbufs are not turned plain (`mb_unmapped_compress()` declines).  With
+  `SLOW=1`: about 36G each.
 - `ktls_decrypt()` (harness `ktls/ktls_rx.c`), on one record in one
   mbuf decrypted by the NIC, AES-GCM TLS 1.2: delivered as a
   TLS_GET_RECORD control message and its payload, no more.  Only on
