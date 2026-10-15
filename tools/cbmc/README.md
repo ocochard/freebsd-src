@@ -151,15 +151,16 @@ with RFC 5288 (AES-GCM) and RFC 7905 (ChaCha20-Poly1305).  No bug found.
   TLS_GET_RECORD control message and its payload, no more.  Only on
   fixed shapes: over a byte stream the proof is past 80G.
 
-Fix, waiting for the developer: a NIC-decrypted record shorter than its
-tag (20 bytes, where header and tag are 29) passed `ktls_decrypt()`'s
-header checks, which the software paths refuse with EMSGSIZE; its
-payload came to -9 bytes and the trailer trim walked off the chain to a
-NULL dereference.  The fix,
-[a482e648447b](https://github.com/ocochard/freebsd-src/commit/a482e648447b),
-refuses it with EMSGSIZE too (`run.sh` mutant `ktls_rx_decrypt_tagless`
-takes it back).  Whether a NIC can mark such a record decrypted is the
-hardware's: asked of the developer.  Report:
+Hardening: `ktls_decrypt()` takes a NIC-decrypted record to hold its
+header and trailer, without the check the software paths make; one
+shorter than its tag (20 bytes, where header and tag are 29) would come
+to a payload of -9 bytes and a trailer trim walking off the chain to a
+NULL dereference.  The developer answered that a driver passes up such
+a record only with a length known to hold them, which cxgbe's TOE path
+does by building it; for mlx5 it is the NIC's.
+[a482e648447b](https://github.com/ocochard/freebsd-src/commit/a482e648447b)
+refuses one with EMSGSIZE all the same (`run.sh` mutant
+`ktls_rx_decrypt_tagless` takes it back).  Report:
 [reports/ktls.md](reports/ktls.md).
 
 Fix [a0d672151d9e](https://github.com/ocochard/freebsd-src/commit/a0d672151d9e):

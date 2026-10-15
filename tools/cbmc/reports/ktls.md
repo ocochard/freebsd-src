@@ -7,16 +7,18 @@ again before filing.
 
 | # | Bug | Fix | Status |
 |---|---|---|---|
-| 1 | a NIC-decrypted record shorter than its tag is a NULL dereference | [a482e648447b](https://github.com/ocochard/freebsd-src/commit/a482e648447b) | waiting for the developer |
+| 1 | a NIC-decrypted record's length is not checked against its trailer (hardening) | [a482e648447b](https://github.com/ocochard/freebsd-src/commit/a482e648447b) | hardening, developer answered |
 | 2 | a receive tag reset tests the wrong capability bits | [a0d672151d9e](https://github.com/ocochard/freebsd-src/commit/a0d672151d9e) | ready |
 | 3 | a chain of packets loses its receiving interface | [447cba6c6808](https://github.com/ocochard/freebsd-src/commit/447cba6c6808) | ready |
 
 ---
 
-## 1. ktls_decrypt() walks off the chain on a short NIC-decrypted record
+## 1. ktls_decrypt() trusts a NIC-decrypted record's length
 
-**Status: candidate fix; asked the developer whether the hardware can
-deliver such a record.**
+**Status: hardening.  The developer answered that a driver is expected
+to pass up an M_DECRYPTED record only with a length it knows to hold
+the header and trailer, as cxgbe does; the check makes ktls_decrypt()
+not depend on that.**
 
 **Fix:** a482e648447b "ktls: Refuse a NIC-decrypted record shorter than its trailer"
 (`Fixes: fe8c78f0d202`)
@@ -24,32 +26,41 @@ deliver such a record.**
 **What happens:** `ktls_decrypt()` checks a record's length against its
 header length only (`tls_len < tls_hlen`).  For a record the NIC marked
 decrypted (`KTLS_MBUF_CRYPTO_ST_DECRYPTED`), it then takes the trailer to
-be `tls_tlen` long whatever the record's length.  A record shorter than
-its header and trailer gives a negative payload length, stored as a
-large one in `tgr.tls_length`, and the trailer trim,
-`for (m = data; remain > m->m_len; m = m->m_next)`, walks past the end of
-the chain and dereferences NULL.  The software paths
+be `tls_tlen` long whatever the record's length.  Were a record shorter
+than its header and trailer marked decrypted, its payload length would
+be negative, stored as a large one in `tgr.tls_length`, and the trailer
+trim, `for (m = data; remain > m->m_len; m = m->m_next)`, would walk past
+the end of the chain and dereference NULL.  The software paths
 (`ktls_ocf_tls12_aead_decrypt()`, `ktls_ocf_tls13_aead_decrypt()`,
 `ktls_ocf_tls_cbc_decrypt()`) refuse such records with EMSGSIZE.
 
-**Reachability:** `sbappend_ktls_rx()` marks all mbufs of a packet
-decrypted when the driver set `CSUM_TLS_DECRYPTED` (mlx5:
-`mlx5_en_rx.c`, per completion; cxgbe TOE: `t4_tls.c`).  The record
-header is the peer's; whether the NIC reports such a record decrypted is
-the hardware's, not visible in the source.  TLS 1.3 records were already
-refused (EBADMSG, the content type falls in the header).
+**Reachability, by the drivers:** `sbappend_ktls_rx()` marks all mbufs
+of a packet decrypted when the driver set `CSUM_TLS_DECRYPTED`.
+- cxgbe TOE (`t4_tls.c`, `do_rx_tls_cmp()`) cannot get there: it reports
+  a decryption error as EBADMSG and passes no record up, and it builds
+  the decrypted record it passes up itself, the header, the data and
+  `tls_tlen` bytes of trailer, rewriting the header's length to match.
+- mlx5 (`mlx5_en_rx.c`) marks a packet decrypted from its completion
+  entry, one with an error not, and passes the record as on the wire,
+  its trailer the peer's.  It gets there only if the NIC reports as
+  decrypted a record too short to carry its tag, which it cannot have
+  authenticated; whether firmware ever does is not visible in the source.
+- TLS 1.3 records are refused anyway (EBADMSG, the content type falls in
+  the header).
 
 **Fix detail:** in the decrypted case, fail with EMSGSIZE when
 `tls_len < tls_hlen + tls_tlen`, as the software paths do; the error
-path drops the record and sets `so_error`.
+path drops the record and sets `so_error`.  A comparison per record
+decrypted by the NIC.
 
-**Reproduce:** no test: it needs a NIC with TLS receive offload.  The
-CBMC counterexample (`run.sh` mutant `ktls_rx_decrypt_tagless`): AES-GCM
-TLS 1.2 (header 13, tag 16), a 20-byte record in one mbuf, decrypted by
-the NIC: payload -9, `remain` 65527, NULL dereference reading `m->m_len`.
+**Reproduce:** no test: it needs a NIC that breaks the contract above.
+The CBMC counterexample (`run.sh` mutant `ktls_rx_decrypt_tagless`):
+AES-GCM TLS 1.2 (header 13, tag 16), a 20-byte record in one mbuf, marked
+decrypted: payload -9, `remain` 65527, NULL dereference reading
+`m->m_len`.
 
 **Found by:** memory safety of `ktls_decrypt()` (`proof_rx_decrypt`,
-`ktls/ktls_rx.c`).
+`ktls/ktls_rx.c`), with the NIC's marks free.
 
 ---
 
