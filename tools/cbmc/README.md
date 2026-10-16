@@ -59,6 +59,33 @@ leaves no lock, page busy state or reference behind.  `offset` and
 Each property is shown to bite by a mutant, the source with one fix or
 check taken back, which `run.sh` requires to fail.
 
+The pager those proofs model, for a file on UFS (harness
+`sendfile/pager.c`, for `vnode_pager_generic_getpages()`,
+`sys/vm/vnode_pager.c`, as `ffs_getpages_async()` calls it): on a run
+as `vm_pager_assert_in()` takes it, up to three pages of a four-page
+file, read-behind and read-ahead asked for or not, any block map and
+sector size, blocks of 4K and 8K, the read failing or not.  Success,
+and the completion runs once, after the read, on the run given; the
+run valid up to the end of the file; read-behind and read-ahead pages
+freed on an error, queued otherwise, and reported; the pager buffer
+freed; one asynchronous read of the file's bytes in whole sectors and
+no more, from where the block map puts them.  The page cache is taken
+as the pager states it, a page partly valid only past the end of the
+file, and the run as `sendfile_swapin()` ends it, on a page not valid.
+The block size is a constant per job: 64-bit division by a variable
+block size took the formula past 46G in 40 minutes, a constant one 40
+seconds.
+
+Open questions, outside what sendfile and UFS give the pager (`run.sh`
+questions): a run ending on the file's last page valid up to its end
+completes on one page less, which stays busied
+(`pager_lastvalid`); a hole, or a file system without `VOP_BMAP()`,
+is read with no I/O and `VM_PAGER_OK` and the asynchronous completion
+never runs, as `ffs_getpages_async()` and
+`vnode_pager_local_getpages_async()` run it on an error only
+(`pager_nobmap`).  sendfile asks `vm_pager_has_page()` first, under the
+vnode lock, and trims a run's valid last pages.
+
 Not covered: a page busied by another thread (only as a short grab).
 
 ## KTLS: what is proven
