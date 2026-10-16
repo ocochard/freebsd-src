@@ -2595,7 +2595,9 @@ CHACHA20_TESTS(GEN_RECEIVE_TESTS);
 	GEN_RECEIVE_APP_DATA_TEST(cipher_name, cipher_alg, key_size,	\
 	    auth_alg, minor, padding_16_extra, 16, 16)			\
 	GEN_RECEIVE_APP_DATA_TEST(cipher_name, cipher_alg, key_size,	\
-	    auth_alg, minor, padding_32_extra, 16, 32)
+	    auth_alg, minor, padding_32_extra, 16, 32)			\
+	GEN_RECEIVE_APP_DATA_TEST(cipher_name, cipher_alg, key_size,	\
+	    auth_alg, minor, padding_128_extra, 16, 128)
 
 #define ADD_RECEIVE_MTE_PADDING_TESTS(cipher_name, cipher_alg,		\
 	    key_size, auth_alg, minor)					\
@@ -2634,7 +2636,9 @@ CHACHA20_TESTS(GEN_RECEIVE_TESTS);
 	ADD_RECEIVE_APP_DATA_TEST(cipher_name, cipher_alg, key_size,	\
 	    auth_alg, minor, padding_16_extra)				\
 	ADD_RECEIVE_APP_DATA_TEST(cipher_name, cipher_alg, key_size,	\
-	    auth_alg, minor, padding_32_extra)
+	    auth_alg, minor, padding_32_extra)				\
+	ADD_RECEIVE_APP_DATA_TEST(cipher_name, cipher_alg, key_size,	\
+	    auth_alg, minor, padding_128_extra)
 
 #define GEN_RECEIVE_BAD_PADDING_TEST(cipher_name, cipher_alg, key_size,	\
 	    auth_alg, minor, len)					\

@@ -419,7 +419,7 @@ static int
 check_padding(void *arg, void *data, u_int len)
 {
 	uint8_t pad = *(uint8_t *)arg;
-	const char *cp = data;
+	const uint8_t *cp = data;
 
 	while (len > 0) {
 		if (*cp != pad)
