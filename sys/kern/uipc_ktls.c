@@ -1339,7 +1339,7 @@ ktls_enable_rx(struct socket *so, struct tls_enable *en)
 		SOCK_RECVBUF_UNLOCK(so);
 		SOCK_IO_RECV_UNLOCK(so);
 		ktls_free(tls);
-		return (EALREADY);
+		return (error);
 	}
 	so->so_rcv.sb_tls_seqno = be64dec(en->rec_seq);
 	so->so_rcv.sb_tls_info = tls;

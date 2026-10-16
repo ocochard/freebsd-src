@@ -2965,6 +2965,34 @@ ATF_TC_BODY(ktls_sendto_baddst, tc)
 }
 
 /*
+ * TLS receive cannot be enabled on the source of a splice.
+ */
+ATF_TC_WITHOUT_HEAD(ktls_spliced_socket_rx);
+ATF_TC_BODY(ktls_spliced_socket_rx, tc)
+{
+	struct tls_enable en;
+	struct splice sp;
+	int src[2], sink[2];
+
+	ATF_REQUIRE_KTLS();
+	ATF_REQUIRE_MSG(socketpair_tcp(src), "failed to create sockets");
+	ATF_REQUIRE_MSG(socketpair_tcp(sink), "failed to create sockets");
+	memset(&sp, 0, sizeof(sp));
+	sp.sp_fd = sink[0];
+	ATF_REQUIRE(setsockopt(src[1], SOL_SOCKET, SO_SPLICE, &sp,
+	    sizeof(sp)) == 0);
+
+	build_tls_enable(tc, CRYPTO_AES_NIST_GCM_16, 128 / 8, 0,
+	    TLS_MINOR_VER_THREE, (uint64_t)random(), &en);
+	ATF_REQUIRE_ERRNO(EINVAL, setsockopt(src[1], IPPROTO_TCP,
+	    TCP_RXTLS_ENABLE, &en, sizeof(en)) == -1);
+	free_tls_enable(&en);
+
+	close_sockets(src);
+	close_sockets(sink);
+}
+
+/*
  * Make sure that listen(2) returns an error for KTLS-enabled sockets, and
  * verify that an attempt to enable KTLS on a listening socket fails.
  */
@@ -3130,6 +3158,7 @@ ATF_TP_ADD_TCS(tp)
 
 	/* Miscellaneous */
 	ATF_TP_ADD_TC(tp, ktls_sendto_baddst);
+	ATF_TP_ADD_TC(tp, ktls_spliced_socket_rx);
 	ATF_TP_ADD_TC(tp, ktls_listening_socket_tx);
 	ATF_TP_ADD_TC(tp, ktls_listening_socket_rx);
 	ATF_TP_ADD_TC(tp, ktls_receive_loopback_sendfile);
