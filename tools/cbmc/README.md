@@ -9,7 +9,7 @@ them against the kernel's own source for every input within the bounds.
     tools/cbmc/run.sh                # every proof, about three hours
     SLOW=1 tools/cbmc/run.sh         # and the longest or largest
     ONLY=nocache tools/cbmc/run.sh   # the jobs whose name matches
-    tools/cbmc/run.sh ktls           # one harness: sendfile, ktls, accept, kevent
+    tools/cbmc/run.sh ktls           # one harness: sendfile, ktls, accept, kevent, close
 
 ## sendfile(2): fixes
 
@@ -328,6 +328,30 @@ Open questions (`run.sh` questions): an EV_ERROR event that cannot be
 written is counted all the same, where kqueue.2 gives EFAULT
 (`kevent_outfault`); a change with filter 0 is skipped, where kqueue.2
 gives EINVAL for an invalid filter (`kevent_zerofilter`).
+
+## close(2) and close_range(2): what is proven
+
+Harness `close/close.c`, for `kern_close()`, `closefp()`, `closef()`,
+`kern_close_range()` and the descriptor table's own code,
+`sys/kern/kern_descrip.c`, against lib/libsys/close.2 and closefrom.2,
+on a table of 4 slots whose files may be shared between slots and held
+elsewhere; a file's last close, its knotes and VOP_ADVLOCK() are
+modelled.  close(2) of any descriptor: EBADF for one not active, the
+table as it was; else the slot, its bit in the map and its capabilities
+freed, the free-slot hint kept, the file's reference dropped once and
+the file deactivated on its last one only, its knotes dropped and the
+file told (`fo_fdclose()`), the process's POSIX locks on a vnode
+released on any close, the last close's error returned with EINTR for
+a restart (the descriptor freed all the same), every other slot as it
+was, the table unlocked.  close_range(2) on any range, the ends past
+the table and past `INT_MAX` included, and any flags: EINVAL for a bad
+flag or `highfd` below `lowfd`, nothing done; else every open
+descriptor in the range clamped to the table closed as above, or
+flagged close-on-exec or close-on-fork, the others as they were, 0
+returned whatever the closes return.  No bug found.  Not covered: a
+table shared by process leaders (`p_fdtol`), capabilities' seqc, AUDIT.
+goto-cc cannot evaluate the `_Static_assert()`s on constant arrays in
+the file: they are compiled out.
 
 ## How it works
 
