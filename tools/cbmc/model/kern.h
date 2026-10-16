@@ -140,6 +140,11 @@ void *
 void
 (free)(void *addr, struct malloc_type *type)
 {
+#ifdef CBMC_FREE_HOOK
+	/* A harness tracking its own typed allocations, see unp/unp.c. */
+	if (addr != NULL && CBMC_FREE_HOOK(addr, type))
+		return;
+#endif
 	if (addr != NULL)
 		__CPROVER_deallocate(addr);
 }

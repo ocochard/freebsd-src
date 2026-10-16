@@ -9,7 +9,7 @@ them against the kernel's own source for every input within the bounds.
     tools/cbmc/run.sh                # every proof, about three hours
     SLOW=1 tools/cbmc/run.sh         # and the longest or largest
     ONLY=nocache tools/cbmc/run.sh   # the jobs whose name matches
-    tools/cbmc/run.sh ktls           # one harness: sendfile, ktls, accept, kevent, close
+    tools/cbmc/run.sh ktls           # one harness: sendfile, ktls, accept, kevent, close, unp
 
 ## sendfile(2): fixes
 
@@ -352,6 +352,38 @@ returned whatever the closes return.  No bug found.  Not covered: a
 table shared by process leaders (`p_fdtol`), capabilities' seqc, AUDIT.
 goto-cc cannot evaluate the `_Static_assert()`s on constant arrays in
 the file: they are compiled out.
+
+## Unix socket SCM_RIGHTS: what is proven
+
+Harness `unp/unp.c`, for `unp_internalize()` and `unp_externalize()`,
+`sys/kern/uipc_usrreq.c`, against unix.4: the conversion of a sender's
+file descriptors into file references and their installation in the
+receiver's descriptor table, which `sendmsg(2)` and `recvmsg(2)` drive.
+The descriptor table, the control mbufs and the file garbage collector
+are modelled; the files passed are regular files, not sockets, so no
+unpcb message count is touched.  On a SCM_RIGHTS message of 0, 1 or 2
+descriptors, each slot open or not, passable or not, shared between
+slots or held elsewhere:
+
+- `unp_internalize()`: every descriptor is checked, and the first that
+  is missing (EBADF) or not passable (EOPNOTSUPP) rejects the whole
+  message; each file accepted is held once and internalized once; on any
+  error every reference taken is rolled back and every allocation freed;
+  the total of all files' reference counts is the baseline plus the
+  references the message now holds, none lost or leaked.
+- `unp_externalize()`: a descriptor is allocated and the file installed
+  for each (its reference handed to the table), or, when the receiver
+  does not want them or has cleared SO_PASSRIGHTS, or descriptor
+  allocation fails (EMFILE), every file's message reference is released
+  once; the message keeps no reference and its filedescent array is
+  freed in every case.
+
+No bug found.  Not covered: files that are themselves Unix sockets (the
+`unp_msgcount` cycle the garbage collector walks), a message split over
+several mbufs, SCM_CREDS content, and a descriptor array of more than
+two (NFDS=3 internalize proves but at ~40G, through the real
+`sbcreatecontrol()` and `filecaps_copy()`).  goto-cc cannot evaluate the
+`_Static_assert()`s on constant arrays: they are compiled out.
 
 ## How it works
 
