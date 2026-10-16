@@ -9,7 +9,7 @@ them against the kernel's own source for every input within the bounds.
     tools/cbmc/run.sh                # every proof, about three hours
     SLOW=1 tools/cbmc/run.sh         # and the longest or largest
     ONLY=nocache tools/cbmc/run.sh   # the jobs whose name matches
-    tools/cbmc/run.sh ktls           # one harness: sendfile or ktls
+    tools/cbmc/run.sh ktls           # one harness: sendfile, ktls or accept
 
 ## sendfile(2): fixes
 
@@ -275,6 +275,27 @@ every access through the session read back was also one to the socket
 and the other records: two calls on two records took over 40G.  The
 worker reads through both, so its proofs bear that cost: two records
 asynchronously are past 100G.
+
+## accept(2) and accept4(2): what is proven
+
+Harness `accept/accept.c`, for `sys_accept()`, `sys_accept4()`,
+`accept1()` and `kern_accept4()`, `sys/kern/uipc_syscalls.c`, against
+lib/libsys/accept.2.  The descriptor table, the listen queue, the
+protocol's address and the socket's ioctls are modelled by what they
+do.  On any descriptor (a listening socket, a socket not listening, a
+file not a socket, none), a connection or an error from the queue
+(EWOULDBLOCK for a non-blocking socket, EINTR, ECONNABORTED), a full
+descriptor table, an address buffer of any length or none, faults on
+either copy, and for accept4(2) any flags: refused with the manual's
+errors (EINVAL for bad flags and for a socket not listening), no
+descriptor, reference or capability left behind; or a new descriptor
+for the connection, returned, with O_NONBLOCK, O_ASYNC and the signal
+destination inherited (accept) or O_NONBLOCK from SOCK_NONBLOCK and
+O_ASYNC and the signal destination cleared (accept4), close-on-exec and
+close-on-fork from SOCK_CLOEXEC and SOCK_CLOFORK, the socket's
+blocking and async state in step with its file, the peer's address
+copied out to the room given and its own length returned.  No bug
+found.  Not covered: MAC, capability rights, COMPAT_OLDSOCK.
 
 ## How it works
 
