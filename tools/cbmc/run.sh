@@ -72,6 +72,9 @@ replace_kevent="kqueue_register:cbmc_kqueue_register
 	kqueue_scan:cbmc_kqueue_scan"
 replace_close="_fdrop:cbmc_fdrop
 	filecaps_free:cbmc_filecaps_free"
+replace_unp="unp_internalize_fp:cbmc_unp_internalize_fp
+	unp_externalize_fp:cbmc_unp_externalize_fp
+	unp_discard:cbmc_unp_discard"
 replace_ktls="ktls_buffer_alloc:cbmc_ktls_buffer_alloc
 	ktls_drop:cbmc_ktls_drop
 	ktls_destroy:cbmc_ktls_destroy"
@@ -191,7 +194,8 @@ for f in $(sed -n 's/^#include "\(opt_[a-z0-9_]*\.h\)"/\1/p' \
     "$top/sys/kern/kern_sendfile.c" "$top/sys/kern/uipc_ktls.c" \
     "$top/sys/kern/uipc_sockbuf.c" "$top/sys/opencrypto/ktls_ocf.c" \
     "$top/sys/vm/vnode_pager.c" "$top/sys/kern/uipc_syscalls.c" \
-    "$top/sys/kern/kern_event.c" "$top/sys/kern/kern_descrip.c"); do
+    "$top/sys/kern/kern_event.c" "$top/sys/kern/kern_descrip.c" \
+    "$top/sys/kern/uipc_usrreq.c"); do
 	: >"$work/inc/$f"
 done
 
@@ -914,6 +918,59 @@ if want close; then
 	    '/^close_range_flags(/,/^}/s/if (fde->fde_file != NULL)/if (1)/'
 	mutant close_setclamp "$h" "$s" proof_close_range "$dc" "$uc" \
 	    '/^close_range_flags(/,/^}/s/for (; fd <= highfd; fd++) {/for (; fd < highfd; fd++) {/'
+fi
+
+if want unp; then
+	# The SCM_RIGHTS control messages of Unix sockets, uipc_usrreq.c,
+	# against unix.4: unp_internalize() and unp_externalize(), the file
+	# references modelled.  Messages of 0, 1 and 2 descriptors; the
+	# round-trip reference count is sound.  (NFDS=3 internalize proves at
+	# ~40G: the sbcreatecontrol/filecaps round-trip; left to the 0..2
+	# cases, which bite every mutant.)  goto-cc cannot evaluate the
+	# _Static_assert()s on constant arrays: they are compiled out.
+	h="$here/unp/unp.c"
+	s="$top/sys/kern/uipc_usrreq.c"
+	di='-D_Static_assert(a,b)='
+	ui="unp_internalize.0:4,unp_internalize.1:4,unp_internalize.2:4"
+	ui="$ui,unp_internalize.3:4,unp_internalize.4:4,unp_internalize.5:4"
+	ui="$ui,unp_internalize.6:2,unp_internalize_cleanup_rights.0:4"
+	ui="$ui,build_control.0:4,proof_internalize.0:4,proof_internalize.1:4"
+	ui="$ui,proof_internalize.2:4,fdallocn.0:4,check_balance.0:4"
+	ui="$ui,check_balance.1:4,check_balance.2:4,setup.0:4,setup.1:4"
+	ui="$ui,setup.2:4,cbmc_memmove.0:33,unp_freerights.0:4,unp_freerights.1:4"
+	ux="unp_externalize.0:4,unp_externalize.1:4,unp_externalize.2:2"
+	ux="$ux,fdallocn.0:4,setup.0:4,setup.1:4,setup.2:4,proof_externalize.0:4"
+	ux="$ux,proof_externalize.1:4,proof_externalize.2:4,proof_externalize.3:4"
+	ux="$ux,check_balance.0:4,check_balance.1:4,check_balance.2:4"
+	ux="$ux,cbmc_memmove.0:33,unp_freerights.0:4,unp_freerights.1:4"
+	for n in 0 1 2; do
+		proof unp_internalize_$n "$h" "$s" proof_internalize \
+		    "$di -DNFDS=$n" "$ui"
+	done
+	for n in 0 1 2 3; do
+		proof unp_externalize_$n "$h" "$s" proof_externalize \
+		    "$di -DNFDS=$n" "$ux"
+	done
+	# A non-passable or missing descriptor is rejected, every reference
+	# held rolled back; each file held is internalized once.
+	mutant unp_int_passable "$h" "$s" proof_internalize "$di -DNFDS=2" "$ui" \
+	    '/^unp_internalize(/,/^}/s/if (!(fp->f_ops->fo_flags \& DFLAG_PASSABLE)) {/if (0) {/'
+	mutant unp_int_hold "$h" "$s" proof_internalize "$di -DNFDS=2" "$ui" \
+	    '/^unp_internalize(/,/^}/s/if (!fhold(fdesc->fd_ofiles\[\*fdp\].fde_file)) {/if (0) {/'
+	mutant unp_int_intfp "$h" "$s" proof_internalize "$di -DNFDS=2" "$ui" \
+	    '/^unp_internalize(/,/^}/s/unp_internalize_fp(fdep\[i\]->fde_file);/;/'
+	mutant unp_int_cleanup "$h" "$s" proof_internalize "$di -DNFDS=2" "$ui" \
+	    's/unp_internalize_cleanup_rights(mc_first(mc));/;/'
+	# Each file installed (its reference handed to the table) or discarded
+	# once; the message keeps none; the fdep array is freed.
+	mutant unp_ext_pass "$h" "$s" proof_externalize "$di -DNFDS=2" "$ux" \
+	    '/^unp_externalize(/,/^}/s/SO_PASSRIGHTS) == 0) {/SO_PASSRIGHTS) == 1) {/'
+	mutant unp_ext_finstall "$h" "$s" proof_externalize "$di -DNFDS=2" "$ux" \
+	    '/^unp_externalize(/,/^}/s/_finstall(fdesc, fp, \*fdp,/if (0) _finstall(fdesc, fp, *fdp,/'
+	mutant unp_ext_extfp "$h" "$s" proof_externalize "$di -DNFDS=2" "$ux" \
+	    '/^unp_externalize(/,/^}/s/unp_externalize_fp(fp);/;/'
+	mutant unp_ext_freearray "$h" "$s" proof_externalize "$di -DNFDS=2" "$ux" \
+	    '/^unp_externalize(/,/^}/s/free(fdep\[0\], M_FILECAPS);/;/'
 fi
 
 h="$here/ktls/ktls.c"
