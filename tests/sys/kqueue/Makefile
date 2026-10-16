@@ -4,6 +4,7 @@ TESTSDIR=	${TESTSBASE}/sys/kqueue
 BINDIR=		${TESTSDIR}
 
 ATF_TESTS_C+=	kqueue_fork		\
+		kqueue_lengths		\
 		kqueue_peek_signal
 
 NETBSD_ATF_TESTS_C=	proc1_test
