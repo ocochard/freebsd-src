@@ -68,6 +68,8 @@ replace_sendfile="vm_pager_has_page:cbmc_vm_pager_has_page
 	sf_buf_kva:cbmc_sf_buf_kva"
 replace_pager="vnode_pager_input_old:cbmc_vnode_pager_input
 	vnode_pager_input_smlfs:cbmc_vnode_pager_input"
+replace_kevent="kqueue_register:cbmc_kqueue_register
+	kqueue_scan:cbmc_kqueue_scan"
 replace_ktls="ktls_buffer_alloc:cbmc_ktls_buffer_alloc
 	ktls_drop:cbmc_ktls_drop
 	ktls_destroy:cbmc_ktls_destroy"
@@ -186,7 +188,8 @@ mkdir -p "$work/inc"
 for f in $(sed -n 's/^#include "\(opt_[a-z0-9_]*\.h\)"/\1/p' \
     "$top/sys/kern/kern_sendfile.c" "$top/sys/kern/uipc_ktls.c" \
     "$top/sys/kern/uipc_sockbuf.c" "$top/sys/opencrypto/ktls_ocf.c" \
-    "$top/sys/vm/vnode_pager.c" "$top/sys/kern/uipc_syscalls.c"); do
+    "$top/sys/vm/vnode_pager.c" "$top/sys/kern/uipc_syscalls.c" \
+    "$top/sys/kern/kern_event.c"); do
 	: >"$work/inc/$f"
 done
 
@@ -783,6 +786,72 @@ if want accept; then
 	    '/^accept1(/,/^}/s/addrlen = ss.ss_len;/;/'
 	mutant accept_efault "$h" "$s" proof_accept4 "" "$ua" \
 	    '/^accept1(/,/^}/s/fdclose(td, fp, td->td_retval\[0\]);/;/'
+fi
+
+if want kevent; then
+	# kevent(2), kern_event.c: the change and event lists, against
+	# kqueue.2.  Up to 3 changes and 3 events, and 9 changes, two
+	# batches of KQ_NEVENTS (about 5 minutes).
+	h="$here/kevent/kevent.c"
+	s="$top/sys/kern/kern_event.c"
+	uk="proof_kevent.0:4,proof_kevent.1:4,kqueue_kevent.0:4"
+	uk="$uk,kqueue_kevent.1:2,cbmc_memmove.0:193"
+	uk9="proof_kevent.0:10,proof_kevent.1:10,kqueue_kevent.0:9"
+	uk9="$uk9,kqueue_kevent.1:3,cbmc_memmove.0:513"
+	proof kevent "$h" "$s" proof_kevent "" "$uk"
+	proof kevent_9 "$h" "$s" proof_kevent "-DNC=9" "$uk9"
+	# A negative nevents refused with EINVAL before any change.  The fix
+	# taken back: a change that fails or has EV_RECEIPT is written as an
+	# EV_ERROR event past the event list and counted.
+	proof kevent_negevents "$h" "$s" proof_kevent "-DNEGEVENTS" "$uk"
+	mutant kevent_negevents_late "$h" "$s" proof_kevent "-DNEGEVENTS" \
+	    "$uk" '/^kqueue_kevent(/,/^}/s/if (nchanges < 0 || nevents < 0)/if (nchanges < 0)/'
+	# Open questions, kqueue.2 against the code.  An EV_ERROR event that
+	# cannot be written is counted all the same, no EFAULT.  A change
+	# with filter 0 is skipped, no EINVAL.
+	question kevent_outfault "$h" "$s" proof_kevent "-DOUTFAULT" "$uk"
+	question kevent_zerofilter "$h" "$s" proof_kevent "-DZEROFILTER" "$uk"
+	# EINVAL for a negative change list; the system's flags cleared ...
+	mutant kevent_negchanges "$h" "$s" proof_kevent "" "$uk" \
+	    '/^kqueue_kevent(/,/^}/s/if (nchanges < 0 || nevents < 0)/if (nevents < 0)/'
+	mutant kevent_sysflags "$h" "$s" proof_kevent "" "$uk" \
+	    '/^kqueue_kevent(/,/^}/s/kevp->flags \&= ~EV_SYSFLAGS;/;/'
+	# ... an error or EV_RECEIPT an EV_ERROR event where there is room, the
+	# call failing with the error where not ...
+	mutant kevent_noroom "$h" "$s" proof_kevent "" "$uk" \
+	    '/^kqueue_kevent(/,/^}/s/if (nevents == 0)/if (0)/'
+	mutant kevent_receipt "$h" "$s" proof_kevent "" "$uk" \
+	    '/^kqueue_kevent(/,/^}/s/if (error || (kevp->flags \& EV_RECEIPT)) {/if (error) {/'
+	mutant kevent_flags "$h" "$s" proof_kevent "" "$uk" \
+	    '/^kqueue_kevent(/,/^}/s/kevp->flags = EV_ERROR;/kevp->flags |= EV_ERROR;/'
+	mutant kevent_data "$h" "$s" proof_kevent "" "$uk" \
+	    '/^kqueue_kevent(/,/^}/s/kevp->data = error;/;/'
+	mutant kevent_dec "$h" "$s" proof_kevent "" "$uk" \
+	    '/^kqueue_kevent(/,/^}/s/nevents--;/;/'
+	# ... the EV_ERROR events counted, or the events read up to nevents
+	# with the timeout given ...
+	mutant kevent_nerrors "$h" "$s" proof_kevent "" "$uk" \
+	    '/^kqueue_kevent(/,/^}/s/nerrors++;/;/'
+	mutant kevent_retval "$h" "$s" proof_kevent "" "$uk" \
+	    '/^kqueue_kevent(/,/^}/s/td->td_retval\[0\] = nerrors;/;/'
+	mutant kevent_scanmax "$h" "$s" proof_kevent "" "$uk" \
+	    '/^kqueue_kevent(/,/^}/s/return (kqueue_scan(kq, nevents, k_ops, timeout, keva, td));/return (kqueue_scan(kq, nevents + 1, k_ops, timeout, keva, td));/'
+	# ... the change list read in batches of KQ_NEVENTS, in order ...
+	mutant kevent_batch "$h" "$s" proof_kevent "-DNC=9" "$uk9" \
+	    '/^kqueue_kevent(/,/^}/s/n = nchanges > KQ_NEVENTS ? KQ_NEVENTS : nchanges;/n = nchanges;/'
+	mutant kevent_advance "$h" "$s" proof_kevent "-DNC=9" "$uk9" \
+	    '/^kevent_copyin(/,/^}/s/uap->changelist += count;/;/'
+	mutant kevent_outadvance "$h" "$s" proof_kevent "" "$uk" \
+	    '/^kevent_copyout(/,/^}/s/uap->eventlist += count;/;/'
+	# ... the kqueue and descriptor let go, the timeout read or EFAULT.
+	mutant kevent_release "$h" "$s" proof_kevent "" "$uk" \
+	    '/^kern_kevent_fp(/,/^}/s/kqueue_release(kq, 0);/;/'
+	mutant kevent_fdrop "$h" "$s" proof_kevent "" "$uk" \
+	    '/^kern_kevent(/,/^}/s/fdrop(fp, td);/;/'
+	mutant kevent_timeout "$h" "$s" proof_kevent "" "$uk" \
+	    '/^kern_kevent_generic(/,/^}/s/tsp = \&ts;/tsp = NULL;/'
+	mutant kevent_tsfault "$h" "$s" proof_kevent "" "$uk" \
+	    '/^kern_kevent_generic(/,/^}/s/if (error)$/if (0)/'
 fi
 
 h="$here/ktls/ktls.c"
