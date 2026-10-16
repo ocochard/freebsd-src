@@ -70,6 +70,8 @@ replace_pager="vnode_pager_input_old:cbmc_vnode_pager_input
 	vnode_pager_input_smlfs:cbmc_vnode_pager_input"
 replace_kevent="kqueue_register:cbmc_kqueue_register
 	kqueue_scan:cbmc_kqueue_scan"
+replace_close="_fdrop:cbmc_fdrop
+	filecaps_free:cbmc_filecaps_free"
 replace_ktls="ktls_buffer_alloc:cbmc_ktls_buffer_alloc
 	ktls_drop:cbmc_ktls_drop
 	ktls_destroy:cbmc_ktls_destroy"
@@ -189,7 +191,7 @@ for f in $(sed -n 's/^#include "\(opt_[a-z0-9_]*\.h\)"/\1/p' \
     "$top/sys/kern/kern_sendfile.c" "$top/sys/kern/uipc_ktls.c" \
     "$top/sys/kern/uipc_sockbuf.c" "$top/sys/opencrypto/ktls_ocf.c" \
     "$top/sys/vm/vnode_pager.c" "$top/sys/kern/uipc_syscalls.c" \
-    "$top/sys/kern/kern_event.c"); do
+    "$top/sys/kern/kern_event.c" "$top/sys/kern/kern_descrip.c"); do
 	: >"$work/inc/$f"
 done
 
@@ -852,6 +854,66 @@ if want kevent; then
 	    '/^kern_kevent_generic(/,/^}/s/tsp = \&ts;/tsp = NULL;/'
 	mutant kevent_tsfault "$h" "$s" proof_kevent "" "$uk" \
 	    '/^kern_kevent_generic(/,/^}/s/if (error)$/if (0)/'
+fi
+
+if want close; then
+	# close(2) and close_range(2), kern_descrip.c, against close.2 and
+	# closefrom.2, on a table of 4 slots.  goto-cc cannot evaluate the
+	# _Static_assert()s on constant arrays: they are compiled out.
+	h="$here/close/close.c"
+	s="$top/sys/kern/kern_descrip.c"
+	dc='-D_Static_assert(a,b)='
+	uc="close_range_impl.0:6,close_range_flags.0:6,flags_trans.0:3"
+	uc="$uc,setup.4:5,setup.5:5,setup.6:5,setup.7:5,cbmc_filecaps_free.0:5"
+	uc="$uc,proof_close.0:5,proof_close_range.0:5,proof_close_range.1:5"
+	uc="$uc,proof_close_range.2:5,proof_close_range.3:5"
+	uc="$uc,check_closed.0:5,check_closed.1:5,check_closed.2:5"
+	proof close "$h" "$s" proof_close "$dc" "$uc"
+	proof close_range "$h" "$s" proof_close_range "$dc" "$uc"
+	# close: EBADF for no active descriptor; the slot, its map bit, its
+	# capabilities freed, the free-slot hint kept ...
+	mutant close_ebadf "$h" "$s" proof_close "$dc" "$uc" \
+	    '/^kern_close(/,/^}/s/if ((fp = fget_noref(fdp, fd)) == NULL) {/if ((fp = fget_noref(fdp, fd)) == NULL \&\& fd < 0) {/'
+	mutant close_free "$h" "$s" proof_close "$dc" "$uc" \
+	    '/^kern_close(/,/^}/s/fdfree(fdp, fd);/;/'
+	mutant close_slot "$h" "$s" proof_close "$dc" "$uc" \
+	    '/^fdfree(/,/^}/s/fde->fde_file = NULL;/;/'
+	mutant close_caps "$h" "$s" proof_close "$dc" "$uc" \
+	    '/^fdefree_last(/,/^}/s/filecaps_free(\&fde->fde_caps);/;/'
+	mutant close_map "$h" "$s" proof_close "$dc" "$uc" \
+	    '/^fdunused(/,/^}/s/fdp->fd_map\[NDSLOT(fd)\] \&= ~NDBIT(fd);/;/'
+	mutant close_freefile "$h" "$s" proof_close "$dc" "$uc" \
+	    '/^fdunused(/,/^}/s/fdp->fd_freefile = fd;/;/'
+	# ... its knotes and fo_fdclose(), the POSIX locks released, EINTR
+	# for a restart, the table unlocked.
+	mutant close_knote "$h" "$s" proof_close "$dc" "$uc" \
+	    '/^closefp_impl(/,/^}/s/knote_fdclose(td, fd);/;/'
+	mutant close_fdclose "$h" "$s" proof_close "$dc" "$uc" \
+	    '/^closefp_impl(/,/^}/s/fp->f_ops->fo_fdclose(fp, fd, td);/;/'
+	mutant close_restart "$h" "$s" proof_close "$dc" "$uc" \
+	    '/^closefp_impl(/,/^}/s/error = EINTR;/;/'
+	mutant close_advlock "$h" "$s" proof_close "$dc" "$uc" \
+	    '/^closef(/,/^}/s/if ((td->td_proc->p_leader->p_flag \& P_ADVLOCK) != 0) {/if (0) {/'
+	mutant close_unlock "$h" "$s" proof_close "$dc" "$uc" \
+	    '/^closefp_impl(/,/^}/s/FILEDESC_XUNLOCK(fdp);/;/'
+	# close_range: EINVAL for highfd below lowfd or a bad flag; every open
+	# descriptor in the range, clamped to the table, closed ...
+	mutant close_order "$h" "$s" proof_close_range "$dc" "$uc" \
+	    '/^kern_close_range(/,/^}/s/if (highfd < lowfd) {/if (highfd < lowfd \&\& lowfd != highfd + 1) {/'
+	mutant close_rflags "$h" "$s" proof_close_range "$dc" "$uc" \
+	    '/^sys_close_range(/,/^}/s/if ((uap->flags \& ~(CLOSE_RANGE_CLOEXEC | CLOSE_RANGE_CLOFORK)) != 0)/if (0)/'
+	mutant close_clamp "$h" "$s" proof_close_range "$dc" "$uc" \
+	    '/^close_range_impl(/,/^}/s/highfd = MIN(highfd, fdt->fdt_nfiles - 1);/highfd = MIN(highfd, fdt->fdt_nfiles);/'
+	mutant close_skip "$h" "$s" proof_close_range "$dc" "$uc" \
+	    '/^close_range_impl(/,/^}/s/fdfree(fdp, fd);/;/'
+	# ... or flagged close-on-exec or close-on-fork, the open ones in the
+	# range only.
+	mutant close_setflags "$h" "$s" proof_close_range "$dc" "$uc" \
+	    '/^close_range_flags(/,/^}/s/fde->fde_flags |= fde_flags;/fde->fde_flags = fde_flags;/'
+	mutant close_setopen "$h" "$s" proof_close_range "$dc" "$uc" \
+	    '/^close_range_flags(/,/^}/s/if (fde->fde_file != NULL)/if (1)/'
+	mutant close_setclamp "$h" "$s" proof_close_range "$dc" "$uc" \
+	    '/^close_range_flags(/,/^}/s/for (; fd <= highfd; fd++) {/for (; fd < highfd; fd++) {/'
 fi
 
 h="$here/ktls/ktls.c"
