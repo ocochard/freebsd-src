@@ -70,6 +70,7 @@ replace_ktls="ktls_buffer_alloc:cbmc_ktls_buffer_alloc
 	ktls_drop:cbmc_ktls_drop
 	ktls_destroy:cbmc_ktls_destroy"
 replace_ktls_sb="sbcompress_ktls_rx:cbmc_sbcompress_ktls_rx"
+replace_ktls_ocf="ktls_ocf_dispatch:cbmc_ktls_ocf_dispatch"
 replace_ktls_rx="$replace_ktls
 	ktls_resync_ifnet:cbmc_ktls_resync_ifnet
 	m_free:cbmc_m_free"
@@ -96,6 +97,8 @@ restrict_ktls="ktls_encrypt.function_pointer_call.1/cbmc_pr_ready
 cbmc_ktls="--object-bits 10 --no-signed-overflow-check"
 restrict_ktls_rx=$restrict_ktls
 cbmc_ktls_sb="--no-signed-overflow-check"
+restrict_ktls_ocf="m_apply.function_pointer_call.1/check_padding"
+cbmc_ktls_ocf="--no-signed-overflow-check"
 cbmc_ktls_sbc="--no-signed-overflow-check --object-bits 10"
 # ktls_decrypt() walking off its chain goes on with what it reads there,
 # and fails further on: stop at the first property a trace violates.
@@ -174,7 +177,7 @@ mkdir -p "$work/inc"
 ) >/dev/null
 for f in $(sed -n 's/^#include "\(opt_[a-z0-9_]*\.h\)"/\1/p' \
     "$top/sys/kern/kern_sendfile.c" "$top/sys/kern/uipc_ktls.c" \
-    "$top/sys/kern/uipc_sockbuf.c"); do
+    "$top/sys/kern/uipc_sockbuf.c" "$top/sys/opencrypto/ktls_ocf.c"); do
 	: >"$work/inc/$f"
 done
 
@@ -935,6 +938,96 @@ if want ktls; then
 	    's/if (!ktls_ocf_recrypt_supported(tls))/if (0)/'
 	mutant ktls_rx_tag_alloc6 "$h" "$s" proof_rx_tag_alloc "$dk" "$ut" \
 	    '/^ktls_alloc_rcv_tag(/,/^}/s/IFCAP2_BIT(IFCAP2_RXTLS6)/IFCAP2_BIT(IFCAP2_RXTLS4)/'
+
+	# The software decryption of sys/opencrypto/ktls_ocf.c, on records
+	# of any bytes over two mbufs.  CBC, TLS 1.1 and 1.2, every MAC, on
+	# records of a fixed length: not whole blocks (40), too short for
+	# SHA-256 and SHA-384 (48), short (64), padding byte past 127 (176,
+	# 17 minutes) and up to 255 (304, 83 minutes and 8G: SLOW=1).
+	ho="$here/ktls/ktls_ocf.c"
+	so="$top/sys/opencrypto/ktls_ocf.c"
+	uo="record.0:3,cbyte.0:3,cbmc_ktls_ocf_dispatch.0:4,cbmc_memmove.0:17"
+	uc="$uo,ktls_ocf_tls_cbc_decrypt.0:3,ktls_ocf_tls_cbc_decrypt.1:3"
+	uc="$uc,check_padding.0:257,m_apply.0:3,m_apply.1:3,m_copydata.0:9"
+	uc="$uc,proof_cbc_decrypt.0:257"
+	for l in 40 48 64 176; do
+		proof ktls_ocf_cbc_$l "$ho" "$so" proof_cbc_decrypt \
+		    "$dk -DRLEN=$l" "$uc"
+	done
+	slow proof ktls_ocf_cbc_304 "$ho" "$so" proof_cbc_decrypt \
+	    "$dk -DRLEN=304" "$uc"
+	dc="$dk -DRLEN=64"
+	# The fix taken back: padding bytes compared as signed chars, so a
+	# valid record with a padding byte past 127 is refused.
+	mutant ktls_ocf_cbc_sign "$ho" "$so" proof_cbc_decrypt \
+	    "$dk -DRLEN=176" "$uc" \
+	    '/^check_padding(/,/^}/s/const uint8_t \*cp = data;/const char *cp = data;/'
+	# A record too short or not whole blocks is refused ...
+	mutant ktls_ocf_cbc_short "$ho" "$so" proof_cbc_decrypt "$dc" "$uc" \
+	    's/tls_len < AES_BLOCK_LEN + roundup2(os->mac_len + 1, AES_BLOCK_LEN))/tls_len < AES_BLOCK_LEN)/'
+	# ... decrypted after its IV ...
+	mutant ktls_ocf_cbc_iv "$ho" "$so" proof_cbc_decrypt "$dc" "$uc" \
+	    's/crp.crp_iv_start = sizeof(\*hdr);/crp.crp_iv_start = 0;/'
+	# ... its padding refused when it does not fit after the IV and MAC,
+	# or is not all its length (walking it one byte short is no mutant:
+	# the byte left out is the padding length itself) ...
+	mutant ktls_ocf_cbc_fit "$ho" "$so" proof_cbc_decrypt "$dc" "$uc" \
+	    's/if (AES_BLOCK_LEN + \*trailer_len > tls_len)/if (*trailer_len > tls_len)/'
+	mutant ktls_ocf_cbc_pad "$ho" "$so" proof_cbc_decrypt "$dc" "$uc" \
+	    '/^check_padding(/,/^}/s/if (\*cp != pad)/if (0 \&\& *cp != pad)/'
+	mutant ktls_ocf_cbc_walk "$ho" "$so" proof_cbc_decrypt "$dc" "$uc" \
+	    's/(pad + 1), pad + 1,/pad, pad + 1,/'
+	# ... the MAC checked over the content, after the IV, and the
+	# trailer the MAC and padding.
+	mutant ktls_ocf_cbc_skip "$ho" "$so" proof_cbc_decrypt "$dc" "$uc" \
+	    's/skip = sizeof(\*hdr) + AES_BLOCK_LEN;/skip = sizeof(*hdr);/'
+	mutant ktls_ocf_cbc_mac "$ho" "$so" proof_cbc_decrypt "$dc" "$uc" \
+	    's/tls_comp_len = tls_len - (AES_BLOCK_LEN + \*trailer_len);/tls_comp_len = tls_len - *trailer_len;/'
+	mutant ktls_ocf_cbc_trailer "$ho" "$so" proof_cbc_decrypt "$dc" "$uc" \
+	    's/= os->mac_len + pad + 1;/= os->mac_len + pad;/'
+
+	# AES-GCM and ChaCha20-Poly1305, TLS 1.2 and 1.3, on records of up
+	# to 64 bytes: refused when too short for nonce, content type and
+	# tag, else decrypted and the tag checked in one request.
+	proof ktls_ocf_aead12 "$ho" "$so" proof_aead12_decrypt "$dc" "$uo"
+	proof ktls_ocf_aead13 "$ho" "$so" proof_aead13_decrypt "$dc" "$uo"
+	mutant ktls_ocf_aead12_short "$ho" "$so" proof_aead12_decrypt "$dc" \
+	    "$uo" '/^ktls_ocf_tls12_aead_decrypt(/,/^}/s/tls->params.tls_hlen +$/tls->params.tls_hlen + 0 */'
+	mutant ktls_ocf_aead12_len "$ho" "$so" proof_aead12_decrypt "$dc" \
+	    "$uo" '/^ktls_ocf_tls12_aead_decrypt(/,/^}/s/(AES_GMAC_HASH_LEN + sizeof(uint64_t));/AES_GMAC_HASH_LEN;/'
+	mutant ktls_ocf_aead13_short "$ho" "$so" proof_aead13_decrypt "$dc" \
+	    "$uo" 's/if (tls_len < tag_len + 1)/if (tls_len < tag_len)/'
+	mutant ktls_ocf_aead13_len "$ho" "$so" proof_aead13_decrypt "$dc" \
+	    "$uo" '/^ktls_ocf_tls13_aead_decrypt(/,/^}/s/crp.crp_payload_length = tls_len - tag_len;/crp.crp_payload_length = tls_len - tag_len - 1;/'
+
+	# The recrypt of a record the NIC decrypted in part, AES-GCM TLS 1.2
+	# and 1.3, records of a fixed length (each byte is checked), too
+	# short or not: the ciphertext back in the decrypted mbufs only, over
+	# the content only.
+	ur="record.0:3,cbyte.0:3,cbmc_ktls_ocf_dispatch.0:4,cbmc_memmove.0:54"
+	ur="$ur,cbmc_ktls_ocf_dispatch.1:49"
+	ur="$ur,proof_recrypt.0:3,proof_recrypt.1:3,proof_recrypt.2:54"
+	ur="$ur,ktls_ocf_recrypt_fixup.0:3,ktls_ocf_recrypt_fixup.1:3"
+	for v in TWO:20 TWO:32 THREE:16 THREE:32; do
+		proof ktls_ocf_recrypt_${v%:*}_${v#*:} "$ho" "$so" proof_recrypt \
+		    "$dk -DVMINOR=TLS_MINOR_VER_${v%:*} -DRLEN=${v#*:}" "$ur"
+	done
+	d2="$dk -DVMINOR=TLS_MINOR_VER_TWO -DRLEN=32"
+	d3="$dk -DVMINOR=TLS_MINOR_VER_THREE -DRLEN=32"
+	mutant ktls_ocf_recrypt_dec "$ho" "$so" proof_recrypt "$d2" "$ur" \
+	    '/^ktls_ocf_recrypt_fixup(/,/^}/s/if (m->m_flags \& M_DECRYPTED)/if (1)/'
+	mutant ktls_ocf_recrypt_skip "$ho" "$so" proof_recrypt "$d3" "$ur" \
+	    '/^ktls_ocf_tls13_aead_recrypt(/,/^}/s/ktls_ocf_recrypt_fixup(m, tls->params.tls_hlen,/ktls_ocf_recrypt_fixup(m, 0,/'
+	mutant ktls_ocf_recrypt_error "$ho" "$so" proof_recrypt "$d3" "$ur" \
+	    '/^ktls_ocf_tls13_aead_recrypt(/,/^}/s/if (error == 0)/if (1)/'
+	mutant ktls_ocf_recrypt_len12 "$ho" "$so" proof_recrypt "$d2" "$ur" \
+	    '/^ktls_ocf_tls12_aead_recrypt(/,/^}/s/payload_len = tls_len - (AES_GMAC_HASH_LEN + sizeof(uint64_t));/payload_len = tls_len - AES_GMAC_HASH_LEN;/'
+	mutant ktls_ocf_recrypt_short12 "$ho" "$so" proof_recrypt \
+	    "$dk -DVMINOR=TLS_MINOR_VER_TWO -DRLEN=20" "$ur" \
+	    's/if (tls_len < sizeof(uint64_t) + AES_GMAC_HASH_LEN)/if (tls_len < AES_GMAC_HASH_LEN)/'
+	mutant ktls_ocf_recrypt_short13 "$ho" "$so" proof_recrypt \
+	    "$dk -DVMINOR=TLS_MINOR_VER_THREE -DRLEN=16" "$ur" \
+	    's/if (tls_len < AES_GMAC_HASH_LEN + 1)/if (tls_len < AES_GMAC_HASH_LEN)/'
 
 	# sbappend_ktls_rx(), uipc_sockbuf.c: TCP data into a TLS receive
 	# buffer, and the check for packets in on another interface.

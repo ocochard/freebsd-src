@@ -160,6 +160,26 @@ with RFC 5288 (AES-GCM) and RFC 7905 (ChaCha20-Poly1305).  No bug found.
   mbuf decrypted by the NIC, AES-GCM TLS 1.2: delivered as a
   TLS_GET_RECORD control message and its payload, no more.  Only on
   fixed shapes: over a byte stream the proof is past 80G.
+- Software decryption (harness `ktls/ktls_ocf.c`, for
+  `sys/opencrypto/ktls_ocf.c`), on records of any bytes over two mbufs,
+  the crypto framework modelled by what it is asked: every request
+  reads and writes inside its buffer, mbuf or iovecs.
+  `ktls_ocf_tls_cbc_decrypt()` (TLS 1.1 and 1.2, every MAC) against RFC
+  5246 6.2.3.2: a record not whole blocks or too short for IV, MAC and
+  padding is refused; a padding that does not fit or is not all its
+  length is refused; any other, up to 255 bytes, goes on to the MAC,
+  checked over the content, and the trailer is the MAC and padding.  On
+  records of 40, 48, 64, 176 and 304 bytes (`SLOW=1`, 83 minutes, 8G),
+  as the padding walk at an offset CBMC cannot settle took over 16
+  minutes at any length up to 192.  `ktls_ocf_tls12_aead_decrypt()` and
+  `ktls_ocf_tls13_aead_decrypt()` (AES-GCM, ChaCha20-Poly1305) against
+  RFC 5288, RFC 7905 and RFC 8446 5.2, records of up to 64 bytes: too
+  short for nonce, content type and tag is refused, else one request
+  decrypts the content and checks the tag ending the record, the
+  trailer is the tag.  The recrypt of a record the NIC decrypted in
+  part (AES-GCM, TLS 1.2 and 1.3): the ciphertext goes back into the
+  decrypted mbufs, over the content only, every other byte left.
+  Timing is not a property CBMC checks.
 
 Hardening: `ktls_decrypt()` takes a NIC-decrypted record to hold its
 header and trailer, without the check the software paths make; one
@@ -188,6 +208,13 @@ chain's first mbuf, whose packet header it had demoted by then, so a
 chain of two packets or more had no interface and a change of input
 interface went unnoticed (`run.sh` mutant `ktls_rx_append_first` takes
 the fix back).
+
+Fix [1ae48c201579](https://github.com/ocochard/freebsd-src/commit/1ae48c201579):
+`check_padding()` compared each CBC padding byte, read as a signed
+`char`, with the padding length, a `uint8_t`, so on amd64 every record
+with a padding length byte of 128 or more was refused, against RFC
+5246, which allows up to 255 (`run.sh` mutant `ktls_ocf_cbc_sign` takes
+the fix back; ATF cases `ktls_receive_*_padding_128_extra`).
 
 A TLS 1.0 sequence number past 2^64-1, which RFC 2246 forbids, would
 leave a record waiting for good; only a session set up within a few
