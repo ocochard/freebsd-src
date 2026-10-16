@@ -9,7 +9,7 @@ them against the kernel's own source for every input within the bounds.
     tools/cbmc/run.sh                # every proof, about three hours
     SLOW=1 tools/cbmc/run.sh         # and the longest or largest
     ONLY=nocache tools/cbmc/run.sh   # the jobs whose name matches
-    tools/cbmc/run.sh ktls           # one harness: sendfile, ktls or accept
+    tools/cbmc/run.sh ktls           # one harness: sendfile, ktls, accept, kevent
 
 ## sendfile(2): fixes
 
@@ -296,6 +296,38 @@ close-on-fork from SOCK_CLOEXEC and SOCK_CLOFORK, the socket's
 blocking and async state in step with its file, the peer's address
 copied out to the room given and its own length returned.  No bug
 found.  Not covered: MAC, capability rights, COMPAT_OLDSOCK.
+
+## kevent(2): what is proven
+
+Harness `kevent/kevent.c`, for `sys_kevent()`, `kern_kevent()`,
+`kern_kevent_fp()` and `kqueue_kevent()`, `sys/kern/kern_event.c`,
+against lib/libsys/kqueue.2: the layer between the process's change
+and event lists and the kqueue, `kqueue_register()` and
+`kqueue_scan()` modelled by what they are given and return.  On a
+kqueue or another descriptor, up to 3 changes and 3 events (and 9
+changes, two batches of `KQ_NEVENTS`), a timeout or none, any
+registration results, faults on every copy: a negative list length
+refused with EINVAL before any change, a timeout or change list that
+cannot be read with EFAULT; every change applied in order, its system
+flags cleared, before any event is read; an error or `EV_RECEIPT`
+reported as an EV_ERROR event (its ident and filter, the error in
+`data`) where there is room, the call failing with the error and the
+changes after it left where not; the EV_ERROR events counted, or the
+events read up to `nevents` with the timeout given; the descriptor and
+kqueue references let go.
+
+Fix [cd32be5ec761](https://github.com/ocochard/freebsd-src/commit/cd32be5ec761):
+a negative `nevents` was refused only in `kqueue_scan()`, after the
+changes, so a change that failed or had `EV_RECEIPT` was written as an
+EV_ERROR event past the event list and counted, where e00bae5c181a and
+kqueue.2 give EINVAL (`run.sh` mutant `kevent_negevents_late` takes the
+fix back; ATF `tests/sys/kqueue/kqueue_lengths`).  Report:
+[reports/kevent.md](reports/kevent.md).
+
+Open questions (`run.sh` questions): an EV_ERROR event that cannot be
+written is counted all the same, where kqueue.2 gives EFAULT
+(`kevent_outfault`); a change with filter 0 is skipped, where kqueue.2
+gives EINVAL for an invalid filter (`kevent_zerofilter`).
 
 ## How it works
 
