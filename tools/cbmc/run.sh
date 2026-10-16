@@ -186,7 +186,7 @@ mkdir -p "$work/inc"
 for f in $(sed -n 's/^#include "\(opt_[a-z0-9_]*\.h\)"/\1/p' \
     "$top/sys/kern/kern_sendfile.c" "$top/sys/kern/uipc_ktls.c" \
     "$top/sys/kern/uipc_sockbuf.c" "$top/sys/opencrypto/ktls_ocf.c" \
-    "$top/sys/vm/vnode_pager.c"); do
+    "$top/sys/vm/vnode_pager.c" "$top/sys/kern/uipc_syscalls.c"); do
 	: >"$work/inc/$f"
 done
 
@@ -727,6 +727,62 @@ if want sendfile; then
 	    '/^vnode_pager_generic_getpages(/,/^}/s/bp->b_blkno -= IDX_TO_OFF(rbehind) \/ DEV_BSIZE;/;/'
 	mutant pager_trim "$h" "$s" proof_getpages "$d" "$up" \
 	    '/^vnode_pager_generic_getpages(/,/^}/s/rahead = min(rahead, after);/;/'
+fi
+
+if want accept; then
+	# accept(2) and accept4(2), uipc_syscalls.c, against accept.2.
+	h="$here/accept/accept.c"
+	s="$top/sys/kern/uipc_syscalls.c"
+	ua="soaccept.0:129,cbmc_memmove.0:137,check.0:129"
+	proof accept "$h" "$s" proof_accept "" "$ua"
+	proof accept4 "$h" "$s" proof_accept4 "" "$ua"
+	# accept4: invalid flags refused, before the descriptor is looked up.
+	mutant accept_flags "$h" "$s" proof_accept4 "" "$ua" \
+	    's/if ((uap->flags \& ~(SOCK_CLOEXEC | SOCK_CLOFORK | SOCK_NONBLOCK)) != 0)/if ((uap->flags \& ~(SOCK_CLOEXEC | SOCK_CLOFORK | SOCK_NONBLOCK | SOCK_STREAM)) != 0)/'
+	# EINVAL on a socket not listening, before a descriptor is allocated.
+	mutant accept_listen "$h" "$s" proof_accept4 "" "$ua" \
+	    '/fflag = atomic_load_int(\&headfp->f_flag);/,/error = EINVAL;/s/if (!SOLISTENING(head)) {/if (0) {/'
+	# Close-on-exec and close-on-fork from the flags ...
+	mutant accept_cloexec "$h" "$s" proof_accept4 "" "$ua" \
+	    '/^kern_accept4(/,/^}/s/((flags \& SOCK_CLOEXEC) != 0 ? O_CLOEXEC : 0) |/0 |/'
+	mutant accept_clofork "$h" "$s" proof_accept4 "" "$ua" \
+	    '/^kern_accept4(/,/^}/s/((flags \& SOCK_CLOFORK) != 0 ? O_CLOFORK : 0), \&fcaps);/0, \&fcaps);/'
+	# ... the new descriptor returned ...
+	mutant accept_retval "$h" "$s" proof_accept4 "" "$ua" \
+	    '/^kern_accept4(/,/^}/s/td->td_retval\[0\] = fd;/;/'
+	# ... accept: the signal destination inherited; accept4: cleared,
+	# O_ASYNC cleared, O_NONBLOCK from the flags ...
+	mutant accept_inherit "$h" "$s" proof_accept "" "$ua" \
+	    '/^kern_accept4(/,/^}/s/fsetown(pgid, \&so->so_sigio);/;/'
+	mutant accept_setown "$h" "$s" proof_accept4 "" "$ua" \
+	    '/^kern_accept4(/,/^}/s/if (flags \& ACCEPT4_INHERIT) {/if (1) {/'
+	mutant accept_clear "$h" "$s" proof_accept4 "" "$ua" \
+	    '/^kern_accept4(/,/^}/s/fflag \&= ~(FNONBLOCK | FASYNC);/fflag \&= ~FNONBLOCK;/'
+	mutant accept_nonblock "$h" "$s" proof_accept4 "" "$ua" \
+	    '/^kern_accept4(/,/^}/s/fflag |= FNONBLOCK;/;/'
+	# ... the socket's state in step with its file ...
+	mutant accept_nbio "$h" "$s" proof_accept4 "" "$ua" \
+	    '/^kern_accept4(/,/^}/s/tmp = fflag \& FNONBLOCK;/tmp = 0;/'
+	mutant accept_async "$h" "$s" proof_accept "" "$ua" \
+	    '/^kern_accept4(/,/^}/s/tmp = fflag \& FASYNC;/tmp = 0;/'
+	# ... on an error, the new descriptor closed, and every reference and
+	# capability let go ...
+	mutant accept_close "$h" "$s" proof_accept4 "" "$ua" \
+	    '/^kern_accept4(/,/^}/s/fdclose(td, nfp, fd);/;/'
+	mutant accept_caps "$h" "$s" proof_accept4 "" "$ua" \
+	    '/^kern_accept4(/,/^}/s/filecaps_free(\&fcaps);/;/'
+	mutant accept_drop "$h" "$s" proof_accept4 "" "$ua" \
+	    '/^kern_accept4(/,/^}/s/fdrop(headfp, td);/;/'
+	mutant accept_nfpdrop "$h" "$s" proof_accept4 "" "$ua" \
+	    '/^kern_accept4(/,/^}/s/fdrop(nfp, td);/;/'
+	# ... the address copied out to the room given, its own length
+	# returned, the descriptor closed when that faults.
+	mutant accept_addrlen "$h" "$s" proof_accept4 "" "$ua" \
+	    '/^accept1(/,/^}/s/addrlen = min(ss.ss_len, addrlen);/addrlen = ss.ss_len;/'
+	mutant accept_retlen "$h" "$s" proof_accept4 "" "$ua" \
+	    '/^accept1(/,/^}/s/addrlen = ss.ss_len;/;/'
+	mutant accept_efault "$h" "$s" proof_accept4 "" "$ua" \
+	    '/^accept1(/,/^}/s/fdclose(td, fp, td->td_retval\[0\]);/;/'
 fi
 
 h="$here/ktls/ktls.c"
