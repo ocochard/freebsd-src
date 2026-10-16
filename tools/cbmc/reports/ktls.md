@@ -10,6 +10,7 @@ again before filing.
 | 1 | a NIC-decrypted record's length is not checked against its trailer (hardening) | [a482e648447b](https://github.com/ocochard/freebsd-src/commit/a482e648447b) | hardening, developer answered |
 | 2 | a receive tag reset tests the wrong capability bits | [a0d672151d9e](https://github.com/ocochard/freebsd-src/commit/a0d672151d9e) | ready |
 | 3 | a chain of packets loses its receiving interface | [447cba6c6808](https://github.com/ocochard/freebsd-src/commit/447cba6c6808) | ready |
+| 4 | a CBC record with more than 128 bytes of padding is refused | [1ae48c201579](https://github.com/ocochard/freebsd-src/commit/1ae48c201579) | ready |
 
 ---
 
@@ -131,3 +132,41 @@ is not called.
 
 **Found by:** the property of `sbappend_ktls_rx()` "the session is told
 the last packet came in elsewhere" (`proof_rx_append`, `ktls/ktls_sb.c`).
+
+---
+
+## 4. ktls_ocf_tls_cbc_decrypt() refuses valid padding of more than 128 bytes
+
+**Fix:** 1ae48c201579 "ktls: Compare CBC padding bytes as unsigned"
+(`Fixes: 9a673b715897`)
+
+**What happens:** software decryption of an AES-CBC TLS 1.1 or 1.2
+record checks its padding with `check_padding()`, called through
+`m_apply()` on each padding byte.  It reads the bytes through a
+`const char *` and compares them with the padding length, a `uint8_t`:
+`if (*cp != pad)`.  `char` is signed on amd64 and i386, so a byte of
+128 or more reads as negative and never equals `pad`.  Every record
+whose padding length byte is 128 to 255 is refused with EBADMSG, though
+RFC 5246 6.2.3.2 allows padding of up to 255 bytes, to hide a message's
+length, and requires the receiver to accept it.  `ktls_decrypt()` then
+sets `so_error` and the connection fails.
+
+**Reachability:** any peer sending a CBC record with more than 128
+bytes of padding to a socket with software KTLS receive (CBC receive is
+TLS 1.1 and 1.2 only).  It breaks the connection, no more: a padding
+check that refuses too much reads nothing out of bounds.  Architectures
+where `char` is unsigned (arm64, powerpc, riscv) are not affected.
+
+**Fix detail:** read the padding through `const uint8_t *`.
+
+**Reproduce:** `tests/sys/kern/ktls_test.c` gains
+`ktls_receive_*_cbc_*_padding_128_extra`, a record with 144 or more
+bytes of padding.  In a bhyve guest, on the base kernel all eight
+cases fail (`recvmsg()` returns an error); with the fix all pass, as do
+the `padding_32_extra` cases on both.  The CBMC counterexample
+(`run.sh` mutant `ktls_ocf_cbc_sign`): a 176-byte TLS record, padding
+byte 135 and all 136 padding bytes 135, refused with EBADMSG.
+
+**Found by:** the property of `ktls_ocf_tls_cbc_decrypt()` "any padding
+RFC 5246 allows goes on to the MAC" (`proof_cbc_decrypt`,
+`ktls/ktls_ocf.c`), on a record of 304 bytes.
