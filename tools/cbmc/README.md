@@ -180,6 +180,21 @@ with RFC 5288 (AES-GCM) and RFC 7905 (ChaCha20-Poly1305).  No bug found.
   part (AES-GCM, TLS 1.2 and 1.3): the ciphertext goes back into the
   decrypted mbufs, over the content only, every other byte left.
   Timing is not a property CBMC checks.
+- setsockopt(2) TCP_TXTLS_ENABLE and TCP_RXTLS_ENABLE (harness
+  `ktls/ktls_enable.c`, for `sys/kern/uipc_ktls.c`):
+  `ktls_copyin_tls_enable()` on an option of any size, the old one
+  included, from a process or the kernel, any lengths and key pointers:
+  a length past its bound or no cipher key refused, each key in a kernel
+  buffer of exactly its length holding the process's bytes, the old
+  option's fields kept from sequence number 0, or on an error nothing
+  left for `tcp_setsockopt()` to free.  `ktls_enable_tx()` and
+  `ktls_enable_rx()`, `ktls_create_session()` and the NIC modelled by
+  their contracts, on a TCP socket or not, with a session or not,
+  spliced or not, racing another enable while waiting for the I/O lock:
+  refused with the error ktls(4) and 1000cc4a0d39 give, the session
+  freed and the socket as it was; or the session installed at the
+  option's sequence number, the stack told of NIC offload, receive data
+  marked and checked.
 
 Hardening: `ktls_decrypt()` takes a NIC-decrypted record to hold its
 header and trailer, without the check the software paths make; one
@@ -215,6 +230,12 @@ Fix [1ae48c201579](https://github.com/ocochard/freebsd-src/commit/1ae48c201579):
 with a padding length byte of 128 or more was refused, against RFC
 5246, which allows up to 255 (`run.sh` mutant `ktls_ocf_cbc_sign` takes
 the fix back; ATF cases `ktls_receive_*_padding_128_extra`).
+
+Fix [a71bb0992737](https://github.com/ocochard/freebsd-src/commit/a71bb0992737):
+`ktls_enable_rx()` refused a spliced socket with EALREADY, not the
+EINVAL 1000cc4a0d39 set, which `ktls_enable_tx()` returns (`run.sh`
+mutant `ktls_enable_rx_ret` takes the fix back; ATF case
+`ktls_spliced_socket_rx`).
 
 A TLS 1.0 sequence number past 2^64-1, which RFC 2246 forbids, would
 leave a record waiting for good; only a session set up within a few

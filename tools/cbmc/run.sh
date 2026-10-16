@@ -71,6 +71,11 @@ replace_ktls="ktls_buffer_alloc:cbmc_ktls_buffer_alloc
 	ktls_destroy:cbmc_ktls_destroy"
 replace_ktls_sb="sbcompress_ktls_rx:cbmc_sbcompress_ktls_rx"
 replace_ktls_ocf="ktls_ocf_dispatch:cbmc_ktls_ocf_dispatch"
+replace_ktls_enable="ktls_create_session:cbmc_ktls_create_session
+	ktls_try_ifnet:cbmc_ktls_try_ifnet
+	ktls_destroy:cbmc_ktls_destroy
+	ktls_check_rx:cbmc_ktls_check_rx
+	sb_mark_notready:cbmc_sb_mark_notready"
 replace_ktls_rx="$replace_ktls
 	ktls_resync_ifnet:cbmc_ktls_resync_ifnet
 	m_free:cbmc_m_free"
@@ -99,6 +104,7 @@ restrict_ktls_rx=$restrict_ktls
 cbmc_ktls_sb="--no-signed-overflow-check"
 restrict_ktls_ocf="m_apply.function_pointer_call.1/check_padding"
 cbmc_ktls_ocf="--no-signed-overflow-check"
+cbmc_ktls_enable="--no-signed-overflow-check"
 cbmc_ktls_sbc="--no-signed-overflow-check --object-bits 10"
 # ktls_decrypt() walking off its chain goes on with what it reads there,
 # and fails further on: stop at the first property a trace violates.
@@ -1028,6 +1034,76 @@ if want ktls; then
 	mutant ktls_ocf_recrypt_short13 "$ho" "$so" proof_recrypt \
 	    "$dk -DVMINOR=TLS_MINOR_VER_THREE -DRLEN=16" "$ur" \
 	    's/if (tls_len < AES_GMAC_HASH_LEN + 1)/if (tls_len < AES_GMAC_HASH_LEN)/'
+
+	# setsockopt(2) TCP_TXTLS_ENABLE and TCP_RXTLS_ENABLE, uipc_ktls.c:
+	# the option and keys copied in, then the session given the socket.
+	he="$here/ktls/ktls_enable.c"
+	se="$top/sys/kern/uipc_ktls.c"
+	ue="cbmc_memmove.0:73,same.0:9,proof_copyin.0:9,enable_setup.0:9"
+	proof ktls_copyin "$he" "$se" proof_copyin "$dk" "$ue"
+	proof ktls_enable_tx "$he" "$se" proof_enable_tx "$dk" "$ue"
+	proof ktls_enable_rx "$he" "$se" proof_enable_rx "$dk" "$ue"
+	# A length past its bound, or no cipher key, refused ...
+	mutant ktls_copyin_keylen "$he" "$se" proof_copyin "$dk" "$ue" \
+	    '/^ktls_copyin_tls_enable(/,/^}/s/if (tls->cipher_key_len < 0 || tls->cipher_key_len > TLS_MAX_PARAM_SIZE)/if (tls->cipher_key_len < 0)/'
+	mutant ktls_copyin_ivlen "$he" "$se" proof_copyin "$dk" "$ue" \
+	    '/^ktls_copyin_tls_enable(/,/^}/s/if (tls->iv_len < 0 || tls->iv_len > sizeof/if (tls->iv_len < 0 \&\& tls->iv_len > sizeof/'
+	mutant ktls_copyin_authlen "$he" "$se" proof_copyin "$dk" "$ue" \
+	    '/^ktls_copyin_tls_enable(/,/^}/s/if (tls->auth_key_len < 0 || tls->auth_key_len > TLS_MAX_PARAM_SIZE)/if (tls->auth_key_len < 0)/'
+	mutant ktls_copyin_nokey "$he" "$se" proof_copyin "$dk" "$ue" \
+	    '/^ktls_copyin_tls_enable(/,/^}/s/if (tls->cipher_key_len == 0)/if (0)/'
+	# ... nothing left allocated on an error ...
+	mutant ktls_copyin_leak "$he" "$se" proof_copyin "$dk" "$ue" \
+	    '/^ktls_copyin_tls_enable(/,/^}/s/zfree(iv, M_KTLS);/;/'
+	# ... each key in a kernel buffer of its length holding the process's
+	# bytes ...
+	mutant ktls_copyin_ptr "$he" "$se" proof_copyin "$dk" "$ue" \
+	    '/^ktls_copyin_tls_enable(/,/^}/s/tls->iv = iv;/;/'
+	mutant ktls_copyin_copy "$he" "$se" proof_copyin "$dk" "$ue" \
+	    '/^ktls_copyin_tls_enable(/,/^}/s/error = copyin(tls->auth_key, auth_key, tls->auth_key_len);/error = 0;/'
+	# ... the old option's fields kept, from sequence number 0.
+	mutant ktls_copyin_v0zero "$he" "$se" proof_copyin "$dk" "$ue" \
+	    '/^ktls_copyin_tls_enable(/,/^}/s/memset(tls, 0, sizeof(\*tls));/;/'
+	mutant ktls_copyin_v0flags "$he" "$se" proof_copyin "$dk" "$ue" \
+	    '/^ktls_copyin_tls_enable(/,/^}/s/tls->flags = tls_v0.flags;/;/'
+	# Refused while offload is off, on other than TCP, with unmapped mbufs
+	# off, on a socket with a session, or one another enable won ...
+	mutant ktls_enable_rx_off "$he" "$se" proof_enable_rx "$dk" "$ue" \
+	    '/^ktls_enable_rx(/,/^}/s/if (!ktls_offload_enable || !ktls_rx_offload_enable)/if (!ktls_offload_enable)/'
+	mutant ktls_enable_tx_tcp "$he" "$se" proof_enable_tx "$dk" "$ue" \
+	    '/^ktls_enable_tx(/,/^}/s/if (so->so_proto->pr_protocol != IPPROTO_TCP)/if (0)/'
+	mutant ktls_enable_tx_extpgs "$he" "$se" proof_enable_tx "$dk" "$ue" \
+	    '/^ktls_enable_tx(/,/^}/s/if (mb_use_ext_pgs == 0)/if (0)/'
+	mutant ktls_enable_tx_already "$he" "$se" proof_enable_tx "$dk" "$ue" \
+	    '/^ktls_enable_tx(/,/^}/s/if (so->so_snd.sb_tls_info != NULL)$/if (0)/'
+	mutant ktls_enable_tx_race "$he" "$se" proof_enable_tx "$dk" "$ue" \
+	    '/^ktls_enable_tx(/,/^}/s/if (__predict_false(so->so_snd.sb_tls_info != NULL))/if (0)/'
+	# ... on a spliced socket, with EINVAL; the fix taken back (rx_ret):
+	# EALREADY ...
+	mutant ktls_enable_tx_splice "$he" "$se" proof_enable_tx "$dk" "$ue" \
+	    '/^ktls_enable_tx(/,/^}/s/else if ((so->so_snd.sb_flags \& SB_SPLICED) != 0)/else if (0)/'
+	mutant ktls_enable_rx_splice "$he" "$se" proof_enable_rx "$dk" "$ue" \
+	    '/^ktls_enable_rx(/,/^}/s/else if ((so->so_rcv.sb_flags \& SB_SPLICED) != 0)/else if (0)/'
+	mutant ktls_enable_rx_ret "$he" "$se" proof_enable_rx "$dk" "$ue" \
+	    '/else if ((so->so_rcv.sb_flags \& SB_SPLICED) != 0)/,/so->so_rcv.sb_tls_seqno/s/return (error);/return (EALREADY);/'
+	# ... the session freed ...
+	mutant ktls_enable_rx_free "$he" "$se" proof_enable_rx "$dk" "$ue" \
+	    '/error = ktls_ocf_try(tls, KTLS_RX);/,/return (error);/s/ktls_free(tls);/;/'
+	# ... or installed at the option's sequence number, the stack told of
+	# NIC offload, receive data marked and checked, in software or on the
+	# NIC.
+	mutant ktls_enable_tx_seq "$he" "$se" proof_enable_tx "$dk" "$ue" \
+	    '/^ktls_enable_tx(/,/^}/s/so->so_snd.sb_tls_seqno = be64dec(en->rec_seq);/;/'
+	mutant ktls_enable_tx_nic "$he" "$se" proof_enable_tx "$dk" "$ue" \
+	    '/^ktls_enable_tx(/,/^}/s/tp->t_nic_ktls_xmit = 1;/;/'
+	mutant ktls_enable_tx_hw "$he" "$se" proof_enable_tx "$dk" "$ue" \
+	    '/^ktls_enable_tx(/,/^}/s/if (tp->t_fb->tfb_hwtls_change != NULL)/if (0)/'
+	mutant ktls_enable_rx_notready "$he" "$se" proof_enable_rx "$dk" "$ue" \
+	    '/^ktls_enable_rx(/,/^}/s/sb_mark_notready(\&so->so_rcv);/;/'
+	mutant ktls_enable_rx_check "$he" "$se" proof_enable_rx "$dk" "$ue" \
+	    '/^ktls_enable_rx(/,/^}/s/ktls_check_rx(\&so->so_rcv);/;/'
+	mutant ktls_enable_rx_sw "$he" "$se" proof_enable_rx "$dk" "$ue" \
+	    '/^ktls_enable_rx(/,/^}/s/ktls_use_sw(tls);/;/'
 
 	# sbappend_ktls_rx(), uipc_sockbuf.c: TCP data into a TLS receive
 	# buffer, and the check for packets in on another interface.
