@@ -11,6 +11,7 @@ again before filing.
 | 2 | a receive tag reset tests the wrong capability bits | [a0d672151d9e](https://github.com/ocochard/freebsd-src/commit/a0d672151d9e) | ready |
 | 3 | a chain of packets loses its receiving interface | [447cba6c6808](https://github.com/ocochard/freebsd-src/commit/447cba6c6808) | ready |
 | 4 | a CBC record with more than 128 bytes of padding is refused | [1ae48c201579](https://github.com/ocochard/freebsd-src/commit/1ae48c201579) | ready |
+| 5 | TLS receive on a spliced socket is refused with EALREADY, not EINVAL | [a71bb0992737](https://github.com/ocochard/freebsd-src/commit/a71bb0992737) | ready |
 
 ---
 
@@ -170,3 +171,34 @@ byte 135 and all 136 padding bytes 135, refused with EBADMSG.
 **Found by:** the property of `ktls_ocf_tls_cbc_decrypt()` "any padding
 RFC 5246 allows goes on to the MAC" (`proof_cbc_decrypt`,
 `ktls/ktls_ocf.c`), on a record of 304 bytes.
+
+---
+
+## 5. ktls_enable_rx() refuses a spliced socket with EALREADY
+
+**Fix:** a71bb0992737 "ktls: Return EINVAL for TLS receive on a spliced socket"
+(`Fixes: 1000cc4a0d39`)
+
+**What happens:** 1000cc4a0d39 ("so_splice: Disallow splicing with
+KTLS-enabled sockets") made `ktls_enable_tx()` and `ktls_enable_rx()`
+refuse a socket whose buffer is spliced, with EINVAL, and EALREADY
+still for one that already has a session.  `ktls_enable_tx()` returns
+the error it set.  `ktls_enable_rx()` sets it, then returns EALREADY
+whatever it is, so setsockopt(2) TCP_RXTLS_ENABLE on the source of a
+splice fails with EALREADY ("Operation already in progress"), as if TLS
+receive were already on.
+
+**Reachability:** any process that splices a socket (SO_SPLICE) and then
+enables TLS receive on it.  The session is refused either way; only the
+error is wrong.
+
+**Fix detail:** return the error, as `ktls_enable_tx()` does.
+
+**Reproduce:** `tests/sys/kern/ktls_test.c` gains `ktls_spliced_socket_rx`.
+In a bhyve guest it fails on the base kernel ("Expected errno 22, got
+37") and passes with the fix.  The CBMC counterexample (`run.sh` mutant
+`ktls_enable_rx_ret`): a receive buffer spliced, no session, the error
+EINVAL set, EALREADY returned.
+
+**Found by:** the property of `ktls_enable_rx()` "refused on a spliced
+socket (1000cc4a0d39)" (`proof_enable_rx`, `ktls/ktls_enable.c`).
