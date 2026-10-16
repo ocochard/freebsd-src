@@ -1503,7 +1503,7 @@ kqueue_kevent(struct kqueue *kq, struct thread *td, int nchanges, int nevents,
 	struct kevent *kevp, *changes;
 	int i, n, nerrors, error;
 
-	if (nchanges < 0)
+	if (nchanges < 0 || nevents < 0)
 		return (EINVAL);
 
 	nerrors = 0;
