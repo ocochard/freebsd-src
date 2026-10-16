@@ -66,6 +66,8 @@ replace="counter_u64_add:cbmc_counter_u64_add
 	refcount_release_if_not_last:cbmc_refcount_release_if_not_last"
 replace_sendfile="vm_pager_has_page:cbmc_vm_pager_has_page
 	sf_buf_kva:cbmc_sf_buf_kva"
+replace_pager="vnode_pager_input_old:cbmc_vnode_pager_input
+	vnode_pager_input_smlfs:cbmc_vnode_pager_input"
 replace_ktls="ktls_buffer_alloc:cbmc_ktls_buffer_alloc
 	ktls_drop:cbmc_ktls_drop
 	ktls_destroy:cbmc_ktls_destroy"
@@ -183,7 +185,8 @@ mkdir -p "$work/inc"
 ) >/dev/null
 for f in $(sed -n 's/^#include "\(opt_[a-z0-9_]*\.h\)"/\1/p' \
     "$top/sys/kern/kern_sendfile.c" "$top/sys/kern/uipc_ktls.c" \
-    "$top/sys/kern/uipc_sockbuf.c" "$top/sys/opencrypto/ktls_ocf.c"); do
+    "$top/sys/kern/uipc_sockbuf.c" "$top/sys/opencrypto/ktls_ocf.c" \
+    "$top/sys/vm/vnode_pager.c"); do
 	: >"$work/inc/$f"
 done
 
@@ -652,6 +655,80 @@ fi
 # ktls_frame() and ktls_enqueue(): sys/kern/uipc_ktls.c against the TLS
 # record layer of the RFCs, on sessions ktls_create_session() makes.
 #
+if want sendfile; then
+	# vnode_pager_generic_getpages(), sys/vm/vnode_pager.c, as
+	# ffs_getpages_async() calls it for sendfile(2) on UFS: the pager the
+	# sendfile proofs model.  Blocks of 4K and 8K, a run of up to 3 pages.
+	h="$here/sendfile/pager.c"
+	s="$top/sys/vm/vnode_pager.c"
+	up="vm_object_prepare_buf_pages.0:3,vm_object_prepare_buf_pages.1:4"
+	up="$up,vm_object_prepare_buf_pages.2:3,cbmc_iodone.0:4"
+	up="$up,proof_getpages.0:5,proof_getpages.1:4,proof_getpages.2:4"
+	up="$up,proof_getpages.3:5,proof_getpages.4:4"
+	up="$up,vnode_pager_generic_getpages.4:4,vnode_pager_generic_getpages.5:4"
+	up="$up,vnode_pager_generic_getpages.10:4,vnode_pager_generic_getpages.13:8"
+	up="$up,vnode_pager_generic_getpages.18:8"
+	up="$up,vnode_pager_generic_getpages_done.1:3"
+	up="$up,vnode_pager_generic_getpages_done.2:3"
+	up="$up,vnode_pager_generic_getpages_done.6:8"
+	up="$up,vnode_pager_generic_getpages_done_async.0:8"
+	for b in 4096 8192; do
+		proof pager_ufs_$b "$h" "$s" proof_getpages \
+		    "-DUFS -DBSIZE=$b" "$up"
+	done
+	# Open questions, outside what sendfile and UFS give the pager.  A
+	# run ending on the file's last page valid up to its end completes
+	# on one page less, which stays busied; sendfile_swapin() never ends
+	# a run there.
+	question pager_lastvalid "$h" "$s" proof_getpages \
+	    "-DUFS -DBSIZE=4096 -DLASTVALID" "$up"
+	# A hole, or a file system without VOP_BMAP(), is read with no I/O
+	# and VM_PAGER_OK, and the asynchronous completion never runs:
+	# ffs_getpages_async() and vnode_pager_local_getpages_async() run it
+	# on an error only.  sendfile asks vm_pager_has_page() first, under
+	# the vnode lock, and UFS has VOP_BMAP().
+	question pager_nobmap "$h" "$s" proof_getpages "-DBSIZE=4096" "$up"
+	d="-DUFS -DBSIZE=8192"
+	# The completion runs once, on the run given ...
+	mutant pager_pages "$h" "$s" proof_getpages "$d" "$up" \
+	    '/^vnode_pager_generic_getpages_done_async(/,/^}/s/bp->b_pgiodone(bp->b_caller1, bp->b_pages + bp->b_pgbefore,/bp->b_pgiodone(bp->b_caller1, bp->b_pages,/'
+	mutant pager_count "$h" "$s" proof_getpages "$d" "$up" \
+	    '/^vnode_pager_generic_getpages_done_async(/,/^}/s/bp->b_npages - bp->b_pgbefore - bp->b_pgafter, error);/bp->b_npages - bp->b_pgbefore, error);/'
+	# ... the pager buffer freed ...
+	mutant pager_pbuf "$h" "$s" proof_getpages "$d" "$up" \
+	    '/^vnode_pager_generic_getpages_done_async(/,/^}/s/uma_zfree(vnode_pbuf_zone, bp);/;/'
+	mutant pager_bmapfree "$h" "$s" proof_getpages "$d" "$up" \
+	    '/} else if (error != 0) {/,/return (VM_PAGER_ERROR);/s/uma_zfree(vnode_pbuf_zone, bp);/;/'
+	# ... read-behind and read-ahead pages freed on an error, queued
+	# otherwise ...
+	mutant pager_behind "$h" "$s" proof_getpages "$d" "$up" \
+	    '/for (i = 0; i < bp->b_pgbefore; i++)/,/vm_page_free_invalid/s/vm_page_free_invalid(bp->b_pages\[i\]);/;/'
+	mutant pager_finish "$h" "$s" proof_getpages "$d" "$up" \
+	    '/^vnode_pager_generic_getpages_done(/,/^}/s/vm_page_readahead_finish(mt);/;/'
+	# ... the run valid up to the end of the file ...
+	mutant pager_valid "$h" "$s" proof_getpages "$d" "$up" \
+	    '/^vnode_pager_generic_getpages_done(/,/^}/s/^			vm_page_valid(mt);/			;/'
+	mutant pager_eof "$h" "$s" proof_getpages "$d" "$up" \
+	    '/^vnode_pager_generic_getpages_done(/,/^}/s/vm_page_set_valid_range(mt, 0,/if (0) vm_page_set_valid_range(mt, 0,/'
+	# ... what was read around the run reported; the read asynchronous,
+	# the file's bytes in whole sectors, from where the block map puts
+	# them (the INVARIANTS offset checks catch offset and behindoff).
+	mutant pager_report "$h" "$s" proof_getpages "$d" "$up" \
+	    '/^vnode_pager_generic_getpages(/,/^}/s/\*a_rahead = bp->b_pgafter;/*a_rahead = rahead + 1;/'
+	mutant pager_async "$h" "$s" proof_getpages "$d" "$up" \
+	    '/^vnode_pager_generic_getpages(/,/^}/s/bp->b_flags |= B_ASYNC;/;/'
+	mutant pager_sector "$h" "$s" proof_getpages "$d" "$up" \
+	    '/^vnode_pager_generic_getpages(/,/^}/s/bytecount = (bytecount + secmask) \& ~secmask;/;/'
+	mutant pager_eofcut "$h" "$s" proof_getpages "$d" "$up" \
+	    '/^vnode_pager_generic_getpages(/,/^}/s/bytecount = object->un_pager.vnp.vnp_size - foff;/;/'
+	mutant pager_offset "$h" "$s" proof_getpages "$d" "$up" \
+	    '/^vnode_pager_generic_getpages(/,/^}/s/bp->b_blkno += (foff % bsize) \/ DEV_BSIZE;/;/'
+	mutant pager_behindoff "$h" "$s" proof_getpages "$d" "$up" \
+	    '/^vnode_pager_generic_getpages(/,/^}/s/bp->b_blkno -= IDX_TO_OFF(rbehind) \/ DEV_BSIZE;/;/'
+	mutant pager_trim "$h" "$s" proof_getpages "$d" "$up" \
+	    '/^vnode_pager_generic_getpages(/,/^}/s/rahead = min(rahead, after);/;/'
+fi
+
 h="$here/ktls/ktls.c"
 s="$top/sys/kern/uipc_ktls.c"
 # Chains of up to three records (MAXREC), so walks of four iterations;
