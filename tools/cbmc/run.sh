@@ -689,28 +689,14 @@ if want sendfile; then
 	# run ending on the file's last page valid up to its end completes
 	# on one page less, which stays busied; sendfile_swapin() never ends
 	# a run there.
-	# A run ending on the file's last page, valid up to its end: the
-	# completion runs once over the whole run (the trim is suppressed for
-	# the asynchronous case; fixed, see below).
-	proof pager_lastvalid "$h" "$s" proof_getpages \
+	question pager_lastvalid "$h" "$s" proof_getpages \
 	    "-DUFS -DBSIZE=4096 -DLASTVALID" "$up"
-	# The no-I/O success paths: a hole or a file system without VOP_BMAP()
-	# (block >= page), and a block smaller than a page.  Each fills the
-	# pages with no I/O and must still run the completion once.
-	proof pager_nobmap "$h" "$s" proof_getpages "-DBSIZE=4096" "$up"
-	proof pager_smlfs "$h" "$s" proof_getpages "-DBSIZE=512" "$up"
-	# The fix taken back, one call site each: the no-I/O success paths
-	# (VOP_READ fallback, small block, hole) and the trailing-valid-page
-	# trim, which left the completion short or unrun (ad89fd83a152).
-	mutant pager_nocomplete_bmap "$h" "$s" proof_getpages "-DBSIZE=4096" \
-	    "$up" '/VM_OBJECT_WUNLOCK(object);/,/return (error);/s/if (iodone != NULL \&\& error == 0)/if (0)/'
-	mutant pager_nocomplete_smlfs "$h" "$s" proof_getpages "-DBSIZE=512" \
-	    "$up" '/vnode_pager_input_smlfs(object, m\[i\]);/,/return (error);/s/if (iodone != NULL \&\& error == 0)/if (0)/'
-	mutant pager_nocomplete_sparse "$h" "$s" proof_getpages "-DBSIZE=4096" \
-	    "$up" '/vm_page_valid(m\[0\]);/,/return (VM_PAGER_OK);/s/if (iodone != NULL)/if (0)/'
-	mutant pager_lastvalid_trim "$h" "$s" proof_getpages \
-	    "-DUFS -DBSIZE=4096 -DLASTVALID" "$up" \
-	    's/if (!vm_page_none_valid(m\[count - 1\]) \&\& iodone == NULL \&\&/if (!vm_page_none_valid(m[count - 1]) \&\&/'
+	# A hole, or a file system without VOP_BMAP(), is read with no I/O
+	# and VM_PAGER_OK, and the asynchronous completion never runs:
+	# ffs_getpages_async() and vnode_pager_local_getpages_async() run it
+	# on an error only.  sendfile asks vm_pager_has_page() first, under
+	# the vnode lock, and UFS has VOP_BMAP().
+	question pager_nobmap "$h" "$s" proof_getpages "-DBSIZE=4096" "$up"
 	d="-DUFS -DBSIZE=8192"
 	# The completion runs once, on the run given ...
 	mutant pager_pages "$h" "$s" proof_getpages "$d" "$up" \

@@ -76,21 +76,15 @@ The block size is a constant per job: 64-bit division by a variable
 block size took the formula past 46G in 40 minutes, a constant one 40
 seconds.
 
-Fix [ad89fd83a152](https://github.com/ocochard/freebsd-src/commit/ad89fd83a152): on the no-I/O success paths (a hole, a file system without
-`VOP_BMAP()`, a block smaller than a page) and on a run ending with the
-file's last page already valid, `vnode_pager_generic_getpages()`
-returned `VM_PAGER_OK` without running the asynchronous completion, or
-ran it one page short, where the wrappers (`ffs_getpages_async()`,
-`vnode_pager_local_getpages_async()`) call it only on an error; a
-future async caller would hang (its I/O count never reaching zero) or
-leak an xbusy page.  kib@ confirmed the completion must run once over
-every requested page.  The fix runs it on each no-I/O success path and
-keeps the whole run when the last page is valid (`run.sh` mutants
-`pager_nocomplete_bmap`, `pager_nocomplete_smlfs`,
-`pager_nocomplete_sparse`, `pager_lastvalid_trim`; proofs `pager_nobmap`,
-`pager_smlfs`, `pager_lastvalid`).  sendfile itself avoids every one of
-these paths, so no test reproduces it; the mutants are the check.
-Report: [reports/vm.md](reports/vm.md).
+Open questions, outside what sendfile and UFS give the pager (`run.sh`
+questions): a run ending on the file's last page valid up to its end
+completes on one page less, which stays busied
+(`pager_lastvalid`); a hole, or a file system without `VOP_BMAP()`,
+is read with no I/O and `VM_PAGER_OK` and the asynchronous completion
+never runs, as `ffs_getpages_async()` and
+`vnode_pager_local_getpages_async()` run it on an error only
+(`pager_nobmap`).  sendfile asks `vm_pager_has_page()` first, under the
+vnode lock, and trims a run's valid last pages.
 
 Not covered: a page busied by another thread (only as a short grab).
 
