@@ -9,7 +9,7 @@ them against the kernel's own source for every input within the bounds.
     tools/cbmc/run.sh                # every proof, about three hours
     SLOW=1 tools/cbmc/run.sh         # and the longest or largest
     ONLY=nocache tools/cbmc/run.sh   # the jobs whose name matches
-    tools/cbmc/run.sh ktls           # one harness: sendfile, ktls, accept, kevent, close, unp
+    tools/cbmc/run.sh ktls           # one harness: sendfile, ktls, accept, kevent, close, unp, tcp
 
 ## sendfile(2): fixes
 
@@ -384,6 +384,32 @@ several mbufs, SCM_CREDS content, and a descriptor array of more than
 two (NFDS=3 internalize proves but at ~40G, through the real
 `sbcreatecontrol()` and `filecaps_copy()`).  goto-cc cannot evaluate the
 `_Static_assert()`s on constant arrays: they are compiled out.
+
+## tcp_dooptions(): what is proven
+
+Harness `tcp/tcp.c`, for `tcp_dooptions()`, `sys/netinet/tcp_input.c`,
+against RFC 9293 3.1 (option format), RFC 7323 (window scale,
+timestamps) and RFC 2018 (SACK): the parser of a TCP segment's options,
+driven straight off the wire by any remote peer.  The callers pass
+`cnt = (th_off << 2) - sizeof(struct tcphdr)`, so 0 to 40 bytes, and
+`cp` at that many peer-controlled bytes.  On option buffers of 2, 4, 10
+and 18 bytes (the 18-byte SIGNATURE and a two-block SACK included; cnt=20
+proves too), SYN or not, every byte free: no read outside the buffer;
+each option accepted only at its exact length and only where RFC allows
+(MSS and window scale and SACK-permitted and TFO on a SYN, SACK off a
+SYN); each parsed value the option's bytes (MSS in network order, window
+scale `min(byte, 14)`, the SACK block count `(optlen - 2) / 8`, the TFO
+cookie length `optlen - 2`); and every saved pointer (SACK blocks, the
+MD5 signature, the TFO cookie) within the buffer with the length its
+flag claims.  No bug found.
+
+The option count is a constant per job: a symbolic 0..40 option stream
+ran past 40 minutes, a fixed length seconds to a couple of minutes.  Not
+covered: the one-byte over-read a dropped `cnt < 2` guard would cause is
+not modelled (the harness array is a fixed size, so a read at `cp[cnt]`
+stays in bounds, where the kernel buffer is the segment's); the
+`nsacks` count mutant is equivalent (a valid SACK optlen is `2 + 8k`, so
+`(optlen - 2) / 8` and `optlen / 8` are both `k`).
 
 ## How it works
 
