@@ -365,3 +365,16 @@ unp_int_passable 10 426
 unp_internalize_0 3 137
 unp_internalize_1 8 341
 unp_internalize_2 12 492
+tcp_dooptions_10 12 450
+tcp_dooptions_18 117 624
+tcp_dooptions_2 7 444
+tcp_dooptions_4 7 447
+tcp_eol 102 609
+tcp_msslen 141 795
+tcp_optmax 144 616
+tcp_optmin 59 485
+tcp_sackle2 157 779
+tcp_sackmod 205 802
+tcp_siglen 155 642
+tcp_tfolen 54 478
+tcp_wscale 151 770

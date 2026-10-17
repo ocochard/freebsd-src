@@ -114,6 +114,7 @@ cbmc_ktls_sb="--no-signed-overflow-check"
 restrict_ktls_ocf="m_apply.function_pointer_call.1/check_padding"
 cbmc_ktls_ocf="--no-signed-overflow-check"
 cbmc_ktls_enable="--no-signed-overflow-check"
+cbmc_tcp="--no-signed-overflow-check"
 cbmc_ktls_sbc="--no-signed-overflow-check --object-bits 10"
 # ktls_decrypt() walking off its chain goes on with what it reads there,
 # and fails further on: stop at the first property a trace violates.
@@ -195,7 +196,7 @@ for f in $(sed -n 's/^#include "\(opt_[a-z0-9_]*\.h\)"/\1/p' \
     "$top/sys/kern/uipc_sockbuf.c" "$top/sys/opencrypto/ktls_ocf.c" \
     "$top/sys/vm/vnode_pager.c" "$top/sys/kern/uipc_syscalls.c" \
     "$top/sys/kern/kern_event.c" "$top/sys/kern/kern_descrip.c" \
-    "$top/sys/kern/uipc_usrreq.c"); do
+    "$top/sys/kern/uipc_usrreq.c" "$top/sys/netinet/tcp_input.c"); do
 	: >"$work/inc/$f"
 done
 
@@ -1014,6 +1015,52 @@ urn32="$urn32,tls13_find_record_type.0:33,cbmc_memmove.0:33"
 urn20="$urn,proof_rx_decrypt.0:21,proof_rx_decrypt.2:21"
 urn20="$urn20,tls13_find_record_type.0:21,cbmc_memmove.0:21"
 uw2=$(echo "$uw" | sed -E 's/(ktls_encrypt\.4|widx\.0|cbmc_pr_ready\.0|check_batch\.[01]):2/\1:3/g; s/mb_free_notready\.0:7/mb_free_notready.0:12/; s/batch\.0:3/batch.0:4/; s/check_batch\.2:6/check_batch.2:11/')
+
+if want tcp; then
+	# tcp_dooptions(), sys/netinet/tcp_input.c, against RFC 9293 3.1,
+	# RFC 7323 and RFC 2018: the parser of a segment's options, driven
+	# off the wire by any peer.  cnt (the option bytes) is a constant per
+	# job, as a symbolic 0..40 stream ran past 40 minutes; 2, 4, 10 and
+	# 18 bytes exercise every option, the 18-byte SIGNATURE and a
+	# two-block SACK included (cnt=20 proves too, at ~5 minutes).
+	# TCP_RFC7413 enables the TFO path.
+	h="$here/tcp/tcp.c"
+	s="$top/sys/netinet/tcp_input.c"
+	dt="-DINET -DINET6 -DTCP_RFC7413"
+	ut="tcp_dooptions.0:4,tcp_dooptions.1:21,proof_dooptions.0:41"
+	ut="$ut,cbmc_memmove.0:11"
+	for c in 2 4 10 18; do
+		proof tcp_dooptions_$c "$h" "$s" proof_dooptions \
+		    "$dt -DCNT=$c" "$ut"
+	done
+	# EOL ends the options; the option-length bounds hold ...
+	mutant tcp_eol "$h" "$s" proof_dooptions "$dt -DCNT=18" "$ut" \
+	    '/^tcp_dooptions(/,/^}/s/if (opt == TCPOPT_EOL)/if (0 \&\& opt == TCPOPT_EOL)/'
+	mutant tcp_optmin "$h" "$s" proof_dooptions "$dt -DCNT=10" "$ut" \
+	    '/^tcp_dooptions(/,/^}/s/if (optlen < 2 || optlen > cnt)/if (optlen > cnt)/'
+	mutant tcp_optmax "$h" "$s" proof_dooptions "$dt -DCNT=18" "$ut" \
+	    '/^tcp_dooptions(/,/^}/s/if (optlen < 2 || optlen > cnt)/if (optlen < 2)/'
+	# ... each option accepted only at its exact length, and its value is
+	# the option bytes (MSS network order, window scale min 14, SACK count,
+	# TFO cookie length) ...
+	mutant tcp_msslen "$h" "$s" proof_dooptions "$dt -DCNT=18" "$ut" \
+	    '/^tcp_dooptions(/,/^}/s/if (optlen != TCPOLEN_MAXSEG)/if (0)/'
+	mutant tcp_wscale "$h" "$s" proof_dooptions "$dt -DCNT=18" "$ut" \
+	    '/^tcp_dooptions(/,/^}/s/to->to_wscale = min(cp\[2\], TCP_MAX_WINSHIFT);/to->to_wscale = cp[2];/'
+	mutant tcp_siglen "$h" "$s" proof_dooptions "$dt -DCNT=18" "$ut" \
+	    '/^tcp_dooptions(/,/^}/s/if (optlen != TCPOLEN_SIGNATURE)/if (0)/'
+	mutant tcp_sackmod "$h" "$s" proof_dooptions "$dt -DCNT=18" "$ut" \
+	    '/^tcp_dooptions(/,/^}/s/if (optlen <= 2 || (optlen - 2) % TCPOLEN_SACK != 0)/if (optlen <= 2)/'
+	mutant tcp_sackle2 "$h" "$s" proof_dooptions "$dt -DCNT=18" "$ut" \
+	    '/^tcp_dooptions(/,/^}/s/if (optlen <= 2 || (optlen - 2) % TCPOLEN_SACK != 0)/if ((optlen - 2) % TCPOLEN_SACK != 0)/'
+	mutant tcp_tfolen "$h" "$s" proof_dooptions "$dt -DCNT=18" "$ut" \
+	    '/^tcp_dooptions(/,/^}/s/to->to_tfo_len = optlen - 2;/to->to_tfo_len = optlen;/'
+	# nsacks ((optlen-2)/8 vs optlen/8) is an equivalent mutant: a valid
+	# SACK option has optlen = 2 + 8k, so both are k.  cnt2 (dropping the
+	# "cnt < 2" guard, a one-byte over-read at the buffer's end) the
+	# harness cannot catch: its option array is a fixed OPTMAX, so a read
+	# at cp[cnt] stays in bounds; the kernel buffer is the segment's.
+fi
 
 if want ktls; then
 	proof ktls_frame "$h" "$s" proof_frame "$dk" "$uk"
