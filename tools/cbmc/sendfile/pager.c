@@ -413,15 +413,8 @@ proof_getpages(void)
 
 	ndone = g_ndone;
 	if (error != VM_PAGER_OK) {
-		/*
-		 * On any error the generic routine runs no completion: the
-		 * wrapper (ffs_getpages_async, vnode_pager_local_getpages_
-		 * async) calls iodone on its error return, so a completion
-		 * here would be a second call.  This holds for the BMAP hard
-		 * error, the doomed vnode, and the no-I/O paths that fail.
-		 */
 		__CPROVER_assert(g_io == NULL && ndone == 0,
-		    "an error, and no completion here: the wrapper runs it");
+		    "an error, and no completion: the wrapper runs it");
 		__CPROVER_assert(g_bp == NULL || g_bpfree,
 		    "the pager buffer freed");
 		return;
