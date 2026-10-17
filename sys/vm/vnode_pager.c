@@ -921,9 +921,11 @@ vnode_pager_generic_getpages(struct vnode *vp, vm_page_t *m, int count,
 	 * exist at the end of file, and the page is made fully valid
 	 * by zeroing in vm_pager_get_pages().
 	 */
-	if (!vm_page_none_valid(m[count - 1]) && iodone == NULL &&
-	    --count == 0)
+	if (!vm_page_none_valid(m[count - 1]) && --count == 0) {
+		if (iodone != NULL)
+			iodone(arg, m, 1, 0);
 		return (VM_PAGER_OK);
+	}
 
 	bp = uma_zalloc(vnode_pbuf_zone, M_WAITOK);
 	MPASS((bp->b_flags & B_MAXPHYS) != 0);
@@ -945,8 +947,6 @@ vnode_pager_generic_getpages(struct vnode *vp, vm_page_t *m, int count,
 				break;
 		}
 		VM_OBJECT_WUNLOCK(object);
-		if (iodone != NULL && error == 0)
-			iodone(arg, m, count, 0);
 		return (error);
 	} else if (error != 0) {
 		uma_zfree(vnode_pbuf_zone, bp);
@@ -966,8 +966,6 @@ vnode_pager_generic_getpages(struct vnode *vp, vm_page_t *m, int count,
 			if (error)
 				break;
 		}
-		if (iodone != NULL && error == 0)
-			iodone(arg, m, count, 0);
 		return (error);
 	}
 
@@ -984,8 +982,6 @@ vnode_pager_generic_getpages(struct vnode *vp, vm_page_t *m, int count,
 		KASSERT(m[0]->dirty == 0, ("%s: page %p is dirty",
 		    __func__, m[0]));
 		vm_page_valid(m[0]);
-		if (iodone != NULL)
-			iodone(arg, m, count, 0);
 		return (VM_PAGER_OK);
 	}
 
