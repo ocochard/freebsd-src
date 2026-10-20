@@ -113,6 +113,8 @@ restrict_ktls_rx=$restrict_ktls
 cbmc_ktls_sb="--no-signed-overflow-check"
 restrict_ktls_ocf="m_apply.function_pointer_call.1/check_padding"
 cbmc_ktls_ocf="--no-signed-overflow-check"
+restrict_ktls_send="sosend_generic_locked.function_pointer_call.1/cbmc_pr_send"
+cbmc_ktls_send="--no-signed-overflow-check"
 cbmc_ktls_enable="--no-signed-overflow-check"
 cbmc_tcp="--no-signed-overflow-check"
 replace_sack="tcp_record_dsack:cbmc_tcp_record_dsack"
@@ -196,6 +198,7 @@ mkdir -p "$work/inc"
 for f in $(sed -n 's/^#include "\(opt_[a-z0-9_]*\.h\)"/\1/p' \
     "$top/sys/kern/kern_sendfile.c" "$top/sys/kern/uipc_ktls.c" \
     "$top/sys/kern/uipc_sockbuf.c" "$top/sys/opencrypto/ktls_ocf.c" \
+    "$top/sys/kern/uipc_socket.c" "$top/sys/kern/uipc_mbuf.c" \
     "$top/sys/vm/vnode_pager.c" "$top/sys/kern/uipc_syscalls.c" \
     "$top/sys/kern/kern_event.c" "$top/sys/kern/kern_descrip.c" \
     "$top/sys/kern/uipc_usrreq.c" "$top/sys/netinet/tcp_input.c"); do
@@ -1438,6 +1441,85 @@ if want ktls; then
 	mutant ktls_ocf_recrypt_short13 "$ho" "$so" proof_recrypt \
 	    "$dk -DVMINOR=TLS_MINOR_VER_THREE -DRLEN=16" "$ur" \
 	    's/if (tls_len < AES_GMAC_HASH_LEN + 1)/if (tls_len < AES_GMAC_HASH_LEN)/'
+
+	# write(2) on a socket with a TLS send session, the TLS branch of
+	# sosend_generic_locked(), uipc_socket.c: sends of up to 3 bytes, with
+	# or without a control message, software or NIC sessions.
+	hn="$here/ktls/ktls_send.c"
+	sn="$top/sys/kern/uipc_socket.c"
+	un="sosend_generic_locked.0:3,sosend_generic_locked.1:6"
+	un="$un,sosend_generic_locked.2:6,proof_send.0:6,proof_send.1:6"
+	un="$un,chain.0:6"
+	proof ktls_send "$hn" "$sn" proof_send "$dk" "$un"
+	# The fix taken back: a control message of only its header has its
+	# type byte read past its end.  (Setting the record type back to
+	# application data after the first chain is no mutant: a send with
+	# a type is atomic, one chain.)
+	mutant ktls_send_cmsglen "$hn" "$sn" proof_send "$dk" "$un" \
+	    's/if (clen >= CMSG_LEN(sizeof(tls_rtype)) \&\&/if (clen >= sizeof(*cm) \&\&/'
+	# The control message freed once, not passed on ...
+	mutant ktls_send_ctlfree "$hn" "$sn" proof_send "$dk" "$un" \
+	    '/tls_rtype = \*((uint8_t \*)CMSG_DATA(cm));/,/atomic = 1;/s/m_freem(control);/;/'
+	mutant ktls_send_ctlnull "$hn" "$sn" proof_send "$dk" "$un" \
+	    '/tls_rtype = \*((uint8_t \*)CMSG_DATA(cm));/,/atomic = 1;/s/control = NULL;/;/'
+	# ... an empty write refused unless TLS 1.0 CBC ...
+	mutant ktls_send_empty "$hn" "$sn" proof_send "$dk" "$un" \
+	    's/if (resid == 0 \&\& !ktls_permit_empty_frames(tls)) {/if (0) {/'
+	# ... every chain framed, sent not ready for software sessions, then
+	# queued to the worker with a socket reference, or freed on an error
+	# TCP leaves to the caller; the session held throughout.
+	mutant ktls_send_frame "$hn" "$sn" proof_send "$dk" "$un" \
+	    '/top = m_uiotombuf(uio, M_WAITOK, space,$/,/tls_rtype = TLS_RLTYPE_APP;/s/if (top != NULL) {/if (0) {/'
+	mutant ktls_send_notready "$hn" "$sn" proof_send "$dk" "$un" \
+	    's/tls_send_flag = PRUS_NOTREADY;/tls_send_flag = 0;/'
+	mutant ktls_send_errfree "$hn" "$sn" proof_send "$dk" "$un" \
+	    '/if (tls != NULL \&\& tls->mode == TCP_TLS_MODE_SW) {/,/^#endif/s/m_freem(top);/;/'
+	mutant ktls_send_soref "$hn" "$sn" proof_send "$dk" "$un" \
+	    '/if (tls != NULL \&\& tls->mode == TCP_TLS_MODE_SW) {/,/^#endif/s/soref(so);/;/'
+	mutant ktls_send_enqueue "$hn" "$sn" proof_send "$dk" "$un" \
+	    '/if (tls != NULL \&\& tls->mode == TCP_TLS_MODE_SW) {/,/^#endif/s/ktls_enqueue(top, so, tls_enq_cnt);/;/'
+	mutant ktls_send_swonly "$hn" "$sn" proof_send "$dk" "$un" \
+	    's/if (tls != NULL \&\& tls->mode == TCP_TLS_MODE_SW) {/if (tls != NULL) {/'
+	mutant ktls_send_hold "$hn" "$sn" proof_send "$dk" "$un" \
+	    '/^out:/,/^}/s/ktls_free(tls);/;/'
+
+	# m_uiotombuf() with M_EXTPG, uipc_mbuf.c, which cuts the user's data
+	# into records for the above and sendfile(2): up to two records, any
+	# record length up to 16K.
+	hu="$here/ktls/ktls_uio.c"
+	su="$top/sys/kern/uipc_mbuf.c"
+	uu="m_uiotombuf_nomap.2:3,m_uiotombuf_nomap.3:6"
+	uu="$uu,m_uiotombuf_nomap.14:3,mb_free_mext_pgs.1:6,uiomove_fromphys.0:6"
+	uu="$uu,proof_nomap.0:16,proof_nomap.1:4,proof_nomap.2:16,m_freem.0:4"
+	proof ktls_uio "$hu" "$su" proof_nomap "$dk" "$uu"
+	f='/^m_uiotombuf_nomap(/,/^}/'
+	# The bytes asked for, all of them when len is 0, one empty mbuf for
+	# none ...
+	mutant ktls_uio_len "$hu" "$su" proof_nomap "$dk" "$uu" \
+	    "${f}s/total = MIN(uio->uio_resid, len);/total = uio->uio_resid;/"
+	mutant ktls_uio_empty "$hu" "$su" proof_nomap "$dk" "$uu" \
+	    "${f}s/if (__predict_false(total == 0)) {/if (0) {/"
+	# ... in records of maxseg bytes, the last shorter, linked ...
+	mutant ktls_uio_seg "$hu" "$su" proof_nomap "$dk" "$uu" \
+	    "${f}s/needed = length = MIN(maxseg, total);/needed = length = total;/"
+	mutant ktls_uio_maxseg "$hu" "$su" proof_nomap "$dk" "$uu" \
+	    "${f}s/maxseg = MBUF_PEXT_MAX_PGS \\* PAGE_SIZE;/maxseg = PAGE_SIZE;/"
+	mutant ktls_uio_mlen "$hu" "$su" proof_nomap "$dk" "$uu" \
+	    "${f}s/mb->m_len = length;/mb->m_len = needed;/"
+	mutant ktls_uio_link "$hu" "$su" proof_nomap "$dk" "$uu" \
+	    "${f}s/prev->m_next = mb;/;/"
+	# ... each of anonymous pages holding its bytes ...
+	mutant ktls_uio_anon "$hu" "$su" proof_nomap "$dk" "$uu" \
+	    '/Allocate the pages/,/return (m);/s/mb->m_epg_flags = EPG_FLAG_ANON;/;/'
+	mutant ktls_uio_lastlen "$hu" "$su" proof_nomap "$dk" "$uu" \
+	    "${f}s/mb->m_epg_last_len = length - PAGE_SIZE \\* (mb->m_epg_npgs - 1);/mb->m_epg_last_len = PAGE_SIZE;/"
+	mutant ktls_uio_extsize "$hu" "$su" proof_nomap "$dk" "$uu" \
+	    "${f}s/mb->m_ext.ext_size += PAGE_SIZE \\* mb->m_epg_npgs;/;/"
+	# ... and on a fault, NULL and every page freed.
+	mutant ktls_uio_fault "$hu" "$su" proof_nomap "$dk" "$uu" \
+	    "${f}s/if (error != 0)\$/if (0)/"
+	mutant ktls_uio_failfree "$hu" "$su" proof_nomap "$dk" "$uu" \
+	    "${f}s/^	m_freem(m);/	;/"
 
 	# setsockopt(2) TCP_TXTLS_ENABLE and TCP_RXTLS_ENABLE, uipc_ktls.c:
 	# the option and keys copied in, then the session given the socket.
