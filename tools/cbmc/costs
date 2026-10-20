@@ -321,7 +321,6 @@ kevent_negevents_late 21 791
 kevent_nerrors 24 789
 kevent_noroom 14 681
 kevent_outadvance 40 587
-kevent_outfault 20 803
 kevent_receipt 24 792
 kevent_release 21 791
 kevent_retval 25 788
@@ -383,3 +382,5 @@ sack_doack_0 0 100
 sack_doack_2 128 11092
 sack_holebytes 902 17298
 sack_movestart 902 17287
+kevent_outfault 19 809
+kevent_outfault_drop 19 802

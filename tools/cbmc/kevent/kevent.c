@@ -276,7 +276,14 @@ proof_kevent(void)
 	if (nchanges < 0)
 		return;
 
-	/* The manual's account of the change list, replayed. */
+	/*
+	 * The manual's account of the change list, replayed.  When a copyout
+	 * of an EV_ERROR event faults, the fixed kevent() returns EFAULT at
+	 * that point (asserted above); the event-by-event accounting below
+	 * models the fault-free path, so skip it then.
+	 */
+	if (g_outfault)
+		return;
 	out = 0;
 	k = 0;
 	stopped = false;
