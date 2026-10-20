@@ -12,6 +12,7 @@ again before filing.
 | 3 | a chain of packets loses its receiving interface | [447cba6c6808](https://github.com/ocochard/freebsd-src/commit/447cba6c6808) | ready |
 | 4 | a CBC record with more than 128 bytes of padding is refused | [1ae48c201579](https://github.com/ocochard/freebsd-src/commit/1ae48c201579) | ready |
 | 5 | TLS receive on a spliced socket is refused with EALREADY, not EINVAL | [a71bb0992737](https://github.com/ocochard/freebsd-src/commit/a71bb0992737) | ready |
+| 6 | a record type message without its byte sends a byte of stale kernel memory | [dfa7f43dbdf6](https://github.com/ocochard/freebsd-src/commit/dfa7f43dbdf6) | ready |
 
 ---
 
@@ -202,3 +203,49 @@ EINVAL set, EALREADY returned.
 
 **Found by:** the property of `ktls_enable_rx()` "refused on a spliced
 socket (1000cc4a0d39)" (`proof_enable_rx`, `ktls/ktls_enable.c`).
+
+---
+
+## 6. sosend_generic() reads a TLS record type past its control message
+
+
+**Fix:** dfa7f43dbdf6 "ktls: Check the record type message holds its byte"
+(`Fixes: b2e60773c6b0`)
+
+**What happens:** on a socket with a TLS send session,
+`sosend_generic_locked()` takes a control message of type
+`TLS_SET_RECORD_TYPE` as the type of the records it sends, its payload
+"a single byte holding the desired TLS record type" (ktls(4)).  It
+checks only that the message holds a `struct cmsghdr`, `clen >=
+sizeof(*cm)`, 12 bytes on amd64, then reads `*CMSG_DATA(cm)`, at offset
+16.  A control message of 12 to 16 bytes has no byte there: the read
+is past the data `sockargs()` copied in, inside the mbuf it was copied
+into, which `m_get2()` does not clear.  The byte read is what that
+mbuf held before, and `ktls_frame()` writes it into the records' header
+(TLS 1.2 and earlier) or inner content type (TLS 1.3).  `sendit()`
+accepts any `msg_controllen` of at least `sizeof(struct cmsghdr)`, and
+no one checks `cmsg_len`.
+
+**Reachability:** any process with a KTLS send socket, a single
+sendmsg(2) with `msg_controllen` of 12 to 16: one byte of a freed mbuf
+per call sent to the peer.  A process connected to itself over loopback
+reads it back.  All modes (software, NIC, TOE).
+
+**Fix detail:** require `clen >= CMSG_LEN(sizeof(tls_rtype))`.  A
+shorter message is no longer taken as a record type and goes to TCP,
+which refuses control data with EINVAL.  The message's level is not
+checked either, so any cmsg of type 1 (e.g. SCM_RIGHTS) is taken as a
+record type; ktls(4) names no level, so the fix leaves that alone.
+
+**Reproduce:** `tests/sys/kern/ktls_test.c` gains
+`ktls_transmit_short_record_type`, a sendmsg(2) with a 16-byte control
+message.  In a bhyve guest it fails on the base kernel (the send
+succeeds) and passes with the fix (EINVAL); the
+`ktls_transmit_*_control` cases pass on both.  The CBMC counterexample
+(`run.sh` mutant `ktls_send_cmsglen`): a 16-byte control message of type
+`TLS_SET_RECORD_TYPE`, read at offset 16, outside the object; the
+record went out with type 199.
+
+**Found by:** memory safety of `sosend_generic_locked()`
+(`proof_send`, `ktls/ktls_send.c`), on control messages of exactly the
+bytes the user gave.

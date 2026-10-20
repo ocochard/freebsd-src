@@ -207,6 +207,23 @@ with RFC 5288 (AES-GCM) and RFC 7905 (ChaCha20-Poly1305).  No bug found.
   part (AES-GCM, TLS 1.2 and 1.3): the ciphertext goes back into the
   decrypted mbufs, over the content only, every other byte left.
   Timing is not a property CBMC checks.
+- write(2) on a socket with a TLS send session (harness
+  `ktls/ktls_send.c`, for the TLS branch of `sosend_generic_locked()`,
+  `sys/kern/uipc_socket.c`), on sends of up to 3 bytes into a send
+  buffer of up to 4, with or without a control message of exactly the
+  bytes given, software or NIC sessions: a `TLS_SET_RECORD_TYPE`
+  message's byte is the type of that send's records, read from within
+  the message (ktls(4)), the message freed once and not passed to TCP;
+  an empty write is refused unless TLS 1.0 CBC; every chain cut from the
+  user's data is framed, sent not ready for software sessions, then
+  queued to the worker with a socket reference, or freed on an error
+  TCP leaves to the caller; the session is held for the call.
+  `m_uiotombuf()` with `M_EXTPG` (harness `ktls/ktls_uio.c`, for
+  `sys/kern/uipc_mbuf.c`), which cuts the data for it and sendfile(2):
+  the bytes asked for, all of them for a length of 0, one empty mbuf for
+  none, in records of the frame length, each but the last full, of new
+  anonymous pages holding their bytes; on a fault, NULL and every page
+  freed.  Up to two records, any frame length up to 16K.
 - setsockopt(2) TCP_TXTLS_ENABLE and TCP_RXTLS_ENABLE (harness
   `ktls/ktls_enable.c`, for `sys/kern/uipc_ktls.c`):
   `ktls_copyin_tls_enable()` on an option of any size, the old one
@@ -257,6 +274,12 @@ Fix [1ae48c201579](https://github.com/ocochard/freebsd-src/commit/1ae48c201579):
 with a padding length byte of 128 or more was refused, against RFC
 5246, which allows up to 255 (`run.sh` mutant `ktls_ocf_cbc_sign` takes
 the fix back; ATF cases `ktls_receive_*_padding_128_extra`).
+
+Fix [dfa7f43dbdf6](https://github.com/ocochard/freebsd-src/commit/dfa7f43dbdf6): a `TLS_SET_RECORD_TYPE` control message was checked to
+hold a `struct cmsghdr` only, not the byte after it: one of 12 to 16
+bytes had its record type read past its end, from what the mbuf held
+before, and sent to the peer (`run.sh` mutant `ktls_send_cmsglen` takes
+the fix back; ATF case `ktls_transmit_short_record_type`).
 
 Fix [a71bb0992737](https://github.com/ocochard/freebsd-src/commit/a71bb0992737):
 `ktls_enable_rx()` refused a spliced socket with EALREADY, not the
