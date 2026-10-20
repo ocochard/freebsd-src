@@ -27,6 +27,8 @@
 
 #include <sys/event.h>
 
+#include <sys/mman.h>
+
 #include <atf-c.h>
 #include <errno.h>
 #include <string.h>
@@ -73,10 +75,45 @@ ATF_TC_BODY(negative_nchanges, tc)
 	ATF_REQUIRE(close(kq) == 0);
 }
 
+/*
+ * When writing an EV_ERROR event to the eventlist faults, kevent() must
+ * fail with EFAULT, not silently drop the write and report success.
+ */
+ATF_TC_WITHOUT_HEAD(eventlist_fault);
+ATF_TC_BODY(eventlist_fault, tc)
+{
+	struct kevent kev;
+	struct kevent *bad;
+	long pagesize;
+	int kq;
+
+	pagesize = sysconf(_SC_PAGESIZE);
+	ATF_REQUIRE(pagesize > 0);
+
+	/* An unmapped, non-writable page for the eventlist. */
+	bad = mmap(NULL, pagesize, PROT_NONE, MAP_ANON | MAP_PRIVATE, -1, 0);
+	ATF_REQUIRE(bad != MAP_FAILED);
+
+	kq = kqueue();
+	ATF_REQUIRE(kq >= 0);
+
+	/*
+	 * EV_RECEIPT forces an EV_ERROR event for the change; nevents == 1
+	 * gives the copyout room, so it is attempted and faults on the
+	 * unwritable page.
+	 */
+	EV_SET(&kev, kq, EVFILT_TIMER, EV_ADD | EV_RECEIPT, 0, 1, 0);
+	ATF_REQUIRE_ERRNO(EFAULT, kevent(kq, &kev, 1, bad, 1, NULL) == -1);
+
+	ATF_REQUIRE(munmap(bad, pagesize) == 0);
+	ATF_REQUIRE(close(kq) == 0);
+}
+
 ATF_TP_ADD_TCS(tp)
 {
 	ATF_TP_ADD_TC(tp, negative_nevents);
 	ATF_TP_ADD_TC(tp, negative_nchanges);
+	ATF_TP_ADD_TC(tp, eventlist_fault);
 
 	return (atf_no_error());
 }
