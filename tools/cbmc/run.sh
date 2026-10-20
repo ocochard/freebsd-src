@@ -115,6 +115,8 @@ restrict_ktls_ocf="m_apply.function_pointer_call.1/check_padding"
 cbmc_ktls_ocf="--no-signed-overflow-check"
 cbmc_ktls_enable="--no-signed-overflow-check"
 cbmc_tcp="--no-signed-overflow-check"
+replace_sack="tcp_record_dsack:cbmc_tcp_record_dsack"
+cbmc_sack="--no-signed-overflow-check"
 cbmc_ktls_sbc="--no-signed-overflow-check --object-bits 10"
 # ktls_decrypt() walking off its chain goes on with what it reads there,
 # and fails further on: stop at the first property a trace violates.
@@ -1060,6 +1062,36 @@ if want tcp; then
 	# "cnt < 2" guard, a one-byte over-read at the buffer's end) the
 	# harness cannot catch: its option array is a fixed OPTMAX, so a read
 	# at cp[cnt] stays in bounds; the kernel buffer is the segment's.
+	# tcp_sack_doack(), sys/netinet/tcp_sack.c, against RFC 2018: the peer
+	# SACK blocks parsed into the retransmission scoreboard.  The sequence
+	# space is concrete per job (GEO), as the symbolic scoreboard sweep
+	# ran out of memory (>50G); GEO 0 is a pure cumulative ack, GEO 2 a
+	# peer block trimming a hole's front, each with its delivered /
+	# hole_bytes / sacked_bytes accounting checked.  The other geometries
+	# (whole-hole removal, back trim, split, tail insert) make the sweep
+	# walk more holes than this host can hold and are left out; the SACK
+	# block-count overflow (CVE-2019-11477 class) is bounded separately by
+	# the tcp_dooptions proof (to_nsacks <= 4).
+	hk="$here/tcp/sack.c"
+	sk="$top/sys/netinet/tcp_sack.c"
+	us="build_scoreboard.0:2,build_scoreboard.1:2,build_scoreboard.2:2"
+	us="$us,build_scoreboard.3:2,tcp_sack_doack.0:3,tcp_sack_doack.1:3"
+	us="$us,tcp_sack_doack.2:3,tcp_sack_doack.3:3,tcp_sack_doack.4:4"
+	us="$us,tcp_sack_doack.5:4,tcp_sack_doack.6:4,tcp_sack_doack.7:4"
+	us="$us,tcp_sack_doack.8:4,tcp_sack_doack.9:4,tcp_sack_doack.10:4"
+	us="$us,tcp_sack_doack.11:4,cbmc_memmove.0:9"
+	proof sack_doack_0 "$hk" "$sk" proof_sack_doack "-DINET -DINET6 -DGEO=0" "$us"
+	proof sack_doack_2 "$hk" "$sk" proof_sack_doack "-DINET -DINET6 -DGEO=2" "$us"
+	# The front-trim accounting: delivered data and hole_bytes, and the
+	# hole's new start.  (The end>start acceptance check is equivalent for
+	# a well-formed block, so it is no mutant.)
+	mutant sack_delivered "$hk" "$sk" proof_sack_doack "-DINET -DINET6 -DGEO=2" \
+	    "$us" '/^tcp_sack_doack(/,/^}/s/delivered_data += (sblkp->end - cur->start);/delivered_data += (sblkp->end - cur->start) + 1;/'
+	mutant sack_holebytes "$hk" "$sk" proof_sack_doack "-DINET -DINET6 -DGEO=2" \
+	    "$us" '/^tcp_sack_doack(/,/^}/s/tp->sackhint.hole_bytes -= sblkp->end - cur->start;/;/'
+	mutant sack_movestart "$hk" "$sk" proof_sack_doack "-DINET -DINET6 -DGEO=2" \
+	    "$us" '/^tcp_sack_doack(/,/^}/s/cur->start = sblkp->end;/cur->start = sblkp->start;/'
+
 fi
 
 if want ktls; then

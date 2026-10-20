@@ -411,6 +411,35 @@ stays in bounds, where the kernel buffer is the segment's); the
 `nsacks` count mutant is equivalent (a valid SACK optlen is `2 + 8k`, so
 `(optlen - 2) / 8` and `optlen / 8` are both `k`).
 
+## tcp_sack_doack(): what is proven (partial)
+
+Harness `tcp/sack.c`, for `tcp_sack_doack()`, `sys/netinet/tcp_sack.c`,
+against RFC 2018: the peer's SACK blocks parsed from an option into the
+retransmission scoreboard (a list of holes).  This function is large and
+stateful, and the scoreboard sweep walks a doubly-linked hole list with
+two crossing cursors; the symbolic version runs out of memory (over 50G).
+So the proof is **partial**: the sequence space is a concrete constant per
+job (GEO), and two geometries are proven, each with its accounting
+checked (the returned status, `hole_bytes`, and `sacked_bytes`):
+
+- GEO 0 - a pure cumulative ack with no SACK block: nothing sacked, the
+  scoreboard untouched, `SACK_NOCHANGE`.
+- GEO 2 - a peer block trimming a hole's front: the block accepted, the
+  hole's start advanced, `hole_bytes` and `sacked_bytes` reduced by the
+  acked amount, `SACK_CHANGE`.
+
+Memory safety and every `KASSERT()` hold on both.  Mutants
+(`sack_delivered`, `sack_holebytes`, `sack_movestart`) take the trim
+accounting back.
+
+Not covered, for want of memory on this host: the whole-hole-removal,
+back-trim, hole-split and new-hole-at-tail geometries (the sweep walks
+more holes/blocks than fits), and the fully symbolic sequence space.  The
+security-relevant property a remote peer can push on - that the SACK
+block count cannot overflow `sack_blocks[TCP_MAX_SACK + 1]` - is bounded
+separately by the `tcp_dooptions()` proof, which holds `to_nsacks <= 4`.
+No bug found.
+
 ## How it works
 
 - The harness `#include`s the kernel source whole: the code proven is
