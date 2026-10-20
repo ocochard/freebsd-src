@@ -1524,7 +1524,9 @@ kqueue_kevent(struct kqueue *kq, struct thread *td, int nchanges, int nevents,
 					return (error);
 				kevp->flags = EV_ERROR;
 				kevp->data = error;
-				(void)k_ops->k_copyout(k_ops->arg, kevp, 1);
+				error = k_ops->k_copyout(k_ops->arg, kevp, 1);
+				if (error != 0)
+					return (error);
 				nevents--;
 				nerrors++;
 			}
