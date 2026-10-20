@@ -324,10 +324,15 @@ kqueue.2 give EINVAL (`run.sh` mutant `kevent_negevents_late` takes the
 fix back; ATF `tests/sys/kqueue/kqueue_lengths`).  Report:
 [reports/kevent.md](reports/kevent.md).
 
-Open questions (`run.sh` questions): an EV_ERROR event that cannot be
-written is counted all the same, where kqueue.2 gives EFAULT
-(`kevent_outfault`); a change with filter 0 is skipped, where kqueue.2
-gives EINVAL for an invalid filter (`kevent_zerofilter`).
+Fix [459c6f697997](https://github.com/ocochard/freebsd-src/commit/459c6f697997):
+an EV_ERROR event whose copyout faulted was counted and
+kevent() returned success with nothing written, where kqueue.2 gives
+EFAULT; markj@ confirmed the drop (from the 2000 original) was a bug
+(`run.sh` mutant `kevent_outfault_drop`; ATF
+`tests/sys/kqueue/kqueue_lengths` eventlist_fault).
+
+Open question (`run.sh` question): a change with filter 0 is skipped,
+where kqueue.2 gives EINVAL for an invalid filter (`kevent_zerofilter`).
 
 ## close(2) and close_range(2): what is proven
 

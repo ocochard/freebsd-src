@@ -815,10 +815,14 @@ if want kevent; then
 	proof kevent_negevents "$h" "$s" proof_kevent "-DNEGEVENTS" "$uk"
 	mutant kevent_negevents_late "$h" "$s" proof_kevent "-DNEGEVENTS" \
 	    "$uk" '/^kqueue_kevent(/,/^}/s/if (nchanges < 0 || nevents < 0)/if (nchanges < 0)/'
-	# Open questions, kqueue.2 against the code.  An EV_ERROR event that
-	# cannot be written is counted all the same, no EFAULT.  A change
-	# with filter 0 is skipped, no EINVAL.
-	question kevent_outfault "$h" "$s" proof_kevent "-DOUTFAULT" "$uk"
+	# A copyout of an EV_ERROR event that faults makes kevent() return
+	# EFAULT (markj@ confirmed the drop was a bug; 459c6f697997).  The fix taken
+	# back: the fault is ignored and the event counted.
+	proof kevent_outfault "$h" "$s" proof_kevent "-DOUTFAULT" "$uk"
+	mutant kevent_outfault_drop "$h" "$s" proof_kevent "-DOUTFAULT" "$uk" \
+	    '/^kqueue_kevent(/,/^}/s/error = k_ops->k_copyout(k_ops->arg, kevp, 1);/(void)k_ops->k_copyout(k_ops->arg, kevp, 1); error = 0;/'
+	# Open question, kqueue.2 against the code: a change with filter 0 is
+	# skipped, no EINVAL.
 	question kevent_zerofilter "$h" "$s" proof_kevent "-DZEROFILTER" "$uk"
 	# EINVAL for a negative change list; the system's flags cleared ...
 	mutant kevent_negchanges "$h" "$s" proof_kevent "" "$uk" \
