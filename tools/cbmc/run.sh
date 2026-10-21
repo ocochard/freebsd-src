@@ -1178,6 +1178,35 @@ if want sockargs; then
 	# ... a name's sa_len is the length copied in.
 	mutant sockargs_salen "$h" "$s" proof_sockargs "$d" "$u" \
 	    '/^sockargs(/,/^}/s/sa->sa_len = buflen;/sa->sa_len = buflen + 1;/'
+
+	# getsockaddr(), same file: the copy-in of a socket address for
+	# bind(2), connect(2), sendto(2), sendmsg(2).  A len past
+	# SOCK_MAXADDRLEN refused with ENAMETOOLONG, below the header with
+	# EINVAL, a faulting copyin with the buffer freed; else a name of
+	# sa_len == len.  len is a constant per job; the jobs sweep below the
+	# header (1), the header (2), the cap (SOCK_MAXADDRLEN) and one past.
+	h="$here/sockargs/getsockaddr.c"
+	g="getsockaddr.0:256,cbmc_memmove.0:256"
+	proof getsockaddr_small "$h" "$s" proof_getsockaddr \
+	    "-DINET -DINET6 -DLEN=1" "$g"
+	proof getsockaddr_header "$h" "$s" proof_getsockaddr \
+	    "-DINET -DINET6 -DLEN=2" "$g"
+	proof getsockaddr_max "$h" "$s" proof_getsockaddr \
+	    "-DINET -DINET6 -DLEN=SOCK_MAXADDRLEN" "$g"
+	proof getsockaddr_over "$h" "$s" proof_getsockaddr \
+	    "-DINET -DINET6 -DLEN=(SOCK_MAXADDRLEN+1)" "$g"
+	dg="-DINET -DINET6 -DLEN=SOCK_MAXADDRLEN"
+	# A length past the cap is refused ...
+	mutant getsockaddr_cap "$h" "$s" proof_getsockaddr \
+	    "-DINET -DINET6 -DLEN=(SOCK_MAXADDRLEN+1)" "$g" \
+	    '/^getsockaddr(/,/^}/s/if (len > SOCK_MAXADDRLEN)/if (0)/'
+	# ... a length below the header is refused ...
+	mutant getsockaddr_hdr "$h" "$s" proof_getsockaddr \
+	    "-DINET -DINET6 -DLEN=1" "$g" \
+	    '/^getsockaddr(/,/^}/s/if (len < offsetof(struct sockaddr, sa_data\[0\]))/if (0)/'
+	# ... the name's sa_len is the length copied in.
+	mutant getsockaddr_salen "$h" "$s" proof_getsockaddr "$dg" "$g" \
+	    '/^getsockaddr(/,/^}/s/sa->sa_len = len;/sa->sa_len = len + 1;/'
 fi
 
 if want ktls; then
