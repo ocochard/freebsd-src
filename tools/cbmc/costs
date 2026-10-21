@@ -43,6 +43,12 @@ copyinuio_iovcnt 1 99
 copyinuio_overflow 0 99
 copyinuio_overflow2 0 98
 copyinuio_resid 0 99
+exec_args_1 2 103
+exec_args_2 2 104
+exec_args_3 1 103
+exec_args_charge 3 104
+exec_args_e2big 2 103
+exec_args_endp 2 104
 getsockaddr_cap 1 100
 getsockaddr_hdr 0 100
 getsockaddr_header 0 100

@@ -570,6 +570,33 @@ loop), the jobs sweeping an empty value, one short of the buffer, the
 buffer, and one past it, with `minlen` symbolic in `[0, len]`.  No bug
 found.
 
+## execve(2): what is proven
+
+Harness `exec/exec_args.c`, for the argument-string accounting of
+`execve(2)`, `sys/kern/kern_exec.c`: `exec_args_add_arg()` and
+`exec_args_add_env()` (through `exec_args_add_str()`) each copy one user
+string into the string buffer against a running budget (`stringspace`) and
+advance the end pointer.  `NADD` successive appends, a prefix of them args
+and the rest envs (the order the caller uses), each string of any length,
+against the contract:
+
+- the budget never underflows and never grows past its start.
+- the end pointer stays inside the buffer and tracks the consumed budget
+  (`endp - begin_argv == start - stringspace`).
+- a string that does not fit the budget is refused with `E2BIG` (a fault
+  with its own error).
+
+The buffer is a CBMC object of exactly the budget, so the accounting is
+load-bearing: the mutant `exec_args_charge`, which drops the budget
+decrement, is caught by an out-of-bounds write (the next copy is handed
+the whole budget again).  Mutants `exec_args_endp` and `exec_args_e2big`
+take the pointer advance and the error mapping back.  The budget is a
+small constant per job (the accounting is integer reasoning, the same at
+any size; the real `ARG_MAX` of 256K would need a 256K symbolic buffer
+that runs the solver out of memory).  `copyinstr()` is modelled to return
+a length no greater than the room it was given, as `copyinstr(9)`
+guarantees.  No bug found.
+
 ## How it works
 
 - The harness `#include`s the kernel source whole: the code proven is
