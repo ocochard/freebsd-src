@@ -692,18 +692,33 @@ if want sendfile; then
 		proof pager_ufs_$b "$h" "$s" proof_getpages \
 		    "-DUFS -DBSIZE=$b" "$up"
 	done
-	# Open questions, outside what sendfile and UFS give the pager.  A
-	# run ending on the file's last page valid up to its end completes
-	# on one page less, which stays busied; sendfile_swapin() never ends
-	# a run there.
-	question pager_lastvalid "$h" "$s" proof_getpages \
+	# The asynchronous completion covers every requested page, exactly
+	# once, on the no-I/O exits too (kib@: it must be called for all
+	# pages).  A run ending on the file's last page valid up to its end
+	# no longer trims that page for an async request, so the whole run
+	# flows to one completion; and a hole or a file system without
+	# VOP_BMAP() completes on the full run instead of skipping the
+	# callback.  sendfile does not take these paths (it asks
+	# vm_pager_has_page() first and UFS has VOP_BMAP()), so the mutants
+	# are the regression check.
+	proof pager_lastvalid "$h" "$s" proof_getpages \
 	    "-DUFS -DBSIZE=4096 -DLASTVALID" "$up"
-	# A hole, or a file system without VOP_BMAP(), is read with no I/O
-	# and VM_PAGER_OK, and the asynchronous completion never runs:
-	# ffs_getpages_async() and vnode_pager_local_getpages_async() run it
-	# on an error only.  sendfile asks vm_pager_has_page() first, under
-	# the vnode lock, and UFS has VOP_BMAP().
-	question pager_nobmap "$h" "$s" proof_getpages "-DBSIZE=4096" "$up"
+	proof pager_nobmap "$h" "$s" proof_getpages "-DBSIZE=4096" "$up"
+	# A block smaller than a page takes the small-filesystem path.
+	proof pager_smlfs "$h" "$s" proof_getpages "-DBSIZE=2048" "$up"
+	# The trim that dropped the valid last page for async is gone ...
+	mutant pager_lasttrim "$h" "$s" proof_getpages \
+	    "-DUFS -DBSIZE=4096 -DLASTVALID" "$up" \
+	    '/^vnode_pager_generic_getpages(/,/^}/s/if (!vm_page_none_valid(m\[count - 1\]) \&\& iodone == NULL \&\&/if (!vm_page_none_valid(m[count - 1]) \&\&/'
+	# ... the no-VOP_BMAP input loop completes the run ...
+	mutant pager_oldnodone "$h" "$s" proof_getpages "-DBSIZE=4096" "$up" \
+	    '/if (error == EOPNOTSUPP) {/,/} else if (error != 0) {/s/if (error == 0 \&\& iodone != NULL)/if (0)/'
+	# ... the small-filesystem loop completes the run ...
+	mutant pager_smlnodone "$h" "$s" proof_getpages "-DBSIZE=2048" "$up" \
+	    '/if (pagesperblock == 0) {/,/^	}/s/if (error == 0 \&\& iodone != NULL)/if (0)/'
+	# ... the sparse-file hole completes the run.
+	mutant pager_holenodone "$h" "$s" proof_getpages "-DBSIZE=4096" "$up" \
+	    '/if (bp->b_blkno == -1) {/,/^	}/s/if (iodone != NULL)/if (0)/'
 	d="-DUFS -DBSIZE=8192"
 	# The completion runs once, on the run given ...
 	mutant pager_pages "$h" "$s" proof_getpages "$d" "$up" \
