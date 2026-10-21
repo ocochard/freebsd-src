@@ -1142,6 +1142,44 @@ if want read; then
 	    '/^copyinuio(/,/^}/s/uio->uio_iovcnt = iovcnt;/uio->uio_iovcnt = iovcnt + 1;/'
 fi
 
+if want sockargs; then
+	# sockargs(), sys/kern/uipc_syscalls.c: the copy-in of a socket name
+	# or control buffer into an mbuf, for sendto(2), sendmsg(2), bind(2),
+	# connect(2) and kin.  A buflen past MCLBYTES refused with EMSGSIZE
+	# and no mbuf; a faulting copyin reported with the mbuf freed; else
+	# an mbuf of m_len == buflen, buflen bytes copied into a data area
+	# that holds them, and for a name an sa_len of buflen.
+	# buflen is a constant per job: the copyin is a byte loop, and a
+	# symbolic length runs out of memory.  The boundaries are swept as CPP
+	# expressions (MLEN is a struct offset, not a plain number): an MLEN
+	# mbuf (0, MLEN), an MCLBYTES cluster (MLEN+1, MCLBYTES), and a length
+	# past the cap (MCLBYTES+1).  The copyin loop unwinds to MCLBYTES+1.
+	h="$here/sockargs/sockargs.c"
+	s="$top/sys/kern/uipc_syscalls.c"
+	u="sockargs.0:2050,cbmc_memmove.0:2050"
+	proof sockargs_empty "$h" "$s" proof_sockargs \
+	    "-DINET -DINET6 -DLEN=0" "$u"
+	proof sockargs_mbuf "$h" "$s" proof_sockargs \
+	    "-DINET -DINET6 -DLEN=MLEN" "$u"
+	proof sockargs_clmin "$h" "$s" proof_sockargs \
+	    "-DINET -DINET6 -DLEN=(MLEN+1)" "$u"
+	proof sockargs_clmax "$h" "$s" proof_sockargs \
+	    "-DINET -DINET6 -DLEN=MCLBYTES" "$u"
+	proof sockargs_over "$h" "$s" proof_sockargs \
+	    "-DINET -DINET6 -DLEN=(MCLBYTES+1)" "$u"
+	d="-DINET -DINET6 -DLEN=MCLBYTES"
+	# The data area holds exactly what is copied in (m_len == buflen) ...
+	mutant sockargs_mlen "$h" "$s" proof_sockargs "$d" "$u" \
+	    '/^sockargs(/,/^}/s/m->m_len = buflen;/m->m_len = buflen + 1;/'
+	# ... a length past the cap is refused ...
+	mutant sockargs_cap "$h" "$s" proof_sockargs \
+	    "-DINET -DINET6 -DLEN=(MCLBYTES+1)" "$u" \
+	    '/^sockargs(/,/^}/s/if (buflen > MCLBYTES)/if (0)/'
+	# ... a name's sa_len is the length copied in.
+	mutant sockargs_salen "$h" "$s" proof_sockargs "$d" "$u" \
+	    '/^sockargs(/,/^}/s/sa->sa_len = buflen;/sa->sa_len = buflen + 1;/'
+fi
+
 if want ktls; then
 	proof ktls_frame "$h" "$s" proof_frame "$dk" "$uk"
 	proof ktls_enqueue "$h" "$s" proof_enqueue "$dk" "$uk"
