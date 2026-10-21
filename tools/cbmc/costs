@@ -43,6 +43,13 @@ copyinuio_iovcnt 1 99
 copyinuio_overflow 0 99
 copyinuio_overflow2 0 98
 copyinuio_resid 0 99
+getsockaddr_cap 1 100
+getsockaddr_hdr 0 100
+getsockaddr_header 0 100
+getsockaddr_max 1 101
+getsockaddr_over 0 100
+getsockaddr_salen 1 100
+getsockaddr_small 0 100
 kevent 26 789
 kevent_9 275 6040
 kevent_advance 227 4730
@@ -398,10 +405,10 @@ sockargs 98 20406
 sockargs_cap 2 468
 sockargs_clmax 2 467
 sockargs_clmin 1 100
-sockargs_empty 1 100
+sockargs_empty 0 100
 sockargs_mbuf 1 100
 sockargs_mlen 2 467
-sockargs_over 0 101
+sockargs_over 0 100
 sockargs_salen 2 467
 tcp_dooptions_10 12 450
 tcp_dooptions_18 117 624

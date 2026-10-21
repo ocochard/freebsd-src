@@ -501,7 +501,7 @@ Not covered: the `UIO_MAXIOV` cap itself (reaching it needs `iovcnt >
 allocation's free on the fault path (not observable in the malloc model).
 No bug found.
 
-## sockargs(): what is proven
+## sockargs() and getsockaddr(): what is proven
 
 Harness `sockargs/sockargs.c`, for `sockargs()`, `sys/kern/uipc_syscalls.c`:
 the copy-in of a socket name or control buffer into an mbuf, shared by
@@ -527,6 +527,24 @@ length runs out of memory): the jobs sweep the boundaries, an `MLEN` mbuf
 (`MCLBYTES+1`).  Not covered: a name longer than 255, whose `sa_len`
 truncates to one byte; the only in-tree caller passes control data, not a
 name, so that path is dead.  No bug found.
+
+Harness `sockargs/getsockaddr.c`, for `getsockaddr()`, same file: the
+copy-in of a socket address for `bind(2)`, `connect(2)`, `sendto(2)` and
+`sendmsg(2)`.  A `len`, against the contract:
+
+- `len` past `SOCK_MAXADDRLEN` (255) is refused with `ENAMETOOLONG` and no
+  name.
+- `len` below the fixed header (`offsetof(struct sockaddr, sa_data[0])`)
+  is refused with `EINVAL`.
+- a faulting copyin is reported, with the buffer freed and no name.
+- on success the name's `sa_len` is `len` (capped at 255, so no byte
+  truncation here), `len` bytes copied into a buffer that holds them.
+
+The `M_SONAME` buffer is a CBMC object of exactly `len` bytes, so dropping
+the cap (`getsockaddr_cap`) is caught by an out-of-bounds copy.  Mutants
+`getsockaddr_hdr` and `getsockaddr_salen` take the header check and the
+`sa_len` stamp back.  `len` is a constant per job, the jobs sweeping below
+the header, the header, the cap and one past it.  No bug found.
 
 ## How it works
 
