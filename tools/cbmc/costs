@@ -394,6 +394,15 @@ sendfile_twice_extpg 126 4108
 sendfile_twice_hdrspace 424 11854
 sendfile_xfsize 1 68
 sendfile_xfsize_last 1 68
+sockargs 98 20406
+sockargs_cap 2 468
+sockargs_clmax 2 467
+sockargs_clmin 1 100
+sockargs_empty 1 100
+sockargs_mbuf 1 100
+sockargs_mlen 2 467
+sockargs_over 0 101
+sockargs_salen 2 467
 tcp_dooptions_10 12 450
 tcp_dooptions_18 117 624
 tcp_dooptions_2 7 444

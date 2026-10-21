@@ -501,6 +501,33 @@ Not covered: the `UIO_MAXIOV` cap itself (reaching it needs `iovcnt >
 allocation's free on the fault path (not observable in the malloc model).
 No bug found.
 
+## sockargs(): what is proven
+
+Harness `sockargs/sockargs.c`, for `sockargs()`, `sys/kern/uipc_syscalls.c`:
+the copy-in of a socket name or control buffer into an mbuf, shared by
+`sendto(2)`, `sendmsg(2)`, `bind(2)`, `connect(2)` and their kin.  A
+`buflen` and a `type` of `MT_SONAME` or `MT_DATA`, against the contract:
+
+- `buflen` past `MCLBYTES` is refused with `EMSGSIZE` and no mbuf.
+- a faulting copyin is reported, with the mbuf freed and none handed back.
+- on success the mbuf's `m_len` is `buflen`, exactly `buflen` bytes are
+  copied into a data area that holds them, and for a name `sa_len` is the
+  low byte of `buflen`.
+
+The data area is a CBMC object of the exact size class `m_get2()` would
+give (`MLEN`, else a `MCLBYTES` cluster), so the copyin's write is
+bounds-checked against the real capacity: the mutant `sockargs_cap`, which
+drops the `MCLBYTES` refusal, is caught by an out-of-bounds write, which
+is what makes the cap load-bearing.  Mutants `sockargs_mlen` and
+`sockargs_salen` take the length and the stored `sa_len` back.
+
+`buflen` is a constant per job (the copyin is a byte loop; a symbolic
+length runs out of memory): the jobs sweep the boundaries, an `MLEN` mbuf
+(`0`, `MLEN`), a cluster (`MLEN+1`, `MCLBYTES`) and a length past the cap
+(`MCLBYTES+1`).  Not covered: a name longer than 255, whose `sa_len`
+truncates to one byte; the only in-tree caller passes control data, not a
+name, so that path is dead.  No bug found.
+
 ## How it works
 
 - The harness `#include`s the kernel source whole: the code proven is
