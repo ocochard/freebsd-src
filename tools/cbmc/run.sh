@@ -117,6 +117,7 @@ restrict_ktls_send="sosend_generic_locked.function_pointer_call.1/cbmc_pr_send"
 cbmc_ktls_send="--no-signed-overflow-check"
 cbmc_ktls_enable="--no-signed-overflow-check"
 cbmc_tcp="--no-signed-overflow-check"
+cbmc_read="--no-signed-overflow-check"
 replace_sack="tcp_record_dsack:cbmc_tcp_record_dsack"
 cbmc_sack="--no-signed-overflow-check"
 cbmc_ktls_sbc="--no-signed-overflow-check --object-bits 10"
@@ -1099,6 +1100,31 @@ if want tcp; then
 	mutant sack_movestart "$hk" "$sk" proof_sack_doack "-DINET -DINET6 -DGEO=2" \
 	    "$us" '/^tcp_sack_doack(/,/^}/s/cur->start = sblkp->end;/cur->start = sblkp->start;/'
 
+fi
+
+if want read; then
+	# copyinuio(), sys/kern/subr_uio.c: the iovec copy-in of readv(2),
+	# writev(2), preadv(2), pwritev(2) against readv(2).  Up to NIOV
+	# iovecs of any length: iovcnt past UIO_MAXIOV refused, each length
+	# checked so the running total never passes IOSIZE_MAX, a fault
+	# propagated with no uio; else a uio whose resid is the exact sum.
+	h="$here/read/read.c"
+	s="$top/sys/kern/subr_uio.c"
+	ur="copyinuio.0:5,proof_copyinuio.0:5,proof_copyinuio.1:5,cbmc_memmove.0:65"
+	proof copyinuio "$h" "$s" proof_copyinuio "" "$ur"
+	# Each length checked against the running total so it cannot overflow
+	# IOSIZE_MAX; the total is the exact sum; the iovcnt is recorded.
+	# (The UIO_MAXIOV cap and the fault-path free are not covered: iovcnt
+	# > 1024 exceeds the modelled iovec array, and the single M_IOV
+	# allocation's free is not observable in the malloc model.)
+	mutant copyinuio_overflow "$h" "$s" proof_copyinuio "" "$ur" \
+	    '/^copyinuio(/,/^}/s/if (iov->iov_len > IOSIZE_MAX - uio->uio_resid) {/if (0) {/'
+	mutant copyinuio_overflow2 "$h" "$s" proof_copyinuio "" "$ur" \
+	    '/^copyinuio(/,/^}/s/if (iov->iov_len > IOSIZE_MAX - uio->uio_resid) {/if (iov->iov_len > IOSIZE_MAX) {/'
+	mutant copyinuio_resid "$h" "$s" proof_copyinuio "" "$ur" \
+	    '/^copyinuio(/,/^}/s/uio->uio_resid += iov->iov_len;/uio->uio_resid += iov->iov_len + 1;/'
+	mutant copyinuio_iovcnt "$h" "$s" proof_copyinuio "" "$ur" \
+	    '/^copyinuio(/,/^}/s/uio->uio_iovcnt = iovcnt;/uio->uio_iovcnt = iovcnt + 1;/'
 fi
 
 if want ktls; then

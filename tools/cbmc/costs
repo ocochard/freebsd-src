@@ -38,6 +38,11 @@ close_setopen 97 2376
 close_skip 101 2376
 close_slot 8 551
 close_unlock 12 556
+copyinuio 1 99
+copyinuio_iovcnt 1 99
+copyinuio_overflow 0 99
+copyinuio_overflow2 0 98
+copyinuio_resid 0 99
 kevent 26 789
 kevent_9 275 6040
 kevent_advance 227 4730
