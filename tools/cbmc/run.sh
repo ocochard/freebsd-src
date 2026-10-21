@@ -202,7 +202,8 @@ for f in $(sed -n 's/^#include "\(opt_[a-z0-9_]*\.h\)"/\1/p' \
     "$top/sys/kern/uipc_socket.c" "$top/sys/kern/uipc_mbuf.c" \
     "$top/sys/vm/vnode_pager.c" "$top/sys/kern/uipc_syscalls.c" \
     "$top/sys/kern/kern_event.c" "$top/sys/kern/kern_descrip.c" \
-    "$top/sys/kern/uipc_usrreq.c" "$top/sys/netinet/tcp_input.c"); do
+    "$top/sys/kern/uipc_usrreq.c" "$top/sys/netinet/tcp_input.c" \
+    "$top/sys/kern/kern_exec.c"); do
 	: >"$work/inc/$f"
 done
 
@@ -1236,6 +1237,32 @@ if want setsockopt; then
 	# ... the retrieved length is reported in sopt_valsize.
 	mutant sooptcopyin_report "$h" "$s" proof_sooptcopyin "$ds -DVALSIZE=12" "$so" \
 	    '/^_sooptcopyin(/,/^}/s/sopt->sopt_valsize = valsize = len;/valsize = len;/'
+fi
+
+if want exec; then
+	# The argument-string accounting of execve(2), sys/kern/kern_exec.c:
+	# exec_args_add_fname() lays the filename, then each add_arg()/_env()
+	# copies one user string against the running stringspace budget and
+	# advances endp.  The budget never underflows and endp never runs past
+	# the buffer; a string that does not fit is E2BIG.  NADD successive
+	# appends are proven; the string buffer is sized to the real
+	# PATH_MAX + ARG_MAX, so an overrun is an out-of-bounds write.
+	h="$here/exec/exec_args.c"
+	s="$top/sys/kern/kern_exec.c"
+	db="-DBUDGET=6"
+	ue="proof_exec_args.0:5"
+	for n in 1 2 3; do
+		proof exec_args_$n "$h" "$s" proof_exec_args "$db -DNADD=$n" "$ue"
+	done
+	# The budget is charged for each string copied ...
+	mutant exec_args_charge "$h" "$s" proof_exec_args "$db -DNADD=2" "$ue" \
+	    '/^exec_args_add_str(/,/^}/s/args->stringspace -= length;/;/'
+	# ... and the end pointer advanced, so endp tracks the budget ...
+	mutant exec_args_endp "$h" "$s" proof_exec_args "$db -DNADD=2" "$ue" \
+	    '/^exec_args_add_str(/,/^}/s/args->endp += length;/;/'
+	# ... a copy too long for the budget is E2BIG, not a different error.
+	mutant exec_args_e2big "$h" "$s" proof_exec_args "$db -DNADD=2" "$ue" \
+	    '/^exec_args_add_str(/,/^}/s/return (error == ENAMETOOLONG ? E2BIG : error);/return (error);/'
 fi
 
 if want ktls; then
