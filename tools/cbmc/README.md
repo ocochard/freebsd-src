@@ -30,6 +30,13 @@ file: [reports/sendfile.md](reports/sendfile.md).
 | 8 | sendfile.2: readahead is added to the internal one, not the larger used | [a5bf794ee696](https://github.com/ocochard/freebsd-src/commit/a5bf794ee696) | confirmed by the developer |
 | 9 | sendfile.2: document EINVAL for bad iovecs and pending socket errors | [c602ed263a2b](https://github.com/ocochard/freebsd-src/commit/c602ed263a2b) | confirmed by the developer |
 
+The pager those proofs model has its own fix, in the VM interface, not in
+sendfile(2): report [reports/vm.md](reports/vm.md).
+
+| # | Bug | Fix | Status |
+|---|---|---|---|
+| 1 | async `VOP_GETPAGES` skips the completion on its no-I/O exits | [987722b47487](https://github.com/ocochard/freebsd-src/commit/987722b47487) | confirmed by the developer (kib@) |
+
 Open question: sendfile is zero-copy, so a file truncated after
 `sendfile()` returns, before the peer reads, arrives part old, part
 zeroed (two pages of `x` truncated to 100 bytes: 100 `x`, 3996 zeros,
@@ -76,15 +83,17 @@ The block size is a constant per job: 64-bit division by a variable
 block size took the formula past 46G in 40 minutes, a constant one 40
 seconds.
 
-Open questions, outside what sendfile and UFS give the pager (`run.sh`
-questions): a run ending on the file's last page valid up to its end
-completes on one page less, which stays busied
-(`pager_lastvalid`); a hole, or a file system without `VOP_BMAP()`,
-is read with no I/O and `VM_PAGER_OK` and the asynchronous completion
-never runs, as `ffs_getpages_async()` and
-`vnode_pager_local_getpages_async()` run it on an error only
-(`pager_nobmap`).  sendfile asks `vm_pager_has_page()` first, under the
-vnode lock, and trims a run's valid last pages.
+The completion covers every requested page, exactly once, on the no-I/O
+exits too.  kib@ confirmed the contract: the callback must be called for
+all pages.  Four paths broke it (reports/vm.md): a run ending on the file's last
+page valid up to its end trimmed that page and completed on one less
+(`pager_lastvalid`); a hole, or a file system without `VOP_BMAP()`, read
+with no I/O and `VM_PAGER_OK` and never ran the completion
+(`pager_nobmap`, `pager_smlfs`).  sendfile does not take these paths (it
+asks `vm_pager_has_page()` first, under the vnode lock, and UFS has
+`VOP_BMAP()`), so no in-tree caller hit them and the mutants
+(`pager_lasttrim`, `pager_oldnodone`, `pager_smlnodone`,
+`pager_holenodone`) are the regression check.
 
 Not covered: a page busied by another thread (only as a short grab).
 
