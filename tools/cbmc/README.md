@@ -546,6 +546,30 @@ the cap (`getsockaddr_cap`) is caught by an out-of-bounds copy.  Mutants
 `sa_len` stamp back.  `len` is a constant per job, the jobs sweeping below
 the header, the header, the cap and one past it.  No bug found.
 
+## setsockopt(2): what is proven
+
+Harness `setsockopt/sooptcopyin.c`, for `sooptcopyin()`,
+`sys/kern/uipc_socket.c`: the copy-in of a socket option value, used by
+`setsockopt(2)` through `sosetopt()` and by every protocol
+`pr_ctloutput()`.  The user controls `sopt_valsize`, against a caller
+buffer of `len` bytes and a minimum `minlen`:
+
+- a `valsize` below `minlen` is refused with `EINVAL`, `sopt_valsize`
+  untouched, no copy.
+- a `valsize` above `len` is clamped to `len`, and `sopt_valsize` reports
+  the clamped length.
+- the copy is only ever `min(valsize, len)` bytes, into the caller's
+  buffer, never past it; on the user path it is a copyin that may fault.
+
+The caller's buffer is a CBMC object of exactly `len` bytes, so the clamp
+is load-bearing: the mutant `sooptcopyin_clamp`, which drops it, is caught
+by an out-of-bounds write of the over-long value.  Mutants
+`sooptcopyin_min` and `sooptcopyin_report` take the minimum check and the
+reported length back.  `valsize` is a constant per job (the copy is a byte
+loop), the jobs sweeping an empty value, one short of the buffer, the
+buffer, and one past it, with `minlen` symbolic in `[0, len]`.  No bug
+found.
+
 ## How it works
 
 - The harness `#include`s the kernel source whole: the code proven is

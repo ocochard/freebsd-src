@@ -410,6 +410,13 @@ sockargs_mbuf 1 100
 sockargs_mlen 2 467
 sockargs_over 0 100
 sockargs_salen 2 467
+sooptcopyin_clamp 2 102
+sooptcopyin_empty 2 102
+sooptcopyin_full 2 101
+sooptcopyin_min 2 102
+sooptcopyin_over 2 102
+sooptcopyin_report 2 102
+sooptcopyin_short 2 102
 tcp_dooptions_10 12 450
 tcp_dooptions_18 117 624
 tcp_dooptions_2 7 444
