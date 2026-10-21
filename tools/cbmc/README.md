@@ -468,6 +468,30 @@ block count cannot overflow `sack_blocks[TCP_MAX_SACK + 1]` - is bounded
 separately by the `tcp_dooptions()` proof, which holds `to_nsacks <= 4`.
 No bug found.
 
+## read(2)/readv(2): what is proven
+
+Harness `read/read.c`, for `copyinuio()`, `sys/kern/subr_uio.c`: the
+iovec array copy-in shared by `readv(2)`, `writev(2)`, `preadv(2)` and
+`pwritev(2)`.  A user `iovcnt` and up to `NIOV` iovecs of nondeterministic
+length, against the readv(2) contract:
+
+- `iovcnt` past `UIO_MAXIOV` is refused with `EINVAL` and no `uio`.
+- a faulting copyin of the iovec array is propagated with no `uio`.
+- each iovec length is checked so the running total never passes
+  `IOSIZE_MAX`; on overflow the call fails with `EINVAL` and no `uio`.
+- on success the `uio`'s `uio_resid` is the exact sum of the lengths and
+  `uio_iovcnt` is the requested count.
+
+The success path is where the arithmetic matters: a 64-bit running sum of
+attacker-chosen lengths that must not wrap.  Mutants `copyinuio_overflow`,
+`copyinuio_overflow2`, `copyinuio_resid` and `copyinuio_iovcnt` take the
+overflow guard, the total and the iovcnt back.
+
+Not covered: the `UIO_MAXIOV` cap itself (reaching it needs `iovcnt >
+1024`, past the modelled iovec array of `NIOV`), and the single `M_IOV`
+allocation's free on the fault path (not observable in the malloc model).
+No bug found.
+
 ## How it works
 
 - The harness `#include`s the kernel source whole: the code proven is
