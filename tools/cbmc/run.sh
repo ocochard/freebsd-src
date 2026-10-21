@@ -1209,6 +1209,35 @@ if want sockargs; then
 	    '/^getsockaddr(/,/^}/s/sa->sa_len = len;/sa->sa_len = len + 1;/'
 fi
 
+if want setsockopt; then
+	# sooptcopyin(), sys/kern/uipc_socket.c: the copy-in of a socket
+	# option value, for setsockopt(2) through sosetopt() and every
+	# protocol pr_ctloutput().  The user controls sopt_valsize: below the
+	# caller's minlen it is refused with EINVAL, above the caller's buffer
+	# it is clamped, and the copy is only ever min(valsize, len) bytes
+	# into a len-byte buffer, never past it.  valsize is a constant per
+	# job (the copy is a byte loop); the jobs sweep an empty value, one
+	# short of the buffer, the buffer, and one past it, against a caller
+	# buffer of LEN=8 and a symbolic minlen in [0, LEN].
+	h="$here/setsockopt/sooptcopyin.c"
+	s="$top/sys/kern/uipc_socket.c"
+	ds="-DINET -DINET6 -DLEN=8"
+	so="sooptcopyin.0:9,_sooptcopyin.0:9,cbmc_memmove.0:9"
+	proof sooptcopyin_empty "$h" "$s" proof_sooptcopyin "$ds -DVALSIZE=0" "$so"
+	proof sooptcopyin_short "$h" "$s" proof_sooptcopyin "$ds -DVALSIZE=4" "$so"
+	proof sooptcopyin_full "$h" "$s" proof_sooptcopyin "$ds -DVALSIZE=8" "$so"
+	proof sooptcopyin_over "$h" "$s" proof_sooptcopyin "$ds -DVALSIZE=12" "$so"
+	# A value below the minimum is refused ...
+	mutant sooptcopyin_min "$h" "$s" proof_sooptcopyin "$ds -DVALSIZE=4" "$so" \
+	    '/^_sooptcopyin(/,/^}/s/if ((valsize = sopt->sopt_valsize) < minlen)/if ((valsize = sopt->sopt_valsize), 0)/'
+	# ... an over-long value is clamped to the buffer (no copy past it) ...
+	mutant sooptcopyin_clamp "$h" "$s" proof_sooptcopyin "$ds -DVALSIZE=12" "$so" \
+	    '/^_sooptcopyin(/,/^}/s/sopt->sopt_valsize = valsize = len;/sopt->sopt_valsize = valsize;/'
+	# ... the retrieved length is reported in sopt_valsize.
+	mutant sooptcopyin_report "$h" "$s" proof_sooptcopyin "$ds -DVALSIZE=12" "$so" \
+	    '/^_sooptcopyin(/,/^}/s/sopt->sopt_valsize = valsize = len;/valsize = len;/'
+fi
+
 if want ktls; then
 	proof ktls_frame "$h" "$s" proof_frame "$dk" "$uk"
 	proof ktls_enqueue "$h" "$s" proof_enqueue "$dk" "$uk"
