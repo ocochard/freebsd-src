@@ -546,7 +546,7 @@ the cap (`getsockaddr_cap`) is caught by an out-of-bounds copy.  Mutants
 `sa_len` stamp back.  `len` is a constant per job, the jobs sweeping below
 the header, the header, the cap and one past it.  No bug found.
 
-## setsockopt(2): what is proven
+## setsockopt(2) and getsockopt(2): what is proven
 
 Harness `setsockopt/sooptcopyin.c`, for `sooptcopyin()`,
 `sys/kern/uipc_socket.c`: the copy-in of a socket option value, used by
@@ -569,6 +569,21 @@ reported length back.  `valsize` is a constant per job (the copy is a byte
 loop), the jobs sweeping an empty value, one short of the buffer, the
 buffer, and one past it, with `minlen` symbolic in `[0, len]`.  No bug
 found.
+
+Harness `setsockopt/sooptcopyout.c`, for `sooptcopyout()`, same file: the
+copy-out of an option value for `getsockopt(2)` through `sogetopt()` and
+every `pr_ctloutput()`.  The caller hands a kernel buffer of `len` bytes;
+the user controls `sopt_valsize`:
+
+- the copy is only ever `min(len, sopt_valsize)` bytes, read from the
+  kernel buffer, never past it (which would leak adjacent kernel memory to
+  user space).
+- `sopt_valsize` is set to what was copied.
+
+The kernel buffer is a CBMC object of exactly `len` bytes, so the clamp is
+the information-leak guard: the mutant `sooptcopyout_clamp`, which drops
+the `min()`, is caught by an out-of-bounds read of the kernel buffer.  The
+mutant `sooptcopyout_report` takes the reported length back.  No bug found.
 
 ## execve(2): what is proven
 

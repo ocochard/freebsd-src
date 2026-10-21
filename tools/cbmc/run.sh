@@ -1237,6 +1237,28 @@ if want setsockopt; then
 	# ... the retrieved length is reported in sopt_valsize.
 	mutant sooptcopyin_report "$h" "$s" proof_sooptcopyin "$ds -DVALSIZE=12" "$so" \
 	    '/^_sooptcopyin(/,/^}/s/sopt->sopt_valsize = valsize = len;/valsize = len;/'
+
+	# sooptcopyout(), same file: the copy-out of a socket option value for
+	# getsockopt(2) through sogetopt() and every protocol pr_ctloutput().
+	# The copy is only ever min(len, sopt_valsize) bytes, read from the
+	# kernel buffer of len bytes, never past it (which would leak adjacent
+	# kernel memory); sopt_valsize is set to what was copied.  The kernel
+	# buffer is sized to len, so an over-read is caught.  sopt_valsize is a
+	# constant per job; the jobs sweep an empty user buffer, one short, the
+	# buffer, and larger (the clamp).  LEN is the kernel buffer, 8 bytes.
+	h="$here/setsockopt/sooptcopyout.c"
+	do="-DINET -DINET6 -DLEN=8"
+	oo="sooptcopyout.0:9,cbmc_memmove.0:9"
+	proof sooptcopyout_empty "$h" "$s" proof_sooptcopyout "$do -DVALSIZE=0" "$oo"
+	proof sooptcopyout_short "$h" "$s" proof_sooptcopyout "$do -DVALSIZE=4" "$oo"
+	proof sooptcopyout_full "$h" "$s" proof_sooptcopyout "$do -DVALSIZE=8" "$oo"
+	proof sooptcopyout_over "$h" "$s" proof_sooptcopyout "$do -DVALSIZE=12" "$oo"
+	# The copy is clamped to the kernel buffer (no read past it) ...
+	mutant sooptcopyout_clamp "$h" "$s" proof_sooptcopyout "$do -DVALSIZE=12" "$oo" \
+	    '/^sooptcopyout(/,/^}/s/valsize = min(len, sopt->sopt_valsize);/valsize = sopt->sopt_valsize;/'
+	# ... and the copied length reported in sopt_valsize.
+	mutant sooptcopyout_report "$h" "$s" proof_sooptcopyout "$do -DVALSIZE=12" "$oo" \
+	    '/^sooptcopyout(/,/^}/s/sopt->sopt_valsize = valsize;/;/'
 fi
 
 if want exec; then
