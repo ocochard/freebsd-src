@@ -659,6 +659,32 @@ tables), the jobs sweeping the table boundaries.  Not proven here: that a
 forged ACK is rejected, which rests on the MAC's collision resistance, not
 on this code's packing.  No bug found.
 
+## m_copydata(): what is proven
+
+Harness `mbuf/m_copydata.c`, for `m_copydata()`, `sys/kern/uipc_mbuf.c`:
+copy `len` bytes from offset `off` of an mbuf chain into a flat buffer,
+called all over the stack to pull packet bytes out of a chain.  Under the
+caller's contract (its `KASSERT`s: `off`, `len >= 0` and `off + len`
+within the chain):
+
+- the skip loop lands on the mbuf holding `off`, charging `off` against
+  each mbuf it passes.
+- each per-mbuf copy is `min(m_len - off, len)` bytes, read only within
+  that mbuf's data, never past it.
+- exactly `len` bytes are delivered to the destination.
+
+Each mbuf's data is a CBMC object of exactly its `m_len`, so a read even
+one byte past a mbuf is an out-of-bounds read: the mutant
+`mcopydata_count`, which copies the whole remaining `len` from a shorter
+mbuf, is caught that way, and `mcopydata_skip`, which stops charging `off`
+against the skipped mbufs, is caught by the `off` underflow blowing up the
+count (a `KASSERT`).  The chain geometry (per-mbuf lengths, `off`, `len`)
+is a constant per job -- a symbolic chain's split combinatorics blow up --
+the jobs sweeping a copy inside the first mbuf, one starting mid-mbuf, one
+spanning three mbufs, an empty copy at a boundary, and an offset skipping
+two mbufs.  The mapped path is proven; the `M_EXTPG` branch is not
+reached.  No bug found.
+
 ## How it works
 
 - The harness `#include`s the kernel source whole: the code proven is
