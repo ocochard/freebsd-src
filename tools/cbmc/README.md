@@ -685,6 +685,27 @@ spanning three mbufs, an empty copy at a boundary, and an offset skipping
 two mbufs.  The mapped path is proven; the `M_EXTPG` branch is not
 reached.  No bug found.
 
+Harness `mbuf/m_copyback.c`, for `m_copyback()`, same file: the writing
+counterpart, which puts `len` bytes at `off` into a chain, grows a mbuf
+into its trailing room, and allocates fresh mbufs when `off` or `len`
+runs past the end.  The first mbuf is a real `struct mbuf`, so its storage
+bounds and `M_TRAILINGSPACE` are the kernel's, and `m_get()` allocates any
+further mbufs through the UMA model (which may fail).  Proven:
+
+- every write stays inside a mbuf's storage.
+- a mbuf grows only within its trailing room, so no `m_len` ever exceeds
+  `M_SIZE(m)` -- which a later reader trusting `m_len` would turn into an
+  overread.
+- a failed allocation stops the walk without a write past the end.
+
+The mutant `mcopyback_grow`, which caps the growth by a huge value instead
+of `M_TRAILINGSPACE`, is caught by the `m_len <= M_SIZE` invariant, and
+`mcopyback_count`, which writes the whole remaining `len` into a shorter
+mbuf, by an out-of-bounds write; both bite in a geometry placing the write
+at the `MLEN` tail so the trailing-room cap binds.  Geometry is a constant
+per job (a write inside the mbuf, one growing it into trailing room, two
+allocating past the end, and the tail case).  No bug found.
+
 ## How it works
 
 - The harness `#include`s the kernel source whole: the code proven is
