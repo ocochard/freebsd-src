@@ -77,6 +77,7 @@ replace_unp="unp_internalize_fp:cbmc_unp_internalize_fp
 	unp_discard:cbmc_unp_discard"
 replace_recvmsg="getsock:cbmc_getsock
 	m_dispose_extcontrolm:cbmc_dispose"
+replace_syncookie="syncookie_mac:cbmc_syncookie_mac"
 replace_ktls="ktls_buffer_alloc:cbmc_ktls_buffer_alloc
 	ktls_drop:cbmc_ktls_drop
 	ktls_destroy:cbmc_ktls_destroy"
@@ -205,7 +206,7 @@ for f in $(sed -n 's/^#include "\(opt_[a-z0-9_]*\.h\)"/\1/p' \
     "$top/sys/vm/vnode_pager.c" "$top/sys/kern/uipc_syscalls.c" \
     "$top/sys/kern/kern_event.c" "$top/sys/kern/kern_descrip.c" \
     "$top/sys/kern/uipc_usrreq.c" "$top/sys/netinet/tcp_input.c" \
-    "$top/sys/kern/kern_exec.c"); do
+    "$top/sys/kern/kern_exec.c" "$top/sys/netinet/tcp_syncache.c"); do
 	: >"$work/inc/$f"
 done
 
@@ -1320,6 +1321,44 @@ if want recvmsg; then
 	# ... and a chain that does not fit is flagged truncated.
 	mutant recvit_ctrunc "$h" "$s" proof_recvit "$dc" "$ur" \
 	    '/if (m != NULL) {/,/m_dispose_extcontrolm(m);/s/mp->msg_flags |= MSG_CTRUNC;/;/'
+fi
+
+if want syncache; then
+	# The TCP SYN cookie, sys/netinet/tcp_syncache.c: syncookie_generate()
+	# packs a connection's MSS, window scale and SACK state plus a MAC into
+	# the SYN-ACK ISS, and syncookie_expand() unpacks the ACK the peer
+	# echoes and restores them.  The pair round-trips: a cookie this host
+	# generated decodes to the same MSS, window scale and SACK.  The MAC
+	# (SIPHASH) is replaced by a deterministic model, so what is proven is
+	# the bit packing; the 3-bit indices stay within the 8-entry tables.
+	# Rejection of a forged ACK is the MAC's property, not proven here.
+	h="$here/syncache/syncookie.c"
+	s="$top/sys/netinet/tcp_syncache.c"
+	us="syncookie_generate.0:9,syncookie_generate.1:9,syncookie_expand.0:16"
+	us="$us,proof_roundtrip.0:9,proof_roundtrip.1:9,proof_roundtrip.2:9"
+	us="$us,cbmc_memmove.0:65"
+	# PMSS and WSCALE are constants per job (the encode walks the index
+	# tables): sweep a small MSS (index 0), an exact table entry, and a
+	# large one (top index); with no window scale, and with a scale that
+	# hits a middle and the top table entry.
+	proof syncookie_rt_small "$h" "$s" proof_roundtrip \
+	    "-DINET -DINET6 -DPMSS=100 -DWSCALE=-1" "$us"
+	proof syncookie_rt_exact "$h" "$s" proof_roundtrip \
+	    "-DINET -DINET6 -DPMSS=1460 -DWSCALE=-1" "$us"
+	proof syncookie_rt_wscale "$h" "$s" proof_roundtrip \
+	    "-DINET -DINET6 -DPMSS=1200 -DWSCALE=4" "$us"
+	proof syncookie_rt_big "$h" "$s" proof_roundtrip \
+	    "-DINET -DINET6 -DPMSS=65535 -DWSCALE=8" "$us"
+	dd="-DINET -DINET6 -DPMSS=1200 -DWSCALE=4"
+	# The MSS index packs into the cookie and unpacks to the same entry ...
+	mutant syncookie_mss "$h" "$s" proof_roundtrip "$dd" "$us" \
+	    '/^syncookie_generate(/,/^}/s/cookie.flags.mss_idx = i;/cookie.flags.mss_idx = i + 1;/'
+	# ... the SACK flag round-trips ...
+	mutant syncookie_sack "$h" "$s" proof_roundtrip "$dd" "$us" \
+	    '/^syncookie_expand(/,/^}/s/if (cookie.flags.sack_ok)/if (0)/'
+	# ... the window scale round-trips.
+	mutant syncookie_wscale "$h" "$s" proof_roundtrip "$dd" "$us" \
+	    '/^syncookie_generate(/,/^}/s/cookie.flags.wscale_idx = i;/cookie.flags.wscale_idx = i + 1;/'
 fi
 
 if want ktls; then

@@ -635,6 +635,30 @@ past the user buffer.  Mutants `recvit_ctlbuf`, `recvit_report` and
 `recvit_ctrunc` take the destination advance, the reported length and the
 truncation flag back.  No bug found.
 
+## TCP SYN cookie: what is proven
+
+Harness `syncache/syncookie.c`, for the SYN cookie of
+`sys/netinet/tcp_syncache.c`: `syncookie_generate()` packs a connection's
+MSS, window scale and SACK state plus a MAC into the 32-bit initial
+sequence number of a SYN-ACK, and `syncookie_expand()` unpacks the ACK the
+peer echoes, checks the MAC and restores those values.  The pair must
+round-trip:
+
+- a cookie this host generated decodes to the same MSS table entry, the
+  same window-scale table entry, and the same SACK flag.
+
+The 3-bit `mss_idx` and `wscale_idx` index the eight-entry `tcp_sc_msstab`
+and `tcp_sc_wstab`, so the decode is in bounds by construction, which CBMC
+also checks.  `syncookie_mac()` (SIPHASH, a byte loop) is replaced by a
+deterministic, multiplier-free model: the round-trip then turns only on
+the kernel's own bit packing, which is what is proven, and the SAT back
+end stays fast.  Mutants `syncookie_mss`, `syncookie_wscale` and
+`syncookie_sack` take the index packing and the SACK flag back.  The MSS
+and window scale are constants per job (the encode walks the index
+tables), the jobs sweeping the table boundaries.  Not proven here: that a
+forged ACK is rejected, which rests on the MAC's collision resistance, not
+on this code's packing.  No bug found.
+
 ## How it works
 
 - The harness `#include`s the kernel source whole: the code proven is
