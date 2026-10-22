@@ -206,7 +206,8 @@ for f in $(sed -n 's/^#include "\(opt_[a-z0-9_]*\.h\)"/\1/p' \
     "$top/sys/vm/vnode_pager.c" "$top/sys/kern/uipc_syscalls.c" \
     "$top/sys/kern/kern_event.c" "$top/sys/kern/kern_descrip.c" \
     "$top/sys/kern/uipc_usrreq.c" "$top/sys/netinet/tcp_input.c" \
-    "$top/sys/kern/kern_exec.c" "$top/sys/netinet/tcp_syncache.c"); do
+    "$top/sys/kern/kern_exec.c" "$top/sys/netinet/tcp_syncache.c" \
+    "$top/sys/netinet/ip_options.c"); do
 	: >"$work/inc/$f"
 done
 
@@ -1465,6 +1466,39 @@ if want mbuf; then
 	# ... and the split mbuf keeps exactly the bytes before the offset.
 	mutant msplit_mlen "$h" "$s" proof_split "-DGEO=0" "$ut" \
 	    '/^m_split(/,/^}/s/m->m_len = len;/m->m_len = len + 1;/'
+fi
+
+if want ip; then
+	# ip_dooptions(), sys/netinet/ip_options.c: the IPv4 options parser run
+	# on every received packet carrying options.  It walks the option area
+	# trusting each option's length byte, and for record-route and
+	# timestamp options reads and writes at an attacker-influenced pointer
+	# into the option area.  Every access stays within the option area; the
+	# length and pointer checks in the loop are the guard.  The packet is a
+	# struct ip plus OPTLEN nondeterministic option bytes in one object, so
+	# a read or write past it is an out-of-bounds access.  OPTLEN is a
+	# constant per job (a symbolic length ran past the time budget); the
+	# jobs sweep a few option-area sizes covering the record-route and
+	# timestamp layouts.
+	h="$here/ip/ip_options.c"
+	s="$top/sys/netinet/ip_options.c"
+	ui="ip_dooptions.0:41,ip_dooptions.1:41,ip_dooptions.2:41,ip_dooptions.3:41"
+	ui="$ui,save_rte.0:41,cbmc_memmove.0:41,proof_dooptions.0:41"
+	# OPTLEN sweeps the option-area size: 4 the minimum, 8 and 12 reaching
+	# the record-route and timestamp opcodes.  (The full 40-byte area is
+	# not swept: a 40-byte symbolic option stream runs the parser past the
+	# time budget, and 12 already exercises every opcode and guard.)
+	for n in 4 8 12; do
+		proof ip_dooptions_$n "$h" "$s" proof_dooptions \
+		    "-DINET -DOPTLEN=$n" "$ui"
+	done
+	# The option length is checked not to run past the remaining bytes:
+	# dropping the optlen > cnt check lets the walk step past the area ...
+	mutant ip_optlen "$h" "$s" proof_dooptions "-DINET -DOPTLEN=12" "$ui" \
+	    '/^ip_dooptions(/,/^}/s/if (optlen < IPOPT_OLEN + sizeof(\*cp) || optlen > cnt) {/if (optlen < IPOPT_OLEN + sizeof(*cp)) {/'
+	# ... the record-route pointer is checked against the option length.
+	mutant ip_rroff "$h" "$s" proof_dooptions "-DINET -DOPTLEN=12" "$ui" \
+	    '/case IPOPT_RR:/,/case IPOPT_TS:/s/if (off > optlen - (int)sizeof(struct in_addr))/if (0)/'
 fi
 
 if want ktls; then
