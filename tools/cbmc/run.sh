@@ -1444,6 +1444,27 @@ if want mbuf; then
 	# whose large-offset bounds check is too slow to run here.)
 	mutant mpullup_early "$h" "$s" proof_pullup "-DGEO=1" "$uu" \
 	    '/^m_pullup(/,/^}/s/if (n->m_len >= len)/if (1)/'
+
+	# m_split(), same file: split a chain in two at byte offset len0,
+	# returning the tail.  The plain path (no M_PKTHDR, no external
+	# storage) copies the split mbuf's tail bytes into a fresh mbuf and
+	# divides the lengths exactly.  The copy stays inside both mbufs and
+	# len + remain equals the original length.  Real struct mbufs, so the
+	# storage and M_ALIGN placement are the kernel's; a copy past a mbuf is
+	# an out-of-bounds access.  GEO: split inside the first mbuf, at a mbuf
+	# boundary (remain == 0), and inside a later mbuf.
+	h="$here/mbuf/m_split.c"
+	ut="m_split.0:5,m_split.1:5,proof_split.0:5,proof_split.1:5"
+	ut="$ut,proof_split.2:5,proof_split.3:9,cbmc_memmove.0:65"
+	for g in 0 1 2; do
+		proof msplit_geo$g "$h" "$s" proof_split "-DGEO=$g" "$ut"
+	done
+	# The tail length is the bytes after the offset (m_len - len) ...
+	mutant msplit_remain "$h" "$s" proof_split "-DGEO=0" "$ut" \
+	    '/^m_split(/,/^}/s/remain = m->m_len - len;/remain = m->m_len - len + 1;/'
+	# ... and the split mbuf keeps exactly the bytes before the offset.
+	mutant msplit_mlen "$h" "$s" proof_split "-DGEO=0" "$ut" \
+	    '/^m_split(/,/^}/s/m->m_len = len;/m->m_len = len + 1;/'
 fi
 
 if want ktls; then

@@ -727,6 +727,26 @@ free-space cap on the gather count is exercised by the proofs but not
 mutation-checked: forcing the overshoot needs a head filled to the `MLEN`
 tail, whose large-offset bounds check is too slow to run.  No bug found.
 
+Harness `mbuf/m_split.c`, for `m_split()`, same file: split a chain in two
+at byte offset `len0`, returning the tail.  This covers the plain path (no
+`M_PKTHDR`, no external storage): the split mbuf's tail bytes are copied
+into a fresh mbuf and the lengths divided.  Real `struct mbuf`s, so the
+storage and the `M_ALIGN` placement are the kernel's.  Proven:
+
+- the tail copy stays inside the split mbuf and the fresh mbuf.
+- the split mbuf keeps exactly the bytes before the offset, the tail holds
+  those after, and the two sum to the original (no byte lost or
+  duplicated).
+- no `m_len` exceeds its storage.
+
+The mutants `msplit_remain` (tail one byte too long) and `msplit_mlen`
+(split mbuf one byte too long) are caught by those exact-division
+assertions.  Geometry is a constant per job: a split inside the first
+mbuf, at a mbuf boundary (`remain == 0`), and inside a later mbuf.  The
+`M_PKTHDR` and external-storage branches (`mb_dupcl`, the send-tag
+reference, the recursive `remain > MHLEN` case) are a separate, heavier
+proof and not covered here.  No bug found.
+
 ## How it works
 
 - The harness `#include`s the kernel source whole: the code proven is
