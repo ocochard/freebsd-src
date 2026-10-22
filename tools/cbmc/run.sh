@@ -75,6 +75,8 @@ replace_close="_fdrop:cbmc_fdrop
 replace_unp="unp_internalize_fp:cbmc_unp_internalize_fp
 	unp_externalize_fp:cbmc_unp_externalize_fp
 	unp_discard:cbmc_unp_discard"
+replace_recvmsg="getsock:cbmc_getsock
+	m_dispose_extcontrolm:cbmc_dispose"
 replace_ktls="ktls_buffer_alloc:cbmc_ktls_buffer_alloc
 	ktls_drop:cbmc_ktls_drop
 	ktls_destroy:cbmc_ktls_destroy"
@@ -1285,6 +1287,39 @@ if want exec; then
 	# ... a copy too long for the budget is E2BIG, not a different error.
 	mutant exec_args_e2big "$h" "$s" proof_exec_args "$db -DNADD=2" "$ue" \
 	    '/^exec_args_add_str(/,/^}/s/return (error == ENAMETOOLONG ? E2BIG : error);/return (error);/'
+fi
+
+if want recvmsg; then
+	# The control-message copy-out of recvmsg(2), sys/kern/uipc_syscalls.c:
+	# kern_recvit() copies the control mbuf chain out to the user's
+	# msg_control buffer one mbuf at a time while they fit, accumulating
+	# msg_controllen and flagging MSG_CTRUNC on overflow.  The copy never
+	# runs past the user buffer, the reported length is the bytes copied,
+	# and truncation is flagged iff the chain does not all fit.  The user
+	# buffer is sized to CLEN, so an overrun is an out-of-bounds write.
+	# The chain is up to NMBUF mbufs of any length; getsock(), soreceive()
+	# and the leftover-chain dispose are modelled.
+	h="$here/recvmsg/recvmsg.c"
+	s="$top/sys/kern/uipc_syscalls.c"
+	ur="kern_recvit.0:1,kern_recvit.1:4,soreceive.0:4,m_freem.0:4"
+	ur="$ur,cbmc_memmove.0:65"
+	dr="-DINET -DINET6 -DNMBUF=3"
+	for c in 0 32 64 128; do
+		proof recvit_$c "$h" "$s" proof_recvit "$dr -DCLEN=$c" "$ur"
+	done
+	dc="$dr -DCLEN=64"
+	# Each mbuf copied out advances the user pointer ...
+	mutant recvit_ctlbuf "$h" "$s" proof_recvit "$dc" "$ur" \
+	    '/if (mp->msg_control \&\& controlp == NULL) {/,/^	}/s/ctlbuf += m->m_len;/;/'
+	# ... and shrinks the remaining room, so a later mbuf cannot overrun ...
+	mutant recvit_len "$h" "$s" proof_recvit "$dc" "$ur" \
+	    '/if (mp->msg_control \&\& controlp == NULL) {/,/^	}/s/len -= m->m_len;/;/'
+	# ... the reported length is the bytes copied ...
+	mutant recvit_report "$h" "$s" proof_recvit "$dc" "$ur" \
+	    '/if (mp->msg_control \&\& controlp == NULL) {/,/^	}/s/mp->msg_controllen += m->m_len;/;/'
+	# ... and a chain that does not fit is flagged truncated.
+	mutant recvit_ctrunc "$h" "$s" proof_recvit "$dc" "$ur" \
+	    '/if (m != NULL) {/,/m_dispose_extcontrolm(m);/s/mp->msg_flags |= MSG_CTRUNC;/;/'
 fi
 
 if want ktls; then
