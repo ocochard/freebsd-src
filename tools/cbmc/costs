@@ -437,6 +437,13 @@ sooptcopyout_full 2 102
 sooptcopyout_over 2 102
 sooptcopyout_report 2 102
 sooptcopyout_short 2 102
+syncookie_mss 1 102
+syncookie_rt_big 1 101
+syncookie_rt_exact 1 102
+syncookie_rt_small 1 102
+syncookie_rt_wscale 1 102
+syncookie_sack 1 102
+syncookie_wscale 1 102
 tcp_dooptions_10 12 450
 tcp_dooptions_18 117 624
 tcp_dooptions_2 7 444
