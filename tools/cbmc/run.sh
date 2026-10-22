@@ -1392,6 +1392,34 @@ if want mbuf; then
 	# and blow up the count.
 	mutant mcopydata_skip "$h" "$s" proof_copydata "-DGEO=4" "$um" \
 	    '/^m_copydata(/,/^}/s/off -= m->m_len;/;/'
+
+	# m_copyback(), same file: write len bytes at off into an mbuf chain,
+	# growing a mbuf into its trailing room and allocating new mbufs when
+	# off or len runs past the end.  Every write stays inside a mbuf's
+	# storage, a mbuf grows only within its trailing room, and a failed
+	# allocation stops without a write past the end.  The chain is real
+	# struct mbufs, so the storage bounds and M_TRAILINGSPACE are the
+	# kernel's; a write past m_dat is an out-of-bounds write.  GEO is a
+	# concrete geometry per job: a write inside the mbuf, one growing it
+	# into trailing room, one allocating past the end, one skipping past
+	# the end.
+	h="$here/mbuf/m_copyback.c"
+	ub="m_copyback.0:5,m_copyback.1:5,proof_copyback.0:13,proof_copyback.1:13"
+	ub="$ub,cbmc_memmove.0:65"
+	for g in 0 1 2 3 4; do
+		proof mcopyback_geo$g "$h" "$s" proof_copyback "-DGEO=$g" "$ub"
+	done
+	# The mbuf grows only within its trailing room: capping by a huge
+	# value instead of M_TRAILINGSPACE lets m_len grow past the storage.
+	# GEO 4 puts the mbuf one short of MLEN with a larger write, so the
+	# shortfall exceeds the trailing room and the cap binds; the mutant
+	# then leaves m_len > M_SIZE(m), caught by the post-walk invariant and
+	# by the write that follows.
+	mutant mcopyback_grow "$h" "$s" proof_copyback "-DGEO=4" "$ub" \
+	    '/^m_copyback(/,/^}/s/M_TRAILINGSPACE(m));/65535);/'
+	# ... the per-mbuf write count stays within the mbuf (m_len - off).
+	mutant mcopyback_count "$h" "$s" proof_copyback "-DGEO=4" "$ub" \
+	    '/^m_copyback(/,/^}/s/mlen = min (m->m_len - off, len);/mlen = len;/'
 fi
 
 if want ktls; then
