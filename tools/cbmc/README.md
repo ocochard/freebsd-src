@@ -798,6 +798,23 @@ the per-CPU stat macros are compiled out.  This is the reassembly-overlap
 accounting the whole-function `frag6_input()` could not supply tractably
 (it is too large for the solver even with concrete input).  No bug found.
 
+Harness `tcp/reass_fwd.c`, for `tcp_reass_merge_forward()`, same file: once
+a segment `ent` is in the queue, this walks the segments after it and
+coalesces every one `ent` overlaps forward -- freeing a segment `ent` fully
+covers, trimming a partially overlapping one and merging it in.  This is
+the multi-segment overlap resolution (the fragment-overlap bug class).  A
+queue of `ent` plus a few successors of a concrete per-job geometry is
+built (a symbolic queue's overlap combinatorics blow up):
+
+- afterwards `ent` spans exactly up to the furthest merged end, the overlap
+  trimmed exactly, so no sequence-space byte is double-counted or lost.
+- no following segment still overlaps `ent`, and the queue stays sorted.
+
+The mutant `reass_fwdtrim` (trimming one byte too few) and `reass_fwdconsume`
+(not consuming a fully covered segment) are caught by `ent`'s span no longer
+matching the expected merged end.  The geometries sweep a gap (no overlap),
+a partial trim, a full consume, and two successors.  No bug found.
+
 ## How it works
 
 - The harness `#include`s the kernel source whole: the code proven is
