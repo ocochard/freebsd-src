@@ -747,6 +747,33 @@ mbuf, at a mbuf boundary (`remain == 0`), and inside a later mbuf.  The
 reference, the recursive `remain > MHLEN` case) are a separate, heavier
 proof and not covered here.  No bug found.
 
+## IPv4 options: what is proven
+
+Harness `ip/ip_options.c`, for `ip_dooptions()`, `sys/netinet/ip_options.c`:
+the IPv4 options parser run on every received packet that carries options.
+It walks the option area, trusting each option's length byte and advancing
+by it, and for the record-route and timestamp options reads and writes at
+an attacker-influenced pointer (`off`) into the option area.  The packet
+is a `struct ip` followed by `OPTLEN` nondeterministic option bytes in one
+object, so every `cp[...]` read and every `memcpy(cp + off, ...)` write is
+bounds-checked against it:
+
+- a length byte that would step the walk past the option area, and a
+  record-route or timestamp pointer that would index past it, are refused
+  by the loop's length and pointer checks.
+- every option access stays within the option area, whatever opcodes,
+  lengths and pointers the bytes encode.
+
+The mutants `ip_optlen` (dropping the `optlen > cnt` check) and `ip_rroff`
+(dropping the record-route pointer bound) are each caught by an
+out-of-bounds write.  The interface, route and ICMP helpers the opcodes
+reach are modelled; the route lookup returns a `struct in_ifaddr` as the
+real nhop guarantees (a modelling gap there first showed a spurious
+overread, since fixed).  `OPTLEN` is a constant per job (a symbolic length
+ran the parser past the time budget); the jobs sweep the minimum and sizes
+reaching the record-route and timestamp opcodes, up to 12 bytes -- the
+full 40-byte area is too slow and adds no opcode.  No bug found.
+
 ## How it works
 
 - The harness `#include`s the kernel source whole: the code proven is
