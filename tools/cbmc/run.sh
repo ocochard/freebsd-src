@@ -1361,6 +1361,39 @@ if want syncache; then
 	    '/^syncookie_generate(/,/^}/s/cookie.flags.wscale_idx = i;/cookie.flags.wscale_idx = i + 1;/'
 fi
 
+if want mbuf; then
+	# m_copydata(), sys/kern/uipc_mbuf.c: copy len bytes from offset off
+	# of an mbuf chain into a flat buffer, used all over the stack to pull
+	# packet bytes out of a chain.  Under the caller's contract (off, len
+	# >= 0 and off + len within the chain) every per-mbuf read stays
+	# inside that mbuf's data and exactly len bytes are delivered.  Each
+	# mbuf's data is sized to its m_len, so a read past a mbuf is an
+	# out-of-bounds read.  off and len are constants per job, the chain
+	# lengths symbolic within them; the jobs sweep a zero offset, an
+	# offset mid-mbuf, and one spanning several mbufs.
+	h="$here/mbuf/m_copydata.c"
+	s="$top/sys/kern/uipc_mbuf.c"
+	um="m_copydata.0:5,m_copydata.1:5,m_copydata.2:5,m_copydata.3:5"
+	um="$um,m_copydata.4:5,m_copydata.5:5"
+	um="$um,proof_copydata.0:5,proof_copydata.1:11,cbmc_memmove.0:9"
+	# GEO is a concrete chain geometry per job (a symbolic chain's split
+	# combinatorics blow up): 0 a copy inside the first mbuf, 1 a copy
+	# starting mid-mbuf, 2 a copy spanning three mbufs, 3 an empty copy at
+	# a boundary.
+	for g in 0 1 2 3 4; do
+		proof mcopydata_geo$g "$h" "$s" proof_copydata "-DGEO=$g" "$um"
+	done
+	# The per-mbuf copy count stays within the mbuf (m_len - off): copying
+	# the whole remaining len from a shorter mbuf reads past it ...
+	mutant mcopydata_count "$h" "$s" proof_copydata "-DGEO=2" "$um" \
+	    '/^m_copydata(/,/^}/s/count = min(m->m_len - off, len);/count = len;/'
+	# ... and the skip loop that charges off against each mbuf keeps off
+	# bounded (GEO 4 skips two mbufs), so m_len - off cannot go negative
+	# and blow up the count.
+	mutant mcopydata_skip "$h" "$s" proof_copydata "-DGEO=4" "$um" \
+	    '/^m_copydata(/,/^}/s/off -= m->m_len;/;/'
+fi
+
 if want ktls; then
 	proof ktls_frame "$h" "$s" proof_frame "$dk" "$uk"
 	proof ktls_enqueue "$h" "$s" proof_enqueue "$dk" "$uk"
