@@ -706,6 +706,27 @@ at the `MLEN` tail so the trailing-room cap binds.  Geometry is a constant
 per job (a write inside the mbuf, one growing it into trailing room, two
 allocating past the end, and the tail case).  No bug found.
 
+Harness `mbuf/m_pullup.c`, for `m_pullup()`, same file: rearrange a chain
+so its first `len` bytes are contiguous in the head, gathering them from
+the following mbufs.  Every protocol parser calls it then reads `len`
+bytes from the head, so the contract is load-bearing.  The chain is real
+`struct mbuf`s (heap allocated, so `m_pullup()`'s `m_free()` of a consumed
+mbuf is valid), `m_get()` goes through the UMA model (which may fail), and
+`m_freem()` is modelled.  Proven:
+
+- the gather stays within the head mbuf's storage and within each source
+  mbuf, and no `m_len` ever exceeds `M_SIZE(m)`.
+- on a non-NULL return the head holds at least `len` contiguous bytes.
+- a request past `MHLEN` on the allocate path fails cleanly (`NULL`).
+
+The mutant `mpullup_early`, which takes the "already contiguous" shortcut
+unconditionally, is caught by the head then holding fewer than `len`
+bytes.  Geometry is a constant per job: a pull already contiguous, a
+two-mbuf pull in place, a three-mbuf gather, and a `> MHLEN` request.  The
+free-space cap on the gather count is exercised by the proofs but not
+mutation-checked: forcing the overshoot needs a head filled to the `MLEN`
+tail, whose large-offset bounds check is too slow to run.  No bug found.
+
 ## How it works
 
 - The harness `#include`s the kernel source whole: the code proven is

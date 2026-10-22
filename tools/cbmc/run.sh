@@ -1420,6 +1420,30 @@ if want mbuf; then
 	# ... the per-mbuf write count stays within the mbuf (m_len - off).
 	mutant mcopyback_count "$h" "$s" proof_copyback "-DGEO=4" "$ub" \
 	    '/^m_copyback(/,/^}/s/mlen = min (m->m_len - off, len);/mlen = len;/'
+
+	# m_pullup(), same file: rearrange a chain so its first len bytes are
+	# contiguous in the head, gathering them from the following mbufs.
+	# Every protocol parser calls it then reads len bytes from the head,
+	# so on a non-NULL return the head holds at least len contiguous
+	# bytes, and the gather never writes past the head's storage nor reads
+	# past a source mbuf.  The chain is real struct mbufs, so the storage
+	# bounds are the kernel's; a gather past the head is an out-of-bounds
+	# write.  GEO is a concrete geometry: a pull already contiguous, a
+	# two-mbuf pull in place, a three-mbuf gather, and a > MHLEN request
+	# that must fail cleanly.
+	h="$here/mbuf/m_pullup.c"
+	uu="m_pullup.0:5,m_pullup.1:5,m_pullup.2:5,proof_pullup.0:9"
+	uu="$uu,proof_pullup.1:9,proof_pullup.2:9,m_freem.0:9,cbmc_memmove.0:65"
+	for g in 0 1 2 3; do
+		proof mpullup_geo$g "$h" "$s" proof_pullup "-DGEO=$g" "$uu"
+	done
+	# A pull shorter than len is not reported contiguous: the early-return
+	# shortcut fires only when the head already holds len.  (The free-space
+	# cap on the gather count is exercised by the proofs; a mutant forcing
+	# the overshoot needs a geometry filling the head to the MLEN tail,
+	# whose large-offset bounds check is too slow to run here.)
+	mutant mpullup_early "$h" "$s" proof_pullup "-DGEO=1" "$uu" \
+	    '/^m_pullup(/,/^}/s/if (n->m_len >= len)/if (1)/'
 fi
 
 if want ktls; then
