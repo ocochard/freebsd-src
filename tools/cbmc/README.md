@@ -774,6 +774,30 @@ ran the parser past the time budget); the jobs sweep the minimum and sizes
 reaching the record-route and timestamp opcodes, up to 12 bytes -- the
 full 40-byte area is too slow and adds no opcode.  No bug found.
 
+## TCP reassembly accounting: what is proven
+
+Harness `tcp/reass.c`, for the reassembly helpers of
+`sys/netinet/tcp_reass.c`: `tcp_reass_prepend()`, which splices a new
+segment in front of a queued out-of-order segment and trims the overlap,
+and `tcp_reass_append()`, which tacks one onto the end.  Each maintains a
+queued segment's `(tqe_start, tqe_len)` over the TCP sequence space; a
+wrong trim double-counts or loses bytes.  The sequence numbers and lengths
+are symbolic, bounded so the trim arithmetic cannot wrap:
+
+- after a prepend the segment starts at the new sequence and still ends
+  where the two together reach -- the overlap is trimmed exactly once, so
+  no byte of the sequence space is double-counted or lost.
+- after an append the segment's length grew by exactly the appended length
+  and its start is unchanged.
+
+The mutants `reass_trimlen` (dropping the length trim) and `reass_overlap`
+(trimming one byte too few) are caught by the end no longer being
+preserved, and `reass_appendlen` by the length not growing fully.  `m_adj()`
+is modelled (it only trims the mbuf, which the accounting does not read);
+the per-CPU stat macros are compiled out.  This is the reassembly-overlap
+accounting the whole-function `frag6_input()` could not supply tractably
+(it is too large for the solver even with concrete input).  No bug found.
+
 ## How it works
 
 - The harness `#include`s the kernel source whole: the code proven is

@@ -1501,6 +1501,36 @@ if want ip; then
 	    '/case IPOPT_RR:/,/case IPOPT_TS:/s/if (off > optlen - (int)sizeof(struct in_addr))/if (0)/'
 fi
 
+if want reass; then
+	# The TCP reassembly accounting helpers, sys/netinet/tcp_reass.c:
+	# tcp_reass_prepend() splices a new segment in front of a queued
+	# out-of-order segment and trims the overlap, and tcp_reass_append()
+	# tacks one onto the end.  They maintain each segment's (start, len)
+	# over the sequence space; a wrong trim double-counts or loses bytes.
+	# Prepend starts the segment at the new sequence and preserves its end
+	# (overlap trimmed once); append grows the length by exactly the
+	# appended length.  m_adj() is modelled; the stat macros are compiled
+	# out.  Sequence numbers and lengths are symbolic, bounded so the trim
+	# cannot wrap.
+	h="$here/tcp/reass.c"
+	s="$top/sys/netinet/tcp_reass.c"
+	dr="-DINET -DINET6 -DTCPSTAT_ADD(n,v)= -DTCPSTAT_INC(n)= "
+	proof reass_prepend "$h" "$s" proof_prepend "$dr" ""
+	proof reass_append "$h" "$s" proof_append "$dr" ""
+	# The overlap length trim is load-bearing: dropping it overcounts the
+	# combined length so the segment's end moves past where the data reaches
+	# ...
+	mutant reass_trimlen "$h" "$s" proof_prepend "$dr" "" \
+	    '/^tcp_reass_prepend(/,/^}/s/first->tqe_len -= i;/;/'
+	# ... and the overlap amount must be the full excess (th_seq + tlen -
+	# start), not less, or the trim leaves bytes double-counted.
+	mutant reass_overlap "$h" "$s" proof_prepend "$dr" "" \
+	    '/^tcp_reass_prepend(/,/^}/s/i = (th->th_seq + tlen) - first->tqe_start;/i = (th->th_seq + tlen) - first->tqe_start - 1;/'
+	# append must add the whole appended length.
+	mutant reass_appendlen "$h" "$s" proof_append "$dr" "" \
+	    '/^tcp_reass_append(/,/^}/s/last->tqe_len += tlen;/last->tqe_len += tlen - 1;/'
+fi
+
 if want ktls; then
 	proof ktls_frame "$h" "$s" proof_frame "$dk" "$uk"
 	proof ktls_enqueue "$h" "$s" proof_enqueue "$dk" "$uk"
