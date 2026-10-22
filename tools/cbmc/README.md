@@ -612,6 +612,29 @@ that runs the solver out of memory).  `copyinstr()` is modelled to return
 a length no greater than the room it was given, as `copyinstr(9)`
 guarantees.  No bug found.
 
+## recvmsg(2): what is proven
+
+Harness `recvmsg/recvmsg.c`, for the control-message copy-out of
+`recvmsg(2)`, `sys/kern/uipc_syscalls.c`: `kern_recvit()` takes a chain of
+control mbufs from `soreceive()` and copies them out to the user's
+`msg_control` buffer one mbuf at a time while they fit, accumulating
+`msg_controllen` and flagging `MSG_CTRUNC` when the chain does not fit.  A
+chain of up to `NMBUF` mbufs of any length against a user buffer of `CLEN`
+bytes, with the work before the loop modelled away (`getsock()` returns a
+file, `soreceive()` the chain and no address, an empty iovec list):
+
+- each mbuf is copied out only while it still fits, right after the
+  previous one, and the copy never runs past the user buffer.
+- `msg_controllen` is the exact number of bytes copied out.
+- `MSG_CTRUNC` is set iff the chain did not all fit.
+
+The user buffer is a CBMC object of exactly `CLEN` bytes, so the loop's
+`len >= m->m_len` guard is load-bearing: the mutant `recvit_len`, which
+drops the remaining-room decrement, is caught by an out-of-bounds write
+past the user buffer.  Mutants `recvit_ctlbuf`, `recvit_report` and
+`recvit_ctrunc` take the destination advance, the reported length and the
+truncation flag back.  No bug found.
+
 ## How it works
 
 - The harness `#include`s the kernel source whole: the code proven is

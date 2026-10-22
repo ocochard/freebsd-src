@@ -322,6 +322,14 @@ pager_trim 49 1450
 pager_ufs_4096 51 1445
 pager_ufs_8192 47 1450
 pager_valid 41 1376
+recvit_0 3 153
+recvit_128 13 657
+recvit_32 10 446
+recvit_64 14 663
+recvit_ctlbuf 3 265
+recvit_ctrunc 11 663
+recvit_len 10 663
+recvit_report 15 663
 sack_delivered 901 17316
 sack_doack_0 0 100
 sack_doack_2 128 11092
