@@ -1529,6 +1529,32 @@ if want reass; then
 	# append must add the whole appended length.
 	mutant reass_appendlen "$h" "$s" proof_append "$dr" "" \
 	    '/^tcp_reass_append(/,/^}/s/last->tqe_len += tlen;/last->tqe_len += tlen - 1;/'
+
+	# tcp_reass_merge_forward(), same file: coalesce every segment after ent
+	# that ent overlaps forward, freeing a fully-covered one and trimming a
+	# partially overlapping one before merging it.  Afterwards no following
+	# segment overlaps ent and the queue stays sorted.  GEO is a concrete
+	# queue geometry per job (a symbolic queue's overlap combinatorics blow
+	# up): a gap, a partial-overlap trim, a full consume, and two segments.
+	hf="$here/tcp/reass_fwd.c"
+	uw="tcp_reass_merge_forward.0:9,tcp_reass_merge_forward.1:9"
+	uw="$uw,tcp_reass_merge_forward.2:9,tcp_reass_merge_forward.3:9"
+	uw="$uw,tcp_reass_merge_forward.4:9,tcp_reass_merge_forward.5:9"
+	uw="$uw,proof_merge_fwd.0:9,proof_merge_fwd.1:9,proof_merge_fwd.2:9"
+	uw="$uw,proof_merge_fwd.3:9,proof_merge_fwd.4:9,proof_merge_fwd.5:9"
+	uw="$uw,proof_merge_fwd.6:9,proof_merge_fwd.7:9,proof_merge_fwd.8:9"
+	uw="$uw,proof_merge_fwd.9:9,proof_merge_fwd.10:9,proof_merge_fwd.11:9"
+	uw="$uw,cbmc_memmove.0:41"
+	for g in 0 1 2 3; do
+		proof reass_fwd_geo$g "$hf" "$s" proof_merge_fwd "$dr -DGEO=$g" "$uw"
+	done
+	# The forward trim amount is the overlap (max - q->tqe_start): a short
+	# trim leaves q still overlapping ent after the merge.
+	mutant reass_fwdtrim "$hf" "$s" proof_merge_fwd "$dr -DGEO=1" "$uw" \
+	    '/^tcp_reass_merge_forward(/,/^}/s/i = max - q->tqe_start;/i = max - q->tqe_start - 1;/'
+	# A segment ent fully covers is consumed, not left in the queue.
+	mutant reass_fwdconsume "$hf" "$s" proof_merge_fwd "$dr -DGEO=2" "$uw" \
+	    '/^tcp_reass_merge_forward(/,/^}/s/if (SEQ_GEQ(max, (q->tqe_start + q->tqe_len))) {/if (0) {/'
 fi
 
 if want ktls; then
