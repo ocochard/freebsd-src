@@ -815,6 +815,26 @@ The mutant `reass_fwdtrim` (trimming one byte too few) and `reass_fwdconsume`
 matching the expected merged end.  The geometries sweep a gap (no overlap),
 a partial trim, a full consume, and two successors.  No bug found.
 
+## sbcompress(): what is proven
+
+Harness `sockbuf/sbcompress.c`, for `sbcompress()`,
+`sys/kern/uipc_sockbuf.c`: appends an mbuf chain to a socket buffer's tail,
+coalescing a small mbuf into the previous one's trailing space when it
+fits, else linking it in.  Hit by every protocol's receive path.  The tail
+and appended mbufs are real `struct mbuf`s, so the storage bounds and
+`M_TRAILINGSPACE` are the kernel's; `sballoc()` runs for real.
+
+- the coalesce copy stays within the tail mbuf's storage.
+- `sb_ccc` grows by exactly the bytes appended, and the buffer's total
+  walked matches `sb_ccc`: no byte lost or double-counted.
+
+The mutant `sbcompress_room`, which drops the `m->m_len <=
+M_TRAILINGSPACE(n)` guard, is caught by an out-of-bounds write (in a
+geometry with the tail near `MLEN` so the trailing room is small), and
+`sbcompress_ccc`, which skips the byte-count update, by `sb_ccc` not
+matching.  Geometry is a constant per job: a coalescing appendee, a too-big
+one (linked), and two appendees.  No bug found.
+
 ## How it works
 
 - The harness `#include`s the kernel source whole: the code proven is
