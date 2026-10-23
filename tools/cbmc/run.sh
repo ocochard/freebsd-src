@@ -1557,6 +1557,30 @@ if want reass; then
 	    '/^tcp_reass_merge_forward(/,/^}/s/if (SEQ_GEQ(max, (q->tqe_start + q->tqe_len))) {/if (0) {/'
 fi
 
+if want sockbuf; then
+	# sbcompress(), sys/kern/uipc_sockbuf.c: append an mbuf chain to a socket
+	# buffer's tail, coalescing a small mbuf into the previous one's trailing
+	# space when it fits, else linking it in.  Hit by every protocol receive.
+	# The coalesce copy stays within the tail mbuf's storage and sb_ccc ends
+	# equal to the bytes in the buffer.  Real struct mbufs, so the storage
+	# bounds and M_TRAILINGSPACE are the kernel's; sballoc() runs for real.
+	# GEO is a concrete geometry per job: a coalescing appendee, a too-big
+	# one (linked), and two appendees.
+	h="$here/sockbuf/sbcompress.c"
+	s="$top/sys/kern/uipc_sockbuf.c"
+	usb="sbcompress.0:9,proof_sbcompress.0:9,proof_sbcompress.1:9,cbmc_memmove.0:260"
+	for g in 0 1 2; do
+		proof sbcompress_geo$g "$h" "$s" proof_sbcompress "-DGEO=$g" "$usb"
+	done
+	# The coalesce copies only when the mbuf fits the tail's trailing space:
+	# dropping that check copies past the tail ...
+	mutant sbcompress_room "$h" "$s" proof_sbcompress "-DGEO=1" "$usb" \
+	    '/^sbcompress(/,/^}/s/m->m_len <= M_TRAILINGSPACE(n) &&/1 \&\&/'
+	# ... and every coalesced mbuf's bytes are added to sb_ccc.
+	mutant sbcompress_ccc "$h" "$s" proof_sbcompress "-DGEO=0" "$usb" \
+	    '/^sbcompress(/,/^}/s/sb->sb_ccc += m->m_len;/;/'
+fi
+
 if want ktls; then
 	proof ktls_frame "$h" "$s" proof_frame "$dk" "$uk"
 	proof ktls_enqueue "$h" "$s" proof_enqueue "$dk" "$uk"

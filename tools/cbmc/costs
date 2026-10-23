@@ -375,6 +375,11 @@ sack_doack_0 0 100
 sack_doack_2 128 11092
 sack_holebytes 902 17298
 sack_movestart 902 17287
+sbcompress_ccc 227 109
+sbcompress_geo0 277 119
+sbcompress_geo1 203 96
+sbcompress_geo2 276 120
+sbcompress_room 838 1493
 sendfile_busy_double 1500 39581
 sendfile_busy_iodone 1563 40769
 sendfile_busy_skip 1594 40700
