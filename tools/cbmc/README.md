@@ -469,6 +469,26 @@ Memory safety and every `KASSERT()` hold on both.  Mutants
 (`sack_delivered`, `sack_holebytes`, `sack_movestart`) take the trim
 accounting back.
 
+Harness `tcp/sack_list.c`, for `tcp_update_sack_list()`, same file: the
+receiver's SACK-block list maintenance, which merges a received range into
+the ordered `sackblks[]` list, capped at `MAX_SACK_BLKS`.  A starting list
+of 0..`MAX_SACK_BLKS` well-formed blocks (non-empty, ordered,
+non-overlapping, above `rcv_nxt`) and a received range are
+nondeterministic.  Proven, for the reachable contract (a non-empty range,
+`rcv_start < rcv_end`, as all callers pass): after the call `rcv_numsacks`
+stays within `MAX_SACK_BLKS` and no `sackblks[]` write runs past the array.
+The mutant `sack_list_cap`, dropping the `num_saved >= MAX_SACK_BLKS` cap,
+is caught by the count overflowing.
+
+Flagged, not a bug today: on a *zero-length* range (`rcv_start ==
+rcv_end`), the cap is skipped (it sits inside the `SEQ_LT(rcv_start,
+rcv_end)` branch), and a full list can leave `rcv_numsacks ==
+MAX_SACK_BLKS + 1` with the copy-back writing one block past `sackblks[]`.
+No in-tree caller passes a zero-length range (all pass `todrop`/`save_tlen
+> 0` or an existing block's start..end), so the path is dead; it is a
+latent defect in the function's own zero-length handling, sent to the
+maintainers as a question.
+
 Not covered, for want of memory on this host: the whole-hole-removal,
 back-trim, hole-split and new-hole-at-tail geometries (the sweep walks
 more holes/blocks than fits), and the fully symbolic sequence space.  The
