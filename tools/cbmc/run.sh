@@ -1121,6 +1121,20 @@ if want tcp; then
 	mutant sack_movestart "$hk" "$sk" proof_sack_doack "-DINET -DINET6 -DGEO=2" \
 	    "$us" '/^tcp_sack_doack(/,/^}/s/cur->start = sblkp->end;/cur->start = sblkp->start;/'
 
+	# tcp_update_sack_list(), same file: the receiver's SACK-block list
+	# maintenance.  A received range is merged into the ordered sackblks[]
+	# list, capped at MAX_SACK_BLKS.  The array bound is the security
+	# property (the receiver-side SACK-overflow class): rcv_numsacks never
+	# exceeds MAX_SACK_BLKS and no sackblks[] write runs past the array.
+	# The starting list and the received range are nondeterministic.
+	hl="$here/tcp/sack_list.c"
+	ul="tcp_update_sack_list.0:7,tcp_update_sack_list.1:7,proof_sack_list.0:7"
+	ul="$ul,cbmc_memmove.0:49"
+	proof sack_list "$hl" "$sk" proof_sack_list "-DINET -DINET6" "$ul"
+	# The MAX_SACK_BLKS cap on the saved blocks is load-bearing: dropping it
+	# lets the copy-back write past sackblks[].
+	mutant sack_list_cap "$hl" "$sk" proof_sack_list "-DINET -DINET6" "$ul" \
+	    '/^tcp_update_sack_list(/,/^}/s/if (num_saved >= MAX_SACK_BLKS)/if (0)/'
 fi
 
 if want read; then
