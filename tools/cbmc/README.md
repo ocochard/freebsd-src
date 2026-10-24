@@ -835,6 +835,25 @@ geometry with the tail near `MLEN` so the trailing room is small), and
 matching.  Geometry is a constant per job: a coalescing appendee, a too-big
 one (linked), and two appendees.  No bug found.
 
+Harness `sockbuf/sbappendaddr.c`, for `sbappendaddr_locked()`, same file:
+the datagram receive append used by UDP and Unix-domain datagram sockets.
+It assembles a record of (sockaddr, optional data) and puts it on the
+receive buffer if there is room.  The sockaddr-carrying mbuf is real, so
+the address bcopy is bounds-checked against its storage; `sballoc()` and
+the space check run for real.
+
+- a record whose length exceeds the buffer's space is refused, leaving the
+  byte count unchanged.
+- an accepted record grows `sb_ccc` by exactly the address plus data
+  length.
+- the address copy stays within its mbuf.
+
+The mutant `sbaddr_space`, which drops the `space > sbspace()` check, is
+caught by an over-sized record being accepted past the high-water.  The
+address and data lengths are a constant per job, bracketing the space bound:
+a record that fits, one that just overflows, and one with no data.  No bug
+found.
+
 ## How it works
 
 - The harness `#include`s the kernel source whole: the code proven is

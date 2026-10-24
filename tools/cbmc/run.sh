@@ -1579,6 +1579,25 @@ if want sockbuf; then
 	# ... and every coalesced mbuf's bytes are added to sb_ccc.
 	mutant sbcompress_ccc "$h" "$s" proof_sbcompress "-DGEO=0" "$usb" \
 	    '/^sbcompress(/,/^}/s/sb->sb_ccc += m->m_len;/;/'
+
+	# sbappendaddr_locked(), same file: the datagram receive append (UDP,
+	# Unix-domain datagram).  It assembles a (sockaddr, data) record and
+	# puts it on the receive buffer if there is room.  A record over the
+	# buffer's space is refused; an accepted one grows sb_ccc by exactly the
+	# record length; the sockaddr copy stays within its mbuf.  The address
+	# and data lengths are a constant per job, bracketing the space bound
+	# (HIWAT=64): a record that fits, one that just overflows, and one with
+	# no data.
+	a="$here/sockbuf/sbappendaddr.c"
+	ua="sbappendaddr_locked_internal.0:4,m_length.0:4,proof_addr.0:4"
+	ua="$ua,cbmc_memmove.0:40"
+	proof sbaddr_fit "$a" "$s" proof_addr "-DSALEN=16 -DDLEN=20 -DHIWAT=64" "$ua"
+	proof sbaddr_over "$a" "$s" proof_addr "-DSALEN=16 -DDLEN=60 -DHIWAT=64" "$ua"
+	proof sbaddr_nodata "$a" "$s" proof_addr "-DSALEN=16 -DDLEN=0 -DHIWAT=64" "$ua"
+	# The space check is load-bearing: dropping it accepts a record that
+	# does not fit (sb_ccc then exceeds the high-water) ...
+	mutant sbaddr_space "$a" "$s" proof_addr "-DSALEN=16 -DDLEN=60 -DHIWAT=64" "$ua" \
+	    '/^sbappendaddr_locked(/,/^}/s/if (space > sbspace(sb))/if (0)/'
 fi
 
 if want ktls; then
