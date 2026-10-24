@@ -854,6 +854,21 @@ address and data lengths are a constant per job, bracketing the space bound:
 a record that fits, one that just overflows, and one with no data.  No bug
 found.
 
+Harness `sockbuf/sbreserve.c`, for `sbreserve_locked_limit()`, same file:
+the socket-buffer sizing behind `setsockopt(SO_RCVBUF/SO_SNDBUF)`.  A
+requested byte count `cc` is capped against `BUF_MAX_ADJ(buf_max)` so that
+`cc * sb_efficiency` cannot overflow, then the mbuf ceiling is set to
+`min(cc * sb_efficiency, buf_max)`.  `cc` is a nondeterministic `u_long`
+(the attacker-chosen value); `buf_max` is bounded by `SB_MAX`, the sysctl's
+real ceiling, below where `BUF_MAX_ADJ`'s own `buf_max * MCLBYTES` would
+overflow.  Proven: an accepted request has `cc` within the cap (so with
+`--unsigned-overflow-check` the `cc * sb_efficiency` multiply does not
+overflow), `sb_mbmax <= buf_max`, `sb_hiwat == cc`, and `sb_lowat <=
+sb_hiwat`.  The mutant `sbreserve_cap`, which drops the cap, is caught by
+`cc` no longer being within it.  `chgsbsize()` is modelled; `lim_cur()` is
+reached only with a non-NULL thread, which the proof does not pass.  No bug
+found.
+
 ## How it works
 
 - The harness `#include`s the kernel source whole: the code proven is
