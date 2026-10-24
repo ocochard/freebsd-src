@@ -685,6 +685,21 @@ spanning three mbufs, an empty copy at a boundary, and an offset skipping
 two mbufs.  The mapped path is proven; the `M_EXTPG` branch is not
 reached.  No bug found.
 
+Harness `mbuf/m_pulldown.c`, for `m_pulldown()`, `sys/kern/uipc_mbuf2.c`:
+make `len` bytes starting at offset `off` contiguous in one mbuf, gathering
+a head piece from the mbuf holding `off` and a tail piece from the next.
+Used by every protocol that parses a header spanning mbufs.  Real `struct
+mbuf`s, so the storage bounds and `M_TRAILINGSPACE`/`M_LEADINGSPACE` are the
+kernel's; `m_dup1()` and `m_get()` go through the UMA model.  Proven: the
+head and tail gather copies stay within each mbuf's storage, and on a
+non-NULL return the result mbuf holds `len` contiguous bytes at the returned
+offset (`offp + len <= m_len <= M_SIZE`).  The mutant `mpulldown_tlen`,
+which takes one byte too few for the tail piece, is caught by the result
+holding fewer than `len` contiguous bytes.  Geometry is a constant per job:
+already contiguous, a chop at a non-zero offset, and a head+tail gather,
+with `len <= MLEN` so the single-mbuf allocation path is taken (the cluster
+path is the same logic at a larger size).  No bug found.
+
 Harness `mbuf/m_copyback.c`, for `m_copyback()`, same file: the writing
 counterpart, which puts `len` bytes at `off` into a chain, grows a mbuf
 into its trailing room, and allocates fresh mbufs when `off` or `len`

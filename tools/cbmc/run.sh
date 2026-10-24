@@ -1395,6 +1395,27 @@ if want mbuf; then
 	mutant mcopydata_skip "$h" "$s" proof_copydata "-DGEO=4" "$um" \
 	    '/^m_copydata(/,/^}/s/off -= m->m_len;/;/'
 
+	# m_pulldown(), sys/kern/uipc_mbuf2.c: make len bytes at offset off
+	# contiguous in one mbuf, gathering a head piece from the mbuf holding
+	# off and a tail piece from the next.  Used by every protocol parsing a
+	# header that spans mbufs.  The gather copies stay within each mbuf's
+	# storage, and on a non-NULL return the result mbuf holds len contiguous
+	# bytes at the returned offset.  Real struct mbufs; m_dup1()/m_get() go
+	# through the UMA model.  GEO is a concrete geometry: already contiguous,
+	# a chop at non-zero off, and a head+tail gather (len <= MLEN).
+	hd="$here/mbuf/m_pulldown.c"
+	s2="$top/sys/kern/uipc_mbuf2.c"
+	ud="m_pulldown.0:6,m_pulldown.1:6,m_pulldown.2:6,m_pulldown.3:6"
+	ud="$ud,m_pulldown.4:6,m_dup1.0:6,m_copydata.0:6"
+	ud="$ud,proof_pulldown.0:6,proof_pulldown.1:6,cbmc_memmove.0:41"
+	for g in 0 1 2; do
+		proof mpulldown_geo$g "$hd" "$s2" proof_pulldown "-DGEO=$g" "$ud"
+	done
+	# The tail length is len minus the head piece (len - hlen): a short tail
+	# leaves the result holding fewer than len contiguous bytes.
+	mutant mpulldown_tlen "$hd" "$s2" proof_pulldown "-DGEO=2" "$ud" \
+	    '/^m_pulldown(/,/^}/s/tlen = len - hlen;/tlen = len - hlen - 1;/'
+
 	# m_copyback(), same file: write len bytes at off into an mbuf chain,
 	# growing a mbuf into its trailing room and allocating new mbufs when
 	# off or len runs past the end.  Every write stays inside a mbuf's
