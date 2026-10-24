@@ -313,6 +313,10 @@ mcopydata_geo2 0 99
 mcopydata_geo3 0 99
 mcopydata_geo4 0 98
 mcopydata_skip 0 98
+mpulldown_geo0 0 87
+mpulldown_geo1 0 86
+mpulldown_geo2 0 87
+mpulldown_tlen 0 86
 mpullup_early 0 99
 mpullup_geo0 0 99
 mpullup_geo1 0 99
