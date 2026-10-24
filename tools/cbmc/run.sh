@@ -121,6 +121,7 @@ cbmc_ktls_send="--no-signed-overflow-check"
 cbmc_ktls_enable="--no-signed-overflow-check"
 cbmc_tcp="--no-signed-overflow-check"
 cbmc_read="--no-signed-overflow-check"
+cbmc_sbreserve="--unsigned-overflow-check"
 replace_sack="tcp_record_dsack:cbmc_tcp_record_dsack"
 cbmc_sack="--no-signed-overflow-check"
 cbmc_ktls_sbc="--no-signed-overflow-check --object-bits 10"
@@ -1598,6 +1599,18 @@ if want sockbuf; then
 	# does not fit (sb_ccc then exceeds the high-water) ...
 	mutant sbaddr_space "$a" "$s" proof_addr "-DSALEN=16 -DDLEN=60 -DHIWAT=64" "$ua" \
 	    '/^sbappendaddr_locked(/,/^}/s/if (space > sbspace(sb))/if (0)/'
+
+	# sbreserve_locked_limit(), same file: socket-buffer sizing for
+	# setsockopt(SO_RCVBUF/SO_SNDBUF).  A requested count cc is capped
+	# against BUF_MAX_ADJ(buf_max) so cc * sb_efficiency cannot overflow,
+	# then sb_mbmax = min(cc * sb_efficiency, buf_max).  The cap is the
+	# overflow guard.  cc and buf_max are nondeterministic u_long.
+	# chgsbsize() and lim_cur() are modelled.
+	r="$here/sockbuf/sbreserve.c"
+	proof sbreserve "$r" "$s" proof_sbreserve "" ""
+	# The cap is load-bearing: dropping it lets cc * sb_efficiency overflow.
+	mutant sbreserve_cap "$r" "$s" proof_sbreserve "" "" \
+	    '/^sbreserve_locked_limit(/,/^}/s/if (cc > BUF_MAX_ADJ(buf_max))/if (0)/'
 fi
 
 if want ktls; then
