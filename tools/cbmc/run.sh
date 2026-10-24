@@ -1135,6 +1135,23 @@ if want tcp; then
 	# lets the copy-back write past sackblks[].
 	mutant sack_list_cap "$hl" "$sk" proof_sack_list "-DINET -DINET6" "$ul" \
 	    '/^tcp_update_sack_list(/,/^}/s/if (num_saved >= MAX_SACK_BLKS)/if (0)/'
+
+	# tcp_update_dsack_list(), same file: the receiver's DSACK-block list
+	# maintenance, companion to tcp_update_sack_list().  Same sackblks[]
+	# array bound (the receiver-side SACK-overflow class): rcv_numsacks never
+	# exceeds MAX_SACK_BLKS and no sackblks[] write runs past the array.  The
+	# starting list and DSACK range are nondeterministic.  (Unlike its
+	# sibling this caps inside the loop condition, so it holds for all
+	# inputs.)
+	hd="$here/tcp/dsack_list.c"
+	ud="tcp_update_dsack_list.0:7,tcp_update_dsack_list.1:7"
+	ud="$ud,tcp_update_dsack_list.2:7,tcp_update_dsack_list.3:7"
+	ud="$ud,proof_dsack_list.0:7,cbmc_memmove.0:49"
+	proof dsack_list "$hd" "$sk" proof_dsack_list "-DINET -DINET6" "$ud"
+	# The loop-condition cap n < MAX_SACK_BLKS is load-bearing: dropping it
+	# lets the saved-block append write past saved_blks[].
+	mutant dsack_list_cap "$hd" "$sk" proof_dsack_list "-DINET -DINET6" "$ud" \
+	    '/^tcp_update_dsack_list(/,/^}/s/(j < tp->rcv_numsacks) \&\& (n < MAX_SACK_BLKS)/(j < tp->rcv_numsacks)/'
 fi
 
 if want read; then

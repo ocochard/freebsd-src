@@ -489,6 +489,16 @@ No in-tree caller passes a zero-length range (all pass `todrop`/`save_tlen
 latent defect in the function's own zero-length handling, sent to the
 maintainers as a question.
 
+Harness `tcp/dsack_list.c`, for `tcp_update_dsack_list()`, same file: the
+receiver's DSACK-block list maintenance, the companion to
+`tcp_update_sack_list()`.  Same `sackblks[]`/`MAX_SACK_BLKS` bound.  Proven,
+for any starting list and received range: `rcv_numsacks` stays within
+`MAX_SACK_BLKS` and no `sackblks[]` write runs past the array.  Unlike its
+sibling, this caps inside the saved-block loop's condition
+(`n < MAX_SACK_BLKS`), so the bound holds for every input, including the
+edge cases that break the other; the mutant `dsack_list_cap`, dropping that
+condition, is caught by a `saved_blks[]` out-of-bounds write.  No bug found.
+
 Not covered, for want of memory on this host: the whole-hole-removal,
 back-trim, hole-split and new-hole-at-tail geometries (the sweep walks
 more holes/blocks than fits), and the fully symbolic sequence space.  The
