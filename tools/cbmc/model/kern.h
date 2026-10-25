@@ -173,6 +173,15 @@ uma_zalloc_arg(uma_zone_t zone, void *arg, int flags)
 	/* Typed, so that cbmc does not access each field byte by byte. */
 	m = __CPROVER_allocate(sizeof(struct mbuf), 1);
 	(void)m_init(m, flags, args->type, args->flags);
+	/*
+	 * m_init() unconditionally sets m_data = m_dat, which is M_START() only
+	 * for a plain mbuf.  For a packet-header mbuf the data area begins at
+	 * m_pktdat, so point m_data there -- matching what the real cluster
+	 * constructors leave and what M_ALIGN()/m_align() assert (m_data ==
+	 * M_START(m)).  Without this a header mbuf passed to m_align() trips
+	 * that KASSERT in the model.
+	 */
+	m->m_data = M_START(m);
 	return (m);
 }
 
