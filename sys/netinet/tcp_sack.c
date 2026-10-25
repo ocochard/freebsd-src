@@ -375,17 +375,17 @@ tcp_update_sack_list(struct tcpcb *tp, tcp_seq rcv_start, tcp_seq rcv_end)
 		 */
 		tp->sackblks[0] = head_blk;
 		num_head = 1;
-		/*
-		 * If the number of saved SACK blocks exceeds its limit,
-		 * discard the last SACK block.
-		 */
-		if (num_saved >= MAX_SACK_BLKS)
-			num_saved--;
 	}
 	if ((rcv_start == rcv_end) &&
 	    (rcv_start == tp->sackblks[0].end)) {
 		num_head = 1;
 	}
+	/*
+	 * If the number of saved SACK blocks would overflow the array once the
+	 * head block is accounted for, discard the last saved SACK block.
+	 */
+	if (num_head + num_saved > MAX_SACK_BLKS)
+		num_saved = MAX_SACK_BLKS - num_head;
 	if (num_saved > 0) {
 		/*
 		 * Copy the saved SACK blocks back.
