@@ -1135,9 +1135,10 @@ if want tcp; then
 	ul="$ul,cbmc_memmove.0:49"
 	proof sack_list "$hl" "$sk" proof_sack_list "-DINET -DINET6" "$ul"
 	# The MAX_SACK_BLKS cap on the saved blocks is load-bearing: dropping it
-	# lets the copy-back write past sackblks[].
+	# lets the copy-back write past sackblks[] (and, before the fix, a
+	# zero-length range did exactly that -- see reports/tcp.md).
 	mutant sack_list_cap "$hl" "$sk" proof_sack_list "-DINET -DINET6" "$ul" \
-	    '/^tcp_update_sack_list(/,/^}/s/if (num_saved >= MAX_SACK_BLKS)/if (0)/'
+	    '/^tcp_update_sack_list(/,/^}/s/if (num_head + num_saved > MAX_SACK_BLKS)/if (0)/'
 
 	# tcp_update_dsack_list(), same file: the receiver's DSACK-block list
 	# maintenance, companion to tcp_update_sack_list().  Same sackblks[]

@@ -92,16 +92,15 @@ proof_sack_list(void)
 	}
 
 	/*
-	 * The received range.  All three in-tree callers (tcp_input.c) pass a
-	 * non-empty range (start < end): a DSACK for a dropped range of
-	 * todrop/save_tlen > 0 bytes, or an existing block's own start..end.
-	 * The function also has a zero-length (start == end) retain path, but
-	 * no caller exercises it, and it does not maintain the MAX_SACK_BLKS
-	 * cap -- see reports/tcp.md.  Prove the reachable contract.
+	 * The received range, start <= end as the function's KASSERT permits
+	 * (the callers pass start < end; the zero-length case is the DSACK
+	 * retain path).  The fix that caps num_head + num_saved after num_head
+	 * is set makes the array bound hold for the whole range, including
+	 * zero-length, so the proof covers all of it.
 	 */
 	rcv_start = nondet_uint();
 	rcv_end = nondet_uint();
-	__CPROVER_assume(SEQ_LT(rcv_start, rcv_end));
+	__CPROVER_assume(SEQ_LEQ(rcv_start, rcv_end));
 
 	tcp_update_sack_list(&g_tp, rcv_start, rcv_end);
 
