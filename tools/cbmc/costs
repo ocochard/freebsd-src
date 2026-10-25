@@ -510,6 +510,8 @@ syncookie_rt_small 1 102
 syncookie_rt_wscale 1 102
 syncookie_sack 1 102
 syncookie_wscale 1 102
+sysctl_new_fit 1 90
+sysctl_new_user 1 90
 sysctl_old_clamp 1 90
 sysctl_old_user 1 90
 tcp_dooptions_10 12 450

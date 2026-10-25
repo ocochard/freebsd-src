@@ -958,6 +958,19 @@ chunk that did not fully fit returns `ENOMEM`.  The mutant
 `sysctl_old_clamp`, dropping the remaining-room clamp, is caught by an
 out-of-bounds write past the user buffer.  No bug found.
 
+Harness `sysctl/new_user.c`, for `sysctl_new_user()`, same file: the
+copy-in helper every `sysctl(2)` write goes through, the companion to
+`sysctl_old_user()`.  It reads a chunk of the user's `new` buffer at the
+running offset into a kernel buffer, refusing `EINVAL` if the chunk does
+not fit the remaining `new` length, and accounts it in `newidx`.  The user
+buffer is a CBMC object of exactly `newlen` bytes.  Proven: a chunk past
+the remaining length is refused with no read and `newidx` unchanged; an
+accepted chunk's copy-in stays within the buffer (`offset + len <=
+newlen`), and `newidx` advances by the chunk length, staying within
+`newlen`.  The mutant `sysctl_new_fit`, dropping the remaining-length
+check, is caught by an out-of-bounds read past the user buffer.  No bug
+found.
+
 ## How it works
 
 - The harness `#include`s the kernel source whole: the code proven is
