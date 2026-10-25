@@ -1721,6 +1721,20 @@ if want sysctl; then
 	# ignoring validlen writes past the user buffer.
 	mutant sysctl_old_clamp "$h" "$s" proof_old_user "" "$uo" \
 	    '/^sysctl_old_user(/,/^}/s/if (i > len - origidx)/if (0)/'
+
+	# sysctl_new_user(), same file: the copy-in helper every sysctl(2) write
+	# goes through, companion to sysctl_old_user().  It reads a chunk of the
+	# user new buffer at the running offset, refusing EINVAL if it does not
+	# fit the remaining new length, accounting it in newidx.  The copy-in
+	# stays within the buffer and newidx advances by the chunk length.  The
+	# buffer is sized to newlen, so a read past it is caught.
+	hn="$here/sysctl/new_user.c"
+	un="proof_new_user.0:4"
+	proof sysctl_new_user "$hn" "$s" proof_new_user "" "$un"
+	# The remaining-length check is load-bearing: dropping it lets a chunk
+	# past the buffer be read.
+	mutant sysctl_new_fit "$hn" "$s" proof_new_user "" "$un" \
+	    '/^sysctl_new_user(/,/^}/s/if (req->newlen - req->newidx < l)/if (0)/'
 fi
 
 if want ktls; then
