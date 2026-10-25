@@ -18,6 +18,7 @@ accept_nonblock 3 147
 accept_retlen 3 147
 accept_retval 3 140
 accept_setown 3 142
+addopt_sackclamp 48 2972
 close 12 556
 close_advlock 13 491
 close_caps 12 556
@@ -514,6 +515,7 @@ sysctl_new_fit 1 90
 sysctl_new_user 1 90
 sysctl_old_clamp 1 90
 sysctl_old_user 1 90
+tcp_addoptions 59 2977
 tcp_dooptions_10 12 450
 tcp_dooptions_18 117 624
 tcp_dooptions_2 7 444

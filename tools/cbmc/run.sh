@@ -1157,6 +1157,28 @@ if want tcp; then
 	# lets the saved-block append write past saved_blks[].
 	mutant dsack_list_cap "$hd" "$sk" proof_dsack_list "-DINET -DINET6" "$ud" \
 	    '/^tcp_update_dsack_list(/,/^}/s/(j < tp->rcv_numsacks) \&\& (n < MAX_SACK_BLKS)/(j < tp->rcv_numsacks)/'
+
+	# tcp_addoptions(), sys/netinet/tcp_output.c: the TCP option writer, the
+	# complement to tcp_dooptions().  It assembles the requested options into
+	# the fixed TCP_MAXOLEN-byte option area, NOP-padding for alignment.
+	# Every write stays within the area; the per-option room checks and the
+	# SACK-block clamp are the guard.  The area is a CBMC object of exactly
+	# TCP_MAXOLEN bytes, so a write past it is an out-of-bounds write.  The
+	# option set and the attacker-influenced counts are nondeterministic.
+	ho="$here/tcp/addoptions.c"
+	so="$top/sys/netinet/tcp_output.c"
+	do="-DINET -DINET6 -DTCPSTAT_ADD(n,v)= -DTCPSTAT_INC(n)= "
+	oo="tcp_addoptions.0:20,tcp_addoptions.1:20,tcp_addoptions.2:20"
+	oo="$oo,tcp_addoptions.3:20,tcp_addoptions.4:20,tcp_addoptions.5:20"
+	oo="$oo,tcp_addoptions.6:20,tcp_addoptions.7:20,tcp_addoptions.8:20"
+	oo="$oo,tcp_addoptions.9:20,tcp_addoptions.10:20,tcp_addoptions.11:20"
+	oo="$oo,tcp_addoptions.12:20,tcp_addoptions.13:20,cbmc_memmove.0:17"
+	proof tcp_addoptions "$ho" "$so" proof_addoptions "$do" "$oo"
+	# The SACK-block count clamp to the remaining room is load-bearing:
+	# without it, to_nsacks blocks are written past the option area.  Rewrite
+	# min(to_nsacks, room) to take to_nsacks unclamped (0 * the room term).
+	mutant addopt_sackclamp "$ho" "$so" proof_addoptions "$do" "$oo" \
+	    '/case TOF_SACK:/,/case TOF_FASTOPEN:/s/sackblks = min(to->to_nsacks,/sackblks = (to->to_nsacks) + 0 * (/'
 fi
 
 if want read; then
