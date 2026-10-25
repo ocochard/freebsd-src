@@ -500,6 +500,19 @@ sibling, this caps inside the saved-block loop's condition
 edge cases that break the other; the mutant `dsack_list_cap`, dropping that
 condition, is caught by a `saved_blks[]` out-of-bounds write.  No bug found.
 
+Harness `tcp/addoptions.c`, for `tcp_addoptions()`, `sys/netinet/tcp_output.c`:
+the TCP option writer, the complement to `tcp_dooptions()`.  It assembles
+the requested options (MSS, window scale, SACK-permitted, timestamp,
+signature, SACK blocks, TFO cookie) into the fixed `TCP_MAXOLEN`-byte option
+area, NOP-padding for alignment, and returns the length.  The option area is
+a CBMC object of exactly `TCP_MAXOLEN` bytes, so a write past it is an
+out-of-bounds write.  The requested option set and the attacker-influenced
+counts (`to_nsacks <= TCP_MAX_SACK`, `to_tfo_len`) are nondeterministic.
+Proven: every write stays within the option area and the returned length is
+at most `TCP_MAXOLEN`, for any option combination.  The mutant
+`addopt_sackclamp`, dropping the SACK-block count clamp to the remaining
+room, is caught by an out-of-bounds write.  No bug found.
+
 Not covered, for want of memory on this host: the whole-hole-removal,
 back-trim, hole-split and new-hole-at-tail geometries (the sweep walks
 more holes/blocks than fits), and the fully symbolic sequence space.  The
