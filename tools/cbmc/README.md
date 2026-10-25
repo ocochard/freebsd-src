@@ -474,20 +474,21 @@ receiver's SACK-block list maintenance, which merges a received range into
 the ordered `sackblks[]` list, capped at `MAX_SACK_BLKS`.  A starting list
 of 0..`MAX_SACK_BLKS` well-formed blocks (non-empty, ordered,
 non-overlapping, above `rcv_nxt`) and a received range are
-nondeterministic.  Proven, for the reachable contract (a non-empty range,
-`rcv_start < rcv_end`, as all callers pass): after the call `rcv_numsacks`
-stays within `MAX_SACK_BLKS` and no `sackblks[]` write runs past the array.
-The mutant `sack_list_cap`, dropping the `num_saved >= MAX_SACK_BLKS` cap,
-is caught by the count overflowing.
+nondeterministic.  Proven, over the whole `SEQ_LEQ(rcv_start, rcv_end)`
+range the function's `KASSERT` permits: after the call `rcv_numsacks` stays
+within `MAX_SACK_BLKS` and no `sackblks[]` write runs past the array.  The
+mutant `sack_list_cap`, dropping the cap, is caught by the count
+overflowing.
 
-Flagged, not a bug today: on a *zero-length* range (`rcv_start ==
-rcv_end`), the cap is skipped (it sits inside the `SEQ_LT(rcv_start,
-rcv_end)` branch), and a full list can leave `rcv_numsacks ==
-MAX_SACK_BLKS + 1` with the copy-back writing one block past `sackblks[]`.
-No in-tree caller passes a zero-length range (all pass `todrop`/`save_tlen
-> 0` or an existing block's start..end), so the path is dead; it is a
-latent defect in the function's own zero-length handling, sent to the
-maintainers as a question.
+This found a latent defect and its fix (this branch): the original cap sat
+inside the `SEQ_LT(rcv_start, rcv_end)` branch, so on a *zero-length* range
+(`rcv_start == rcv_end`) that keeps a DSACK block it was skipped while
+`num_head` could still become 1 -- leaving `rcv_numsacks == MAX_SACK_BLKS +
+1` and writing one block past `sackblks[]`.  No in-tree caller passes a
+zero-length range (all pass `todrop`/`save_tlen > 0` or an existing block's
+start..end), so it was not reachable; the fix moves the cap to after
+`num_head` is set (`num_head + num_saved > MAX_SACK_BLKS`), so the bound
+holds for every input, which this proof then confirms over the full range.
 
 Harness `tcp/dsack_list.c`, for `tcp_update_dsack_list()`, same file: the
 receiver's DSACK-block list maintenance, the companion to
