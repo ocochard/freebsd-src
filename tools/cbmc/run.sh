@@ -1181,6 +1181,23 @@ if want read; then
 	    '/^copyinuio(/,/^}/s/uio->uio_resid += iov->iov_len;/uio->uio_resid += iov->iov_len + 1;/'
 	mutant copyinuio_iovcnt "$h" "$s" proof_copyinuio "" "$ur" \
 	    '/^copyinuio(/,/^}/s/uio->uio_iovcnt = iovcnt;/uio->uio_iovcnt = iovcnt + 1;/'
+
+	# copyiniov(), same file: copy a user iovec array into a fresh kernel
+	# array, behind readv(2)/writev(2) and sendmsg/recvmsg.  iovcnt is capped
+	# at UIO_MAXIOV so iovcnt * sizeof(struct iovec) cannot overflow; the
+	# copyin then fills a buffer of exactly that size, freed on a fault.
+	# iovcnt is a constant per job (the copyin is a byte loop): the jobs
+	# sweep an empty array, a small one, the cap, and one past it.
+	hv="$here/read/copyiniov.c"
+	for n in 0 2 1024 1025; do
+		proof copyiniov_$n "$hv" "$s" proof_copyiniov "-DIOVCNT=$n" \
+		    "copyiniov.0:2"
+	done
+	# The UIO_MAXIOV cap is load-bearing: dropping it lets iovcnt * sizeof
+	# overflow, undersizing the array the copyin then overruns.
+	mutant copyiniov_cap "$hv" "$s" proof_copyiniov "-DIOVCNT=1025" \
+	    "copyiniov.0:2" \
+	    '/^copyiniov(/,/^}/s/if (iovcnt > UIO_MAXIOV)/if (0)/'
 fi
 
 if want sockargs; then

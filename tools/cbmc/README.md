@@ -532,6 +532,20 @@ Not covered: the `UIO_MAXIOV` cap itself (reaching it needs `iovcnt >
 allocation's free on the fault path (not observable in the malloc model).
 No bug found.
 
+Harness `read/copyiniov.c`, for `copyiniov()`, same file: the lower-level
+helper that copies a user iovec array into a freshly allocated kernel
+array, behind `readv(2)`/`writev(2)` and the `sendmsg`/`recvmsg` iovec
+handling.  The `M_IOV` buffer is a CBMC object of exactly `iovlen` bytes,
+so the copyin is bounds-checked against it.  Proven: a count past
+`UIO_MAXIOV` is refused with no array; an accepted count has `iovcnt *
+sizeof(struct iovec)` not overflow (`iovlen` equals the size_t product) and
+the copyin fills a buffer that holds it; a fault frees the array and yields
+`NULL`.  The mutant `copyiniov_cap`, dropping the `UIO_MAXIOV` cap, is
+caught by an out-of-bounds copy.  `iovcnt` is a constant per job sweeping
+across the cap (`0`, `2`, `UIO_MAXIOV`, one past).  (This is the cap the
+`copyinuio` proof above could not reach through its modelled array.)  No bug
+found.
+
 ## sockargs() and getsockaddr(): what is proven
 
 Harness `sockargs/sockargs.c`, for `sockargs()`, `sys/kern/uipc_syscalls.c`:

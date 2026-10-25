@@ -38,6 +38,11 @@ close_setopen 97 2376
 close_skip 101 2376
 close_slot 8 551
 close_unlock 12 556
+copyiniov_0 0 89
+copyiniov_1024 0 89
+copyiniov_1025 0 89
+copyiniov_2 0 89
+copyiniov_cap 0 89
 copyinuio 1 99
 copyinuio_iovcnt 1 99
 copyinuio_overflow 0 99
