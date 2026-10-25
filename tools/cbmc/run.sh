@@ -211,7 +211,8 @@ for f in $(sed -n 's/^#include "\(opt_[a-z0-9_]*\.h\)"/\1/p' \
     "$top/sys/kern/kern_event.c" "$top/sys/kern/kern_descrip.c" \
     "$top/sys/kern/uipc_usrreq.c" "$top/sys/netinet/tcp_input.c" \
     "$top/sys/kern/kern_exec.c" "$top/sys/netinet/tcp_syncache.c" \
-    "$top/sys/netinet/ip_options.c" "$top/sys/vm/vm_mmap.c"); do
+    "$top/sys/netinet/ip_options.c" "$top/sys/vm/vm_mmap.c" \
+    "$top/sys/kern/kern_sysctl.c"); do
 	: >"$work/inc/$f"
 done
 
@@ -1701,6 +1702,25 @@ if want mmap; then
 	# through to the mapping.
 	mutant mmap_wrap "$h" "$s" proof_mmap_len "-DINET -DINET6" "$um" \
 	    '/^kern_mmap(/,/^}/s/if (len > size)/if (0)/'
+fi
+
+if want sysctl; then
+	# sysctl_old_user(), sys/kern/kern_sysctl.c: the copy-out helper every
+	# sysctl(2) read goes through.  It copies a chunk to the user buffer at
+	# the running offset, clamped to the validated length, accounting the
+	# total in oldidx.  The copy stays within the buffer, oldidx advances by
+	# the chunk length, and a truncated read returns ENOMEM.  The user buffer
+	# is a CBMC object of exactly validlen bytes, so a copy past it is an
+	# out-of-bounds write.  The chunk length, offset and validlen are
+	# nondeterministic within a small bound.
+	h="$here/sysctl/old_user.c"
+	s="$top/sys/kern/kern_sysctl.c"
+	uo="proof_old_user.0:4"
+	proof sysctl_old_user "$h" "$s" proof_old_user "" "$uo"
+	# The remaining-room clamp is load-bearing: copying the whole chunk
+	# ignoring validlen writes past the user buffer.
+	mutant sysctl_old_clamp "$h" "$s" proof_old_user "" "$uo" \
+	    '/^sysctl_old_user(/,/^}/s/if (i > len - origidx)/if (0)/'
 fi
 
 if want ktls; then

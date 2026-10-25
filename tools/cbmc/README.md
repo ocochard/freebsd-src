@@ -943,6 +943,21 @@ least `len` and page-aligned, so a wrapped size never takes effect.  The
 mutant `mmap_wrap`, dropping the `len > size` guard, is caught by the size
 reaching the mapping being smaller than `len`.  No bug found.
 
+## sysctl(2): what is proven
+
+Harness `sysctl/old_user.c`, for `sysctl_old_user()`,
+`sys/kern/kern_sysctl.c`: the copy-out helper every `sysctl(2)` read goes
+through.  It copies a chunk of the result to the user buffer at the running
+offset, clamped to the validated length, and accounts the total requested
+in `oldidx`.  The user buffer is a CBMC object of exactly `validlen` bytes,
+so a copy-out past it is an out-of-bounds write.  The chunk length, offset
+and `validlen` are nondeterministic within a small bound.  Proven: the
+copy-out stays within the validated buffer (`offset + len <= validlen`),
+`oldidx` advances by the whole requested chunk length, and a non-empty
+chunk that did not fully fit returns `ENOMEM`.  The mutant
+`sysctl_old_clamp`, dropping the remaining-room clamp, is caught by an
+out-of-bounds write past the user buffer.  No bug found.
+
 ## How it works
 
 - The harness `#include`s the kernel source whole: the code proven is
