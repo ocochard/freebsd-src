@@ -77,6 +77,8 @@ replace_unp="unp_internalize_fp:cbmc_unp_internalize_fp
 	unp_discard:cbmc_unp_discard"
 replace_recvmsg="getsock:cbmc_getsock
 	m_dispose_extcontrolm:cbmc_dispose"
+replace_mmap_len="vm_mmap_object:cbmc_vm_mmap_object
+	kern_mmap_maxprot:cbmc_kern_mmap_maxprot"
 replace_syncookie="syncookie_mac:cbmc_syncookie_mac"
 replace_ktls="ktls_buffer_alloc:cbmc_ktls_buffer_alloc
 	ktls_drop:cbmc_ktls_drop
@@ -122,6 +124,7 @@ cbmc_ktls_enable="--no-signed-overflow-check"
 cbmc_tcp="--no-signed-overflow-check"
 cbmc_read="--no-signed-overflow-check"
 cbmc_sbreserve="--unsigned-overflow-check"
+cbmc_mmap_len="--no-signed-overflow-check"
 replace_sack="tcp_record_dsack:cbmc_tcp_record_dsack"
 cbmc_sack="--no-signed-overflow-check"
 cbmc_ktls_sbc="--no-signed-overflow-check --object-bits 10"
@@ -208,7 +211,7 @@ for f in $(sed -n 's/^#include "\(opt_[a-z0-9_]*\.h\)"/\1/p' \
     "$top/sys/kern/kern_event.c" "$top/sys/kern/kern_descrip.c" \
     "$top/sys/kern/uipc_usrreq.c" "$top/sys/netinet/tcp_input.c" \
     "$top/sys/kern/kern_exec.c" "$top/sys/netinet/tcp_syncache.c" \
-    "$top/sys/netinet/ip_options.c"); do
+    "$top/sys/netinet/ip_options.c" "$top/sys/vm/vm_mmap.c"); do
 	: >"$work/inc/$f"
 done
 
@@ -1663,6 +1666,23 @@ if want sockbuf; then
 	# The cap is load-bearing: dropping it lets cc * sb_efficiency overflow.
 	mutant sbreserve_cap "$r" "$s" proof_sbreserve "" "" \
 	    '/^sbreserve_locked_limit(/,/^}/s/if (cc > BUF_MAX_ADJ(buf_max))/if (0)/'
+fi
+
+if want mmap; then
+	# The length/offset validation of kern_mmap(), sys/vm/vm_mmap.c: mmap(2)
+	# adds the page offset to the length and rounds up, then guards the sum
+	# wrapping to zero.  A wrapped size would map fewer pages than asked (an
+	# overflow bug class).  len and pos are nondeterministic; the anonymous
+	# path is driven, and vm_mmap_object() is intercepted to check the size
+	# handed to the mapping is at least len and page-aligned.
+	h="$here/mmap/mmap_len.c"
+	s="$top/sys/vm/vm_mmap.c"
+	um="kern_mmap.0:4,proof_mmap_len.0:4"
+	proof mmap_len "$h" "$s" proof_mmap_len "-DINET -DINET6" "$um"
+	# The wrap guard is load-bearing: dropping it lets a wrapped (tiny) size
+	# through to the mapping.
+	mutant mmap_wrap "$h" "$s" proof_mmap_len "-DINET -DINET6" "$um" \
+	    '/^kern_mmap(/,/^}/s/if (len > size)/if (0)/'
 fi
 
 if want ktls; then

@@ -914,6 +914,20 @@ sb_hiwat`.  The mutant `sbreserve_cap`, which drops the cap, is caught by
 reached only with a non-NULL thread, which the proof does not pass.  No bug
 found.
 
+## mmap(2): what is proven
+
+Harness `mmap/mmap_len.c`, for the length/offset validation of
+`kern_mmap()`, `sys/vm/vm_mmap.c`: `mmap(2)` adds the page offset to the
+requested length and rounds up to a page (`size = round_page(len +
+pageoff)`), then guards the sum wrapping to zero (`if (len > size) return
+ENOMEM`).  A wrapped `size` would map fewer pages than asked -- an overflow
+bug class.  `len` and `pos` are nondeterministic, and the anonymous path is
+driven; `vm_mmap_object()` is intercepted to observe the size handed to the
+mapping.  Proven: if the request reaches the mapping, the size passed is at
+least `len` and page-aligned, so a wrapped size never takes effect.  The
+mutant `mmap_wrap`, dropping the `len > size` guard, is caught by the size
+reaching the mapping being smaller than `len`.  No bug found.
+
 ## How it works
 
 - The harness `#include`s the kernel source whole: the code proven is
