@@ -1939,6 +1939,36 @@ if want mmap; then
 	    '/^kern_mlock(/,/^}/s/if (last < addr || end < addr)/if (0)/'
 fi
 
+if want bpf; then
+	# bpf_validate(), sys/net/bpf_filter.c: the check of a classic-BPF
+	# program before BIOCSETF installs it and bpf_filter() runs it on every
+	# captured packet.  A program it accepts must be safe to interpret: its
+	# jumps stay within the instruction array (so bpf_filter's pc never runs
+	# off the end), its scratch indices are < BPF_MEMWORDS, and it ends in a
+	# return.  The program is a LEN-instruction CBMC object of nondet fields,
+	# so bpf_validate's own reads are bounds-checked; LEN is a constant per
+	# job (1 to 4 instructions).
+	h="$here/bpf/bpf_validate.c"
+	s="$top/sys/net/bpf_filter.c"
+	bv="bpf_validate.0:5,proof_bpf_validate.0:5,proof_bpf_validate.1:5"
+	for n in 1 2 3 4; do
+		proof bpfval_len$n "$h" "$s" proof_bpf_validate "-DLEN=$n" "$bv"
+	done
+	# The jump-bound check is load-bearing: weakening it (the target may
+	# equal len - i - 1, one past the last reachable instruction) lets an
+	# accepted program jump off the array.
+	mutant bpfval_jump "$h" "$s" proof_bpf_validate "-DLEN=3" "$bv" \
+	    '/^bpf_validate(/,/^}/s/if (offset >= (u_int)(len - i) - 1)/if (offset > (u_int)(len - i) - 1)/'
+	# The memory-index check is load-bearing: dropping it lets an accepted
+	# program use a scratch index past BPF_MEMWORDS.
+	mutant bpfval_mem "$h" "$s" proof_bpf_validate "-DLEN=2" "$bv" \
+	    '/^bpf_validate(/,/^}/s/if (p->k >= BPF_MEMWORDS)/if (0)/'
+	# The trailing-return check is load-bearing: dropping it accepts a
+	# program that does not end in BPF_RET.
+	mutant bpfval_ret "$h" "$s" proof_bpf_validate "-DLEN=2" "$bv" \
+	    '/^bpf_validate(/,/^}/s/return (BPF_CLASS(f\[len - 1\].code) == BPF_RET);/return (1);/'
+fi
+
 if want sysctl; then
 	# sysctl_old_user(), sys/kern/kern_sysctl.c: the copy-out helper every
 	# sysctl(2) read goes through.  It copies a chunk to the user buffer at

@@ -19,6 +19,13 @@ accept_retlen 3 147
 accept_retval 3 140
 accept_setown 3 142
 addopt_sackclamp 48 2972
+bpfval_jump 0 86
+bpfval_len1 0 85
+bpfval_len2 0 86
+bpfval_len3 0 85
+bpfval_len4 0 85
+bpfval_mem 0 86
+bpfval_ret 0 86
 close 12 556
 close_advlock 13 491
 close_caps 12 556

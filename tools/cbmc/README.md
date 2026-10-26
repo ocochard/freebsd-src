@@ -1128,6 +1128,25 @@ newlen`), and `newidx` advances by the chunk length, staying within
 check, is caught by an out-of-bounds read past the user buffer.  No bug
 found.
 
+## BPF program validation: what is proven
+
+Harness `bpf/bpf_validate.c`, for `bpf_validate()`, `sys/net/bpf_filter.c`:
+the check a classic-BPF program passes before `BIOCSETF` installs it and
+`bpf_filter()` interprets it on every captured packet.  A program it accepts
+must be safe to run: its jumps must stay within the instruction array (so the
+interpreter's program counter never leaves it), its scratch-memory indices
+must be `< BPF_MEMWORDS`, and it must end in a return.  The program is a
+`LEN`-instruction CBMC object of nondeterministic fields, so `bpf_validate`'s
+own reads of `f[i]` and `f[len - 1]` are bounds-checked.  Proven, for `LEN`
+of one to four instructions: when the program is accepted every forward jump
+target is a valid instruction index, every memory index is within
+`BPF_MEMWORDS`, and the last instruction is a `BPF_RET`.  The mutant
+`bpfval_jump`, loosening the jump bound by one (a target of `len - i - 1` is
+let through), is caught by a jump that leaves the array; `bpfval_mem`,
+dropping the memory-index check, by an index past `BPF_MEMWORDS`; and
+`bpfval_ret`, dropping the trailing-return check, by an accepted program that
+does not end in a return.  No bug found.
+
 ## How it works
 
 - The harness `#include`s the kernel source whole: the code proven is
