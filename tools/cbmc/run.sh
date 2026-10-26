@@ -1232,6 +1232,32 @@ if want read; then
 	mutant copyiniov_cap "$hv" "$s" proof_copyiniov "-DIOVCNT=1025" \
 	    "copyiniov.0:2" \
 	    '/^copyiniov(/,/^}/s/if (iovcnt > UIO_MAXIOV)/if (0)/'
+
+	# uiomove() (through uiomove_faultflag()), same file: the kernel's copy
+	# of n bytes between a kernel buffer and a user iovec list, behind
+	# read(2), write(2) and most device and socket I/O.  Each step copies
+	# min(iov_len, remaining n) bytes, advancing the kernel pointer and
+	# shrinking n; every copy stays within the n-byte kernel buffer and the
+	# iovec.  The kernel buffer is an N-byte object, each iovec its own
+	# object; the user path drives the modelled copyin/copyout.  GEO: an
+	# exact fit, a second iovec clamped by the count, a skipped empty iovec,
+	# and an iovec larger than N (the count clamp).
+	hu="$here/read/uiomove.c"
+	uu="uiomove_faultflag.5:5,proof_uiomove.0:4,proof_uiomove.1:4"
+	for g in 0 1 2 3; do
+		proof uiomove_geo$g "$hu" "$s" proof_uiomove "-DGEO=$g" "$uu"
+	done
+	# The per-step count is clamped to the remaining n (the kernel buffer):
+	# dropping the clamp copies the whole iovec, overrunning the N-byte
+	# kernel buffer.  GEO 3's iovec (20) is larger than N (8), so the
+	# uncapped copy runs past the kernel buffer.
+	mutant uiomove_clamp "$hu" "$s" proof_uiomove "-DGEO=3" "$uu" \
+	    '/^uiomove_faultflag(/,/^}/s/if (cnt > n)/if (0)/'
+	# The kernel pointer and n advance by the bytes moved: dropping the n
+	# decrement loops without draining the count, re-copying from cp past
+	# the kernel buffer.
+	mutant uiomove_advance "$hu" "$s" proof_uiomove "-DGEO=1" "$uu" \
+	    '/cp = (char \*)cp + cnt;/{n;s/^\t\tn -= cnt;/;/;}'
 fi
 
 if want sockargs; then

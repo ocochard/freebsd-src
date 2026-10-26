@@ -559,6 +559,21 @@ across the cap (`0`, `2`, `UIO_MAXIOV`, one past).  (This is the cap the
 `copyinuio` proof above could not reach through its modelled array.)  No bug
 found.
 
+Harness `read/uiomove.c`, for `uiomove()` (through `uiomove_faultflag()`),
+same file: the kernel's copy of `n` bytes between a kernel buffer and a user
+iovec list, the workhorse behind `read(2)`, `write(2)` and most device and
+socket I/O.  The loop copies `min(iov_len, remaining n)` bytes per iovec,
+advancing the kernel pointer and shrinking `n`.  The kernel buffer is an
+`N`-byte object and each iovec points at its own object; the user path
+(`UIO_USERSPACE`) drives the modelled `copyin()`/`copyout()`.  Proven: every
+copy stays within the `N`-byte kernel buffer and the addressed iovec, and
+`uio_resid` is drawn down by exactly the bytes moved.  The mutant
+`uiomove_clamp`, dropping the `cnt > n` clamp, is caught by an out-of-bounds
+write past the kernel buffer (and the residual check); `uiomove_advance`,
+dropping the `n` decrement, likewise.  Geometry is a constant per job: an
+exact fit, a second iovec clamped by the count, a skipped empty iovec, and an
+iovec larger than `N`.  No bug found.
+
 ## sockargs() and getsockaddr(): what is proven
 
 Harness `sockargs/sockargs.c`, for `sockargs()`, `sys/kern/uipc_syscalls.c`:
@@ -793,6 +808,21 @@ mbuf, is caught by an out-of-bounds read in a geometry placing the source at
 the `MLEN` tail.  Geometry is a constant per job: a copy inside the first
 mbuf, one starting mid-mbuf, a three-mbuf span, and the tail case.  The
 `M_EXT` and `M_PKTHDR` branches are not covered.  No bug found.
+
+Harness `mbuf/m_append.c`, for `m_append()`, same file: append `len` bytes
+of `cp` to the end of a chain, used across the stack to grow a packet.  It
+fills the last mbuf's trailing space first (up to `M_TRAILINGSPACE`), then
+allocates fresh mbufs for the remainder, `min(MLEN, remainder)` bytes each.
+The source is a `LEN`-byte object and each mbuf a separate object; fresh
+mbufs come through the UMA model.  Proven: every copy stays within the source
+buffer and the destination mbuf, the trailing fill never exceeds the last
+mbuf's storage, and on success (return 1) the chain's lengths grew by exactly
+`LEN`.  The mutant `mappend_space`, which drops the `space > remainder` cap on
+the trailing fill, is caught by an out-of-bounds read of the source buffer
+(the fill then copies the whole trailing space, far more than `LEN`).
+Geometry is a constant per job: a fit in the trailing space, a spill to a
+fresh mbuf, a full last mbuf, and a two-mbuf destination spilling off the end.
+No bug found.
 
 Harness `mbuf/m_copyback.c`, for `m_copyback()`, same file: the writing
 counterpart, which puts `len` bytes at `off` into a chain, grows a mbuf
