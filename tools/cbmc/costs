@@ -321,6 +321,11 @@ mcopydata_geo2 0 99
 mcopydata_geo3 0 99
 mcopydata_geo4 0 98
 mcopydata_skip 0 98
+mcopym_geo0 0 86
+mcopym_geo1 0 86
+mcopym_geo2 0 86
+mcopym_geo3 0 86
+mcopym_minlen 0 86
 mmap_len 1 92
 mmap_wrap 1 92
 mpulldown_geo0 0 87
