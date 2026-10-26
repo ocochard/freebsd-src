@@ -877,6 +877,22 @@ over-long last fragment, with a spurious MF bit, breaks the tiling).
 fragment loop unbounded); the jobs sweep an exact multiple of the fragment
 payload, a remainder, and a two-fragment split.  No bug found.
 
+Harness `ip6/ip6_fragment.c`, for `ip6_fragment()`, `sys/netinet6/ip6_output.c`:
+the IPv6 counterpart, splitting a packet into fragments of a given `fraglen`.
+The fragments hang off the original's `m_nextpkt`; each fragment's
+`ip6_frag` header (placed by the real, static `ip6_insertfraghdr()` in the
+fragment mbuf's trailing space) and its `ip6_plen` are read back.  Proven:
+the fragments tile `[hlen, tlen)` -- contiguous 8-byte-aligned offsets, each
+payload at most `fraglen`, the More-Fragments bit set on every fragment but
+the last and clear on the last, together covering the whole payload.  The
+offset and MF bit are decoded exactly as `frag6_input()` does (mask the raw
+offlg, then `ntohs`).  The per-fragment helpers (`m_gethdr` via the UMA
+model, `m_dup_pkthdr`, `m_copym`, `m_cat`) are modelled.  The mutant
+`ip6_fragment_last`, dropping the trim of the final fragment, is caught by
+that fragment wrongly carrying the MF bit.  `tlen` and `fraglen` are
+constants per job, the jobs sweeping an exact multiple and a remainder.  No
+bug found.
+
 ## TCP reassembly accounting: what is proven
 
 Harness `tcp/reass.c`, for the reassembly helpers of
