@@ -338,6 +338,11 @@ mappend_geo1 0 86
 mappend_geo2 0 87
 mappend_geo3 0 87
 mappend_space 0 87
+mapply_geo0 0 87
+mapply_geo1 0 87
+mapply_geo2 0 87
+mapply_geo3 0 86
+mapply_min 0 87
 mcopyback_count 1 98
 mcopyback_geo0 0 99
 mcopyback_geo1 0 99

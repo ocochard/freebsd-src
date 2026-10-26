@@ -127,6 +127,9 @@ restrict_ktls_rx=$restrict_ktls
 cbmc_ktls_sb="--no-signed-overflow-check"
 restrict_ktls_ocf="m_apply.function_pointer_call.1/check_padding"
 cbmc_ktls_ocf="--no-signed-overflow-check"
+# m_apply() runs a caller function over the chain by pointer; pin it to the
+# harness callback so cbmc does not branch over every matching function.
+restrict_m_apply="m_apply_one.function_pointer_call.1/cbmc_apply_f"
 restrict_ktls_send="sosend_generic_locked.function_pointer_call.1/cbmc_pr_send"
 cbmc_ktls_send="--no-signed-overflow-check"
 cbmc_ktls_enable="--no-signed-overflow-check"
@@ -1604,6 +1607,25 @@ if want mbuf; then
 	# larger than LEN, so the uncapped fill reads past the source.
 	mutant mappend_space "$ha" "$s" proof_append "-DGEO=0" "$ua" \
 	    '/^m_append(/,/^}/s/if (space > remainder)/if (0)/'
+
+	# m_apply(), same file: run a caller function f over len bytes of a chain
+	# starting off bytes in, used by the checksum and crypto paths.  It skips
+	# to the mbuf holding byte off, then hands f each sub-run [m_data + off,
+	# +min(m_len - off, len)); that run must stay within the mbuf data.  The
+	# chain is real mbufs, each a separate object; f is pinned to the harness
+	# callback, which checks the run lies within the mbuf.  GEO: a run inside
+	# the first mbuf, one starting mid-mbuf, a three-mbuf span, and a run
+	# reaching the last byte.
+	hp="$here/mbuf/m_apply.c"
+	up="m_apply.3:4,m_apply.5:4,proof_apply.0:4,proof_apply.1:4"
+	for g in 0 1 2 3; do
+		proof mapply_geo$g "$hp" "$s" proof_apply "-DGEO=$g" "$up"
+	done
+	# The per-mbuf run is min(m_len - off, len): handing f the whole len from
+	# a shorter mbuf reads past it.  GEO 4 places the first mbuf near MLEN
+	# with off near its end, so the over-long run runs off the mbuf storage.
+	mutant mapply_min "$hp" "$s" proof_apply "-DGEO=4" "$up" \
+	    '/^m_apply(/,/^}/s/count = min(m->m_len - off, len);/count = len;/'
 
 	# m_copyback(), same file: write len bytes at off into an mbuf chain,
 	# growing a mbuf into its trailing room and allocating new mbufs when
