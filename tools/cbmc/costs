@@ -318,6 +318,11 @@ ktls_uio_link 25 294
 ktls_uio_maxseg 32 407
 ktls_uio_mlen 32 403
 ktls_uio_seg 28 405
+mappend_geo0 0 87
+mappend_geo1 0 86
+mappend_geo2 0 87
+mappend_geo3 0 87
+mappend_space 0 87
 mcopyback_count 1 98
 mcopyback_geo0 0 99
 mcopyback_geo1 0 99

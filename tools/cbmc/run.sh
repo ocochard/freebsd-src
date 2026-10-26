@@ -1553,6 +1553,28 @@ if want mbuf; then
 	mutant mcopym_minlen "$hm" "$s" proof_copym "-DGEO=3" "$uc" \
 	    '/^m_copym(/,/^}/s/n->m_len = min(len, m->m_len - off);/n->m_len = len;/'
 
+	# m_append(), same file: append len bytes of cp to the end of a chain.
+	# It fills the last mbuf's trailing space (up to M_TRAILINGSPACE), then
+	# allocates fresh mbufs for the remainder.  Every copy stays within the
+	# source buffer and the destination mbuf; the trailing fill never exceeds
+	# the last mbuf's storage.  The source is a LEN-byte CBMC object and each
+	# mbuf a separate object; fresh mbufs come from the UMA model.  GEO: a fit
+	# in the trailing space, a spill to a fresh mbuf, a full last mbuf, and a
+	# two-mbuf destination spilling off the end.
+	ha="$here/mbuf/m_append.c"
+	ua="m_append.0:3,m_append.1:3,proof_append.0:4,proof_append.1:4"
+	ua="$ua,proof_append.2:5,proof_append.3:4,cbmc_memmove.0:12"
+	for g in 0 1 2 3; do
+		proof mappend_geo$g "$ha" "$s" proof_append "-DGEO=$g" "$ua"
+	done
+	# The trailing fill is capped by M_TRAILINGSPACE (space > remainder):
+	# dropping the cap copies min(space, len) from the source but writes
+	# space bytes, and a space larger than the remaining source over-reads
+	# the LEN-byte source buffer.  GEO 0 has trailing space (MLEN - 4) far
+	# larger than LEN, so the uncapped fill reads past the source.
+	mutant mappend_space "$ha" "$s" proof_append "-DGEO=0" "$ua" \
+	    '/^m_append(/,/^}/s/if (space > remainder)/if (0)/'
+
 	# m_copyback(), same file: write len bytes at off into an mbuf chain,
 	# growing a mbuf into its trailing room and allocating new mbufs when
 	# off or len runs past the end.  Every write stays inside a mbuf's
