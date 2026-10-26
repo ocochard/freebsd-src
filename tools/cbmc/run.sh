@@ -2063,6 +2063,25 @@ if want sctp; then
 	mutant addhmac_full "$ha" "$s" proof_add_hmacid "-DINET -DINET6 -DMAXALGO=2" \
 	    "sctp_auth_add_hmacid.0:3,proof_add_hmacid.0:3" \
 	    '/^sctp_auth_add_hmacid(/,/^}/s/if (list->num_algo == list->max_algo)/if (0)/'
+
+	# sctp_serialize_hmaclist(), same file: write the local HMAC-id list out to
+	# a caller buffer for an outgoing parameter.  It reads hmac[0 .. num_algo)
+	# and writes two bytes each.  The read must stay within the max_algo-entry
+	# array and the write within the num_algo * 2 caller buffer.  The list and
+	# buffer are CBMC objects of exactly their sizes; num_algo is
+	# nondeterministic.  MAXALGO sweeps the two-entry default and a deeper list.
+	hs="$here/sctp/serialize_hmac.c"
+	for n in 2 4; do
+		as="sctp_serialize_hmaclist.0:$((n + 1)),proof_serialize_hmac.0:$((n + 1)),cbmc_memmove.0:3"
+		proof serhmac_max$n "$hs" "$s" proof_serialize_hmac "-DINET -DINET6 -DMAXALGO=$n" "$as"
+	done
+	# The read stays within the array only under the list invariant num_algo
+	# <= max_algo that sctp_auth_add_hmacid() maintains.  Left open as a
+	# question: without it (num_algo past max_algo) the hmac[i] read and the
+	# write leave their objects.  No path produces such a list.
+	question serhmac_noinv "$hs" "$s" proof_serialize_hmac \
+	    "-DINET -DINET6 -DMAXALGO=2 -DNOINV" \
+	    "sctp_serialize_hmaclist.0:7,proof_serialize_hmac.0:3,cbmc_memmove.0:3"
 fi
 
 if want bpf; then
