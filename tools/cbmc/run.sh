@@ -2023,6 +2023,29 @@ if want sctp; then
 	# bound reads one byte past the wire buffer.
 	mutant unpackauth_over "$hu" "$s" proof_unpack_auth "-DINET -DINET6 -DNUM_CHUNKS=5" "$uu" \
 	    '/^sctp_unpack_auth_chunks(/,/^}/s/for (i = 0; i < num_chunks; i++)/for (i = 0; i <= num_chunks; i++)/'
+
+	# sctp_serialize_auth_chunks() / sctp_pack_auth_chunks(), same file: write
+	# the chklist bitmap out to a caller buffer for an outgoing AUTH
+	# parameter.  serialize writes one byte per set chunk (caller gives up to
+	# 256); pack writes one byte per set chunk when num_chunks <= 32, else a
+	# 32-byte bitfield.  Each write must stay within the buffer.  The list is
+	# built with sctp_auth_add_chunk's invariant (num_chunks == set count), so
+	# the flat pack form writes num_chunks <= 32 bytes into a 32-byte buffer.
+	hk="$here/sctp/pack_auth.c"
+	us="build_list.0:257,proof_serialize.0:257,sctp_serialize_auth_chunks.0:257"
+	up="proof_pack.0:257,sctp_pack_auth_chunks.0:257,sctp_pack_auth_chunks.1:257"
+	proof serauth "$hk" "$s" proof_serialize "-DINET -DINET6 -DSERIALIZE" "$us"
+	# NSET sweeps the flat path (a few set chunks, and the 32 boundary) and
+	# the bitfield path (> 32 set chunks).
+	proof packauth_few "$hk" "$s" proof_pack "-DINET -DINET6 -DPACK -DNSET=5"  "$up"
+	proof packauth_32  "$hk" "$s" proof_pack "-DINET -DINET6 -DPACK -DNSET=32" "$up"
+	proof packauth_bits "$hk" "$s" proof_pack "-DINET -DINET6 -DPACK -DNSET=40" "$up"
+	# The flat pack path (one byte per set chunk) is guarded by num_chunks <=
+	# 32 so it never writes more than 32 bytes; the bitfield path handles
+	# larger lists in a fixed 32 bytes.  Forcing the flat path for a list with
+	# more than 32 set chunks writes past the 32-byte buffer.
+	mutant packauth_flat "$hk" "$s" proof_pack "-DINET -DINET6 -DPACK -DNSET=40" "$up" \
+	    '/^sctp_pack_auth_chunks(/,/^}/s/if (list->num_chunks <= 32)/if (1)/'
 fi
 
 if want bpf; then
