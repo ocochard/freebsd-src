@@ -1224,6 +1224,22 @@ the 256-entry array in bounds.  The mutant `unpackauth_over`, an off-by-one
 in the flat-list loop bound, is caught by a read one byte past the wire
 buffer.  `NUM_CHUNKS` is a constant per job.  No bug found.
 
+Harness `sctp/pack_auth.c`, for `sctp_serialize_auth_chunks()` and
+`sctp_pack_auth_chunks()`, same file: write the chklist bitmap out to a
+caller buffer for an outgoing AUTH parameter.  `serialize` writes one byte
+per set chunk (the caller gives room for up to 256); `pack` writes one byte
+per set chunk when `num_chunks <= 32`, else a fixed 32-byte bitfield.  The
+output buffer is a CBMC object of its contract size (256 for serialize, 32
+for pack).  Proven: serialize's writes stay within the 256-byte buffer for
+any bitmap; pack's writes stay within the 32-byte buffer, for a few set
+chunks, the 32 boundary, and the bitfield case.  pack relies on the chklist
+invariant `sctp_auth_add_chunk()` keeps (`num_chunks` == the set count): the
+flat path is chosen by `num_chunks <= 32` and writes one byte per set chunk,
+so the count must match.  The mutant `packauth_flat`, forcing the flat path
+for a list with more than 32 set chunks, is caught by a write past the
+32-byte buffer.  `NSET` (the set-chunk count) is a constant per job.  No bug
+found.
+
 ## How it works
 
 - The harness `#include`s the kernel source whole: the code proven is
