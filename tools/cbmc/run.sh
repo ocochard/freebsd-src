@@ -1491,6 +1491,26 @@ if want mbuf; then
 	mutant mpulldown_tlen "$hd" "$s2" proof_pulldown "-DGEO=2" "$ud" \
 	    '/^m_pulldown(/,/^}/s/tlen = len - hlen;/tlen = len - hlen - 1;/'
 
+	# m_copym(), sys/kern/uipc_mbuf.c: copy len bytes at off of a chain into a
+	# freshly allocated chain, used all over the stack.  Plain path (non-EXT,
+	# non-header): each new mbuf is filled with min(len, m_len - off) bytes.
+	# Each copy stays within the source and the fresh mbuf, and the copied
+	# chain's lengths sum to len.  Real source mbufs; fresh mbufs via the UMA
+	# model.  GEO: a copy inside the first mbuf, one starting mid-mbuf, and a
+	# three-mbuf span.
+	hm="$here/mbuf/m_copym.c"
+	uc="m_copym.0:6,m_copym.1:6,m_copym.2:6,m_copym.3:6,m_copym.4:6"
+	uc="$uc,m_copym.5:6,m_copym.6:6,proof_copym.0:9,proof_copym.1:9"
+	uc="$uc,proof_copym.2:9,cbmc_memmove.0:33"
+	for g in 0 1 2 3; do
+		proof mcopym_geo$g "$hm" "$s" proof_copym "-DGEO=$g" "$uc"
+	done
+	# The per-mbuf copy length is min(len, m_len - off): copying the whole
+	# remaining len from a shorter source mbuf reads past it.  GEO 3 places
+	# the source near MLEN so the over-long read runs off the mbuf.
+	mutant mcopym_minlen "$hm" "$s" proof_copym "-DGEO=3" "$uc" \
+	    '/^m_copym(/,/^}/s/n->m_len = min(len, m->m_len - off);/n->m_len = len;/'
+
 	# m_copyback(), same file: write len bytes at off into an mbuf chain,
 	# growing a mbuf into its trailing room and allocating new mbufs when
 	# off or len runs past the end.  Every write stays inside a mbuf's

@@ -758,6 +758,20 @@ already contiguous, a chop at a non-zero offset, and a head+tail gather,
 with `len <= MLEN` so the single-mbuf allocation path is taken (the cluster
 path is the same logic at a larger size).  No bug found.
 
+Harness `mbuf/m_copym.c`, for `m_copym()`, `sys/kern/uipc_mbuf.c`: copy
+`len` bytes at offset `off` of a chain into a freshly allocated chain, used
+all over the stack to duplicate a run of packet data.  This covers the plain
+path (non-external, non-header): each new mbuf is filled with `min(len,
+m_len - off)` bytes.  The source mbufs are real `struct mbuf`s, each a
+separate object so an over-read is caught; the fresh mbufs come through the
+UMA model.  Proven: each per-mbuf copy stays within the source and the fresh
+mbuf, and on success the copied chain's lengths sum to `len`.  The mutant
+`mcopym_minlen`, copying the whole remaining `len` from a shorter source
+mbuf, is caught by an out-of-bounds read in a geometry placing the source at
+the `MLEN` tail.  Geometry is a constant per job: a copy inside the first
+mbuf, one starting mid-mbuf, a three-mbuf span, and the tail case.  The
+`M_EXT` and `M_PKTHDR` branches are not covered.  No bug found.
+
 Harness `mbuf/m_copyback.c`, for `m_copyback()`, same file: the writing
 counterpart, which puts `len` bytes at `off` into a chain, grows a mbuf
 into its trailing room, and allocates fresh mbufs when `off` or `len`
