@@ -1350,6 +1350,37 @@ if want setsockopt; then
 	# ... and the copied length reported in sopt_valsize.
 	mutant sooptcopyout_report "$h" "$s" proof_sooptcopyout "$do -DVALSIZE=12" "$oo" \
 	    '/^sooptcopyout(/,/^}/s/sopt->sopt_valsize = valsize;/;/'
+
+	# soopt_mcopyin()/soopt_mcopyout(), same file: the copy of a socket
+	# option value between the user buffer (sopt_val, sopt_valsize bytes)
+	# and an mbuf chain, on the IPv6 pr_ctloutput path.  Each mbuf is copied
+	# in full while sopt_valsize >= m_len; sopt_val advances by m_len and
+	# sopt_valsize shrinks by it, so no copy runs past the user buffer or any
+	# mbuf.  The user buffer is a VALSIZE-byte CBMC object and each mbuf a
+	# separate object; the chain is a concrete geometry per job, VALSIZE sized
+	# to cover it (as ip6's soopt_getm() allocates).  GEO sweeps one mbuf, a
+	# two-mbuf chain, a chain with an empty mbuf, and an MLEN-full mbuf.
+	h="$here/setsockopt/sooptmcopy.c"
+	mi="soopt_mcopyin.0:5,build_chain.0:4,build_chain.1:4"
+	mo="soopt_mcopyout.0:5,build_chain.0:4,build_chain.1:4"
+	proof mcopyin_one   "$h" "$s" proof_mcopyin  "$do -DGEO=0 -DVALSIZE=8"       "$mi"
+	proof mcopyin_two   "$h" "$s" proof_mcopyin  "$do -DGEO=1 -DVALSIZE=14"      "$mi"
+	proof mcopyin_empty "$h" "$s" proof_mcopyin  "$do -DGEO=2 -DVALSIZE=14"      "$mi"
+	proof mcopyin_full  "$h" "$s" proof_mcopyin  "$do -DGEO=3 -DVALSIZE=(MLEN+4)" "$mi"
+	proof mcopyout_one   "$h" "$s" proof_mcopyout "$do -DGEO=0 -DVALSIZE=8"       "$mo"
+	proof mcopyout_two   "$h" "$s" proof_mcopyout "$do -DGEO=1 -DVALSIZE=14"      "$mo"
+	proof mcopyout_short "$h" "$s" proof_mcopyout "$do -DGEO=1 -DVALSIZE=10"      "$mo"
+	proof mcopyout_full  "$h" "$s" proof_mcopyout "$do -DGEO=3 -DVALSIZE=(MLEN+4)" "$mo"
+	# Drop the room check: a copy then runs past the user buffer (caught by
+	# touch_user / the VALSIZE object) once sopt_valsize is exhausted.
+	mutant mcopyin_guard "$h" "$s" proof_mcopyin "$do -DGEO=1 -DVALSIZE=10" "$mi" \
+	    '/^soopt_mcopyin(/,/^}/s/sopt->sopt_valsize >= m->m_len/1/'
+	mutant mcopyout_guard "$h" "$s" proof_mcopyout "$do -DGEO=1 -DVALSIZE=10" "$mo" \
+	    '/^soopt_mcopyout(/,/^}/s/sopt->sopt_valsize >= m->m_len/1/'
+	# Drop the advance: the user pointer stays put, so the reported total is
+	# wrong (mcopyout) and a later copy rereads the same bytes.
+	mutant mcopyout_advance "$h" "$s" proof_mcopyout "$do -DGEO=1 -DVALSIZE=14" "$mo" \
+	    '/^soopt_mcopyout(/,/^}/s/valsize += m->m_len;/;/'
 fi
 
 if want exec; then

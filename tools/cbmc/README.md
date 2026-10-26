@@ -643,6 +643,28 @@ the information-leak guard: the mutant `sooptcopyout_clamp`, which drops
 the `min()`, is caught by an out-of-bounds read of the kernel buffer.  The
 mutant `sooptcopyout_report` takes the reported length back.  No bug found.
 
+Harness `setsockopt/sooptmcopy.c`, for `soopt_mcopyin()` and
+`soopt_mcopyout()`, same file: the copy of an option value between the user
+buffer (`sopt_val`, `sopt_valsize` bytes) and an mbuf chain, on the IPv6
+`pr_ctloutput()` path through `soopt_getm()`.  Each mbuf is copied in full
+while the user buffer still has room (`sopt_valsize >= m_len`); the user
+pointer advances by `m_len` and `sopt_valsize` shrinks by it.
+
+- no copy, in either direction, runs past the user buffer or past any
+  mbuf's storage.
+- `soopt_mcopyout()` reports the copied total in `sopt_valsize`, and returns
+  `EINVAL` (not a panic) when the user buffer is too short for an mbuf.
+
+The user buffer is a CBMC object of exactly `VALSIZE` bytes and each mbuf a
+separate object, so a copy past either end is an out-of-bounds access.  The
+room check is the guard: the mutants `mcopyin_guard` and `mcopyout_guard`,
+which force it true, are caught by an out-of-bounds dereference of the user
+buffer once `sopt_valsize` is exhausted.  `mcopyout_advance`, which drops the
+`sopt_val` advance, is caught by the reported-total check.  `GEO` sweeps a
+single mbuf, a two-mbuf chain, a chain with an empty mbuf, and an `MLEN`-full
+mbuf; `VALSIZE` is sized to cover the chain, as `soopt_getm()` allocates.  No
+bug found.
+
 ## execve(2): what is proven
 
 Harness `exec/exec_args.c`, for the argument-string accounting of
