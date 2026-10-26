@@ -838,6 +838,21 @@ the `MLEN` tail.  Geometry is a constant per job: a run inside the first
 mbuf, one starting mid-mbuf, a three-mbuf span, a run reaching the last byte,
 and the tail case.  The `M_EXTPG` path is not covered.  No bug found.
 
+Harness `mbuf/m_getptr.c`, for `m_getptr()`, same file: find the mbuf and
+in-mbuf offset of byte position `loc` in a chain, used by IPsec and the
+multicast code to locate a split point.  Callers index `mtod(m) + *off` right
+after, so the contract that matters is that a non-NULL return hands back an
+offset within the returned mbuf (`0 <= *off <= m_len`) that locates exactly
+byte `loc`.  The chain is real `struct mbuf`s; `loc` is nondeterministic, so
+every position is covered.  Proven: a non-NULL return's offset is within the
+returned mbuf and its storage, a mid-chain return's offset is strictly within
+the mbuf (`off == m_len`, one past the data, only at the end of the chain),
+and the skipped lengths plus the offset equal `loc`.  The mutant
+`mgetptr_bound`, loosening the in-mbuf test from `m_len > loc` to `>=`, is
+caught by a mid-chain offset landing one past the mbuf's data.  Geometry is a
+constant per job: one mbuf, two mbufs, and a chain with an empty mbuf to step
+over.  No bug found.
+
 Harness `mbuf/m_copyback.c`, for `m_copyback()`, same file: the writing
 counterpart, which puts `len` bytes at `off` into a chain, grows a mbuf
 into its trailing room, and allocates fresh mbufs when `off` or `len`

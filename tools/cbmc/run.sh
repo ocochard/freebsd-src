@@ -1627,6 +1627,24 @@ if want mbuf; then
 	mutant mapply_min "$hp" "$s" proof_apply "-DGEO=4" "$up" \
 	    '/^m_apply(/,/^}/s/count = min(m->m_len - off, len);/count = len;/'
 
+	# m_getptr(), same file: find the mbuf and in-mbuf offset of byte
+	# position loc in a chain, used by IPsec and the multicast code to locate
+	# a split point.  Callers index mtod(m) + *off, so the contract is that a
+	# non-NULL return hands back an offset within the returned mbuf (0 <= off
+	# <= m_len) locating exactly byte loc.  The chain is real mbufs; loc is
+	# nondeterministic.  GEO: one mbuf, two mbufs, and a chain with an empty
+	# mbuf to step over.
+	hg="$here/mbuf/m_getptr.c"
+	ug="m_getptr.0:4,proof_getptr.0:4,proof_getptr.1:4,proof_getptr.2:4,proof_getptr.3:4"
+	for g in 0 1 2; do
+		proof mgetptr_geo$g "$hg" "$s" proof_getptr "-DGEO=$g" "$ug"
+	done
+	# The in-mbuf test is m_len > loc: weakening it to >= returns off ==
+	# m_len mid-chain, an offset one past the mbuf's data that a caller would
+	# read out of bounds.  GEO 1's loc can land on the first mbuf's boundary.
+	mutant mgetptr_bound "$hg" "$s" proof_getptr "-DGEO=1" "$ug" \
+	    '/^m_getptr(/,/^}/s/if (m->m_len > loc)/if (m->m_len >= loc)/'
+
 	# m_copyback(), same file: write len bytes at off into an mbuf chain,
 	# growing a mbuf into its trailing room and allocating new mbufs when
 	# off or len runs past the end.  Every write stays inside a mbuf's
