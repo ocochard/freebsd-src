@@ -877,6 +877,19 @@ over-long last fragment, with a spurious MF bit, breaks the tiling).
 fragment loop unbounded); the jobs sweep an exact multiple of the fragment
 payload, a remainder, and a two-fragment split.  No bug found.
 
+Harness `ip/ip_optcopy.c`, for `ip_optcopy()`, same file: copy the "copied"
+IP options from one header to another when building fragments (the real
+copier the `ip_fragment` proof modelled away).  It walks the source options
+and `bcopy()`s each `IPOPT_COPIED` one into the destination option area, then
+pads to a 4-byte boundary.  Each header owns exactly `MAX_IPOPTLEN` option
+bytes as a CBMC object, so a read or write past the area is an out-of-bounds
+access.  Proven, for a well-formed source layout (as `ip_dooptions` leaves
+it): every source read and destination write stays within the option area,
+and the returned length is at most `MAX_IPOPTLEN`.  The mutant
+`ip_optcopy_len`, copying one byte more than the option length, is caught by
+an out-of-bounds write.  The source option length is a constant per job (4,
+8, 40); the option data stays nondeterministic.  No bug found.
+
 Harness `ip6/ip6_fragment.c`, for `ip6_fragment()`, `sys/netinet6/ip6_output.c`:
 the IPv6 counterpart, splitting a packet into fragments of a given `fraglen`.
 The fragments hang off the original's `m_nextpkt`; each fragment's
