@@ -67,6 +67,10 @@ getsockaddr_small 0 100
 ip_dooptions_12 157 2390
 ip_dooptions_4 44 1882
 ip_dooptions_8 65 2001
+ip_fragment_exact 1 89
+ip_fragment_last 1 89
+ip_fragment_rem 1 89
+ip_fragment_two 1 89
 ip_optlen 382 2412
 ip_rroff 145 2190
 kevent 26 789
