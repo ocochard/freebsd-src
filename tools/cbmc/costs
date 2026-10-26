@@ -434,6 +434,9 @@ sbcompress_geo0 278 119
 sbcompress_geo1 205 96
 sbcompress_geo2 279 120
 sbcompress_room 826 1494
+sbctl_fit 2 87
+sbctl_small 2 87
+sbctl_wrap 2 87
 sbreserve 1 89
 sbreserve_cap 0 88
 sendfile_busy_double 1500 39581
