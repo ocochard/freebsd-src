@@ -555,6 +555,9 @@ sendfile_twice_hdrspace 424 11854
 sendfile_xfsize 1 68
 sendfile_xfsize_last 1 68
 serauth 58 1029
+serhmac_max2 1 91
+serhmac_max4 1 90
+serhmac_noinv 1 90
 sockargs 98 20406
 sockargs_cap 2 468
 sockargs_clmax 2 467

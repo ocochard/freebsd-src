@@ -1252,6 +1252,19 @@ within the `max_algo`-entry array.  The mutant `addhmac_full`, dropping the
 full check, is caught by a write one past the array on a full list.
 `MAXALGO` is a constant per job.  No bug found.
 
+Harness `sctp/serialize_hmac.c`, for `sctp_serialize_hmaclist()`, same file:
+write the local HMAC-id list out to a caller buffer for an outgoing
+parameter.  It reads `hmac[0 .. num_algo)` and writes two bytes each.  The
+read must stay within the `max_algo`-entry array and the write within the
+`num_algo * 2` caller buffer.  The list and buffer are CBMC objects of
+exactly their sizes; `num_algo` is nondeterministic.  Proven, for the
+two-entry default and a deeper list: the reads stay within the array and the
+writes within the buffer.  The open question `serhmac_noinv` records the list
+invariant the reads rely on (`num_algo <= max_algo`, which
+`sctp_auth_add_hmacid()` maintains): without it a `num_algo` past `max_algo`
+reads and writes past the objects; no path produces such a list.  `MAXALGO`
+is a constant per job.  No bug found.
+
 ## How it works
 
 - The harness `#include`s the kernel source whole: the code proven is
