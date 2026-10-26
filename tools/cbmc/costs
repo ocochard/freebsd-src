@@ -64,6 +64,9 @@ getsockaddr_max 1 101
 getsockaddr_over 0 100
 getsockaddr_salen 1 100
 getsockaddr_small 0 100
+ip6_fragment_exact 1 90
+ip6_fragment_last 2 90
+ip6_fragment_rem 2 89
 ip_dooptions_12 157 2390
 ip_dooptions_4 44 1882
 ip_dooptions_8 65 2001

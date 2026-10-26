@@ -82,6 +82,9 @@ replace_mmap_len="vm_mmap_object:cbmc_vm_mmap_object
 replace_ip_fragment="m_copym:cbmc_m_copym
 	m_dup_pkthdr:cbmc_m_dup_pkthdr
 	in_cksum:cbmc_in_cksum"
+replace_ip6_fragment="m_copym:cbmc_m_copym
+	m_dup_pkthdr:cbmc_m_dup_pkthdr
+	m_cat:cbmc_m_cat"
 replace_syncookie="syncookie_mac:cbmc_syncookie_mac"
 replace_ktls="ktls_buffer_alloc:cbmc_ktls_buffer_alloc
 	ktls_drop:cbmc_ktls_drop
@@ -215,7 +218,8 @@ for f in $(sed -n 's/^#include "\(opt_[a-z0-9_]*\.h\)"/\1/p' \
     "$top/sys/kern/uipc_usrreq.c" "$top/sys/netinet/tcp_input.c" \
     "$top/sys/kern/kern_exec.c" "$top/sys/netinet/tcp_syncache.c" \
     "$top/sys/netinet/ip_options.c" "$top/sys/vm/vm_mmap.c" \
-    "$top/sys/kern/kern_sysctl.c" "$top/sys/netinet/ip_output.c"); do
+    "$top/sys/kern/kern_sysctl.c" "$top/sys/netinet/ip_output.c" \
+    "$top/sys/netinet6/ip6_output.c"); do
 	: >"$work/inc/$f"
 done
 
@@ -1642,6 +1646,30 @@ if want ip; then
 	# trim leaves it over-long and sets MF, breaking the tiling.
 	mutant ip_fragment_last "$hf" "$sf" proof_fragment "$df -DMTU=48 -DIPLEN=100" "$uf" \
 	    '/^ip_fragment(/,/^}/s/if (off + len >= ip_len)/if (0)/'
+fi
+
+if want ip6; then
+	# ip6_fragment(), sys/netinet6/ip6_output.c: split an IPv6 packet into
+	# fragments of a given fraglen, the IPv6 counterpart of ip_fragment().
+	# The fragments tile [hlen, tlen) exactly: contiguous 8-aligned offsets,
+	# each payload fraglen, the More-Fragments bit on all but the last.  The
+	# per-fragment helpers are modelled and the fragment header placed in a
+	# harness buffer so the offlg writes are bounds-checked.  tlen and fraglen
+	# are constants per job; the jobs sweep an exact multiple and a remainder.
+	h6="$here/ip6/ip6_fragment.c"
+	s6="$top/sys/netinet6/ip6_output.c"
+	u6="ip6_fragment.0:12,ip6_fragment.1:12,ip6_fragment.2:12,ip6_fragment.3:12"
+	u6="$u6,ip6_fragment.4:12,ip6_fragment.5:12,ip6_fragment.6:12"
+	u6="$u6,ip6_fragment.7:12,proof_ip6_fragment.0:16,cbmc_memmove.0:9"
+	d6="-DINET6 -DIP6STAT_ADD(n,v)= -DIP6STAT_INC(n)= "
+	# hlen 40, fraglen 24.  tlen-40 payload: 112=? use 136-40=96=4*24 exact,
+	# 160-40=120=5*24 exact; 150-40=110 remainder.
+	proof ip6_fragment_exact "$h6" "$s6" proof_ip6_fragment "$d6 -DTLEN=136 -DFRAGLEN=24" "$u6"
+	proof ip6_fragment_rem "$h6" "$s6" proof_ip6_fragment "$d6 -DTLEN=150 -DFRAGLEN=24" "$u6"
+	# The last fragment's length trim is load-bearing: dropping it over-sizes
+	# the last fragment and sets MF, breaking the tiling.
+	mutant ip6_fragment_last "$h6" "$s6" proof_ip6_fragment "$d6 -DTLEN=150 -DFRAGLEN=24" "$u6" \
+	    '/^ip6_fragment(/,/^}/s/if (off + fraglen >= tlen)/if (0)/'
 fi
 
 if want reass; then
