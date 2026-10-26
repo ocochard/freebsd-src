@@ -2046,6 +2046,23 @@ if want sctp; then
 	# more than 32 set chunks writes past the 32-byte buffer.
 	mutant packauth_flat "$hk" "$s" proof_pack "-DINET -DINET6 -DPACK -DNSET=40" "$up" \
 	    '/^sctp_pack_auth_chunks(/,/^}/s/if (list->num_chunks <= 32)/if (1)/'
+
+	# sctp_auth_add_hmacid(), same file: append an HMAC id to the hmaclist,
+	# whose flexible hmac[] holds max_algo entries.  The append writes
+	# hmac[num_algo++] guarded by a full check (num_algo == max_algo), so the
+	# write stays within the max_algo entries.  The list is a CBMC object of
+	# exactly that size; num_algo and the existing ids are nondeterministic.
+	# MAXALGO sweeps the two-entry default (SHA1 + SHA256) and a deeper list.
+	ha="$here/sctp/add_hmacid.c"
+	for n in 2 4; do
+		aa="sctp_auth_add_hmacid.0:$((n + 1)),proof_add_hmacid.0:$((n + 1))"
+		proof addhmac_max$n "$ha" "$s" proof_add_hmacid "-DINET -DINET6 -DMAXALGO=$n" "$aa"
+	done
+	# The full check is load-bearing: dropping it lets an append on a full
+	# list write hmac[max_algo], one past the array.
+	mutant addhmac_full "$ha" "$s" proof_add_hmacid "-DINET -DINET6 -DMAXALGO=2" \
+	    "sctp_auth_add_hmacid.0:3,proof_add_hmacid.0:3" \
+	    '/^sctp_auth_add_hmacid(/,/^}/s/if (list->num_algo == list->max_algo)/if (0)/'
 fi
 
 if want bpf; then

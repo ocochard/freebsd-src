@@ -1240,6 +1240,18 @@ for a list with more than 32 set chunks, is caught by a write past the
 32-byte buffer.  `NSET` (the set-chunk count) is a constant per job.  No bug
 found.
 
+Harness `sctp/add_hmacid.c`, for `sctp_auth_add_hmacid()`, same file: append
+an HMAC algorithm id to the hmaclist, whose flexible `hmac[]` holds
+`max_algo` entries.  The append writes `hmac[num_algo++]`, guarded by a full
+check (`num_algo == max_algo`), so the write must stay within the `max_algo`
+entries allocated.  The list is a CBMC object of exactly
+`sizeof(sctp_hmaclist_t) + MAXALGO * sizeof(uint16_t)`; `num_algo` and the
+existing ids are nondeterministic, so every fill level is covered.  Proven,
+for the two-entry default (SHA1 + SHA256) and a deeper list: the append stays
+within the `max_algo`-entry array.  The mutant `addhmac_full`, dropping the
+full check, is caught by a write one past the array on a full list.
+`MAXALGO` is a constant per job.  No bug found.
+
 ## How it works
 
 - The harness `#include`s the kernel source whole: the code proven is
