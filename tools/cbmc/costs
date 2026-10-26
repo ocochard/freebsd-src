@@ -615,3 +615,8 @@ unp_int_passable 10 426
 unp_internalize_0 3 137
 unp_internalize_1 8 341
 unp_internalize_2 12 492
+unpackauth_32 1 90
+unpackauth_bits 1 90
+unpackauth_empty 1 90
+unpackauth_over 1 91
+unpackauth_small 1 90
