@@ -563,6 +563,12 @@ tcp_sackmod 205 802
 tcp_siglen 155 642
 tcp_tfolen 54 478
 tcp_wscale 151 770
+uiomove_advance 0 87
+uiomove_clamp 0 88
+uiomove_geo0 0 87
+uiomove_geo1 0 87
+uiomove_geo2 0 88
+uiomove_geo3 0 88
 unp_ext_extfp 3 102
 unp_ext_finstall 2 96
 unp_ext_freearray 3 102
