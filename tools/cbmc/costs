@@ -74,6 +74,10 @@ ip_fragment_exact 1 89
 ip_fragment_last 1 89
 ip_fragment_rem 1 89
 ip_fragment_two 1 89
+ip_optcopy_4 1 89
+ip_optcopy_40 2 98
+ip_optcopy_8 1 88
+ip_optcopy_len 2 103
 ip_optlen 382 2412
 ip_rroff 145 2190
 kevent 26 789

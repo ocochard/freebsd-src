@@ -1646,6 +1646,23 @@ if want ip; then
 	# trim leaves it over-long and sets MF, breaking the tiling.
 	mutant ip_fragment_last "$hf" "$sf" proof_fragment "$df -DMTU=48 -DIPLEN=100" "$uf" \
 	    '/^ip_fragment(/,/^}/s/if (off + len >= ip_len)/if (0)/'
+
+	# ip_optcopy(), sys/netinet/ip_options.c: copy the "copied" IP options
+	# from one header to another when building fragments.  It walks the
+	# source options and bcopy()s each copied one into the destination option
+	# area, then pads to 4 bytes.  Both source reads and destination writes
+	# stay within the 40-byte option areas.  Each header owns exactly
+	# MAX_IPOPTLEN option bytes as a CBMC object, so a read or write past it
+	# is an out-of-bounds access.  A well-formed source layout per job.
+	hc="$here/ip/ip_optcopy.c"
+	uc="ip_optcopy.0:12,proof_optcopy.0:41,cbmc_memmove.0:41"
+	for n in 4 8 40; do
+		proof ip_optcopy_$n "$hc" "$s" proof_optcopy "-DINET -DOPTLEN=$n" "$uc"
+	done
+	# The copy length is exactly the option length: copying one byte more
+	# writes past the source option and the destination area.
+	mutant ip_optcopy_len "$hc" "$s" proof_optcopy "-DINET -DOPTLEN=40" "$uc" \
+	    '/^ip_optcopy(/,/^}/s/bcopy(cp, dp, optlen);/bcopy(cp, dp, optlen + 1);/'
 fi
 
 if want ip6; then
