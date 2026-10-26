@@ -337,6 +337,8 @@ mcopym_geo1 0 86
 mcopym_geo2 0 86
 mcopym_geo3 0 86
 mcopym_minlen 0 86
+mlock_len 1 90
+mlock_wrap 1 91
 mmap_len 1 92
 mmap_wrap 1 92
 mpulldown_geo0 0 87

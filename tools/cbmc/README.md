@@ -1015,6 +1015,23 @@ least `len` and page-aligned, so a wrapped size never takes effect.  The
 mutant `mmap_wrap`, dropping the `len > size` guard, is caught by the size
 reaching the mapping being smaller than `len`.  No bug found.
 
+Harness `mmap/mlock_len.c`, for the address/length validation of
+`kern_mlock()`, same file: `mlock(2)` rounds `[addr, addr+len)` to pages and
+guards the sum wrapping (`last < addr || end < addr`).  `addr` and `len` are
+nondeterministic; `vm_map_wire()` is intercepted to observe the range.
+Proven: the range reaching `vm_map_wire()` is always ordered (`end >=
+start`) and page-aligned.  The mutant `mlock_wrap`, dropping the guard, is
+caught by the range no longer being ordered.
+
+This found a coverage gap: for `addr == 0` and a `len` in the last page of
+the address space (e.g. `mlock(0, (size_t)-1)`), `round_page(addr + len)`
+wraps to 0; the guard `end < addr` (0 < 0) misses it, `npages` becomes
+`atop(0 - 0) == 0`, and `kern_mlock()` returns success having wired nothing
+-- a silent no-op instead of locking or failing.  `kern_mmap()` catches the
+equivalent wrap with an explicit `len > size` check; `kern_mlock()` has
+none.  Not a memory-safety issue (the 0-length range is well-formed), a
+contract violation; sent to the maintainers as a question.
+
 ## sysctl(2): what is proven
 
 Harness `sysctl/old_user.c`, for `sysctl_old_user()`,

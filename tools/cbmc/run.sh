@@ -79,6 +79,9 @@ replace_recvmsg="getsock:cbmc_getsock
 	m_dispose_extcontrolm:cbmc_dispose"
 replace_mmap_len="vm_mmap_object:cbmc_vm_mmap_object
 	kern_mmap_maxprot:cbmc_kern_mmap_maxprot"
+replace_mlock_len="vm_map_wire:cbmc_vm_map_wire
+	priv_check_cred:cbmc_priv_check_cred
+	pmap_wired_count:cbmc_pmap_wired_count"
 replace_ip_fragment="m_copym:cbmc_m_copym
 	m_dup_pkthdr:cbmc_m_dup_pkthdr
 	in_cksum:cbmc_in_cksum"
@@ -131,6 +134,7 @@ cbmc_tcp="--no-signed-overflow-check"
 cbmc_read="--no-signed-overflow-check"
 cbmc_sbreserve="--unsigned-overflow-check"
 cbmc_mmap_len="--no-signed-overflow-check"
+cbmc_mlock_len="--no-signed-overflow-check"
 replace_sack="tcp_record_dsack:cbmc_tcp_record_dsack"
 cbmc_sack="--no-signed-overflow-check"
 cbmc_ktls_sbc="--no-signed-overflow-check --object-bits 10"
@@ -1815,6 +1819,20 @@ if want mmap; then
 	# through to the mapping.
 	mutant mmap_wrap "$h" "$s" proof_mmap_len "-DINET -DINET6" "$um" \
 	    '/^kern_mmap(/,/^}/s/if (len > size)/if (0)/'
+
+	# The address/length wrap guard of kern_mlock(), sys/vm/vm_mmap.c:
+	# mlock(2) rounds [addr, addr+len) to pages and guards the sum wrapping
+	# (last < addr || end < addr).  A wrapped range would wire a bogus
+	# region.  addr and len are nondeterministic; vm_map_wire() is
+	# intercepted to check the range reaching it is ordered, page-aligned and
+	# covers the request.
+	hl="$here/mmap/mlock_len.c"
+	ul="kern_mlock.0:4,proof_mlock_len.0:4"
+	proof mlock_len "$hl" "$s" proof_mlock_len "-DINET -DINET6" "$ul"
+	# The wrap guard is load-bearing: dropping it lets a wrapped range reach
+	# vm_map_wire with end < start.
+	mutant mlock_wrap "$hl" "$s" proof_mlock_len "-DINET -DINET6" "$ul" \
+	    '/^kern_mlock(/,/^}/s/if (last < addr || end < addr)/if (0)/'
 fi
 
 if want sysctl; then
