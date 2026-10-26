@@ -14,6 +14,9 @@ changes when the branch is rebased: look the hash up again before filing.
 
 ## 2. kern_mlock(): round_page(addr + len) wrap returns success locking nothing
 
+**To:** markj@ / kib@ (vm)
+**Subject:** kern_mlock(): round_page(addr+len) wrap returns success locking nothing
+
 **What happens:** `mlock(0, (size_t)-1)` -- and any `mlock()` with a
 page-aligned `addr` and a `len` in the last page of the address space --
 returns 0 (success) while wiring no pages, instead of locking the range or
