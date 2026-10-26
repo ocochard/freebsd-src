@@ -1053,6 +1053,22 @@ sb_hiwat`.  The mutant `sbreserve_cap`, which drops the cap, is caught by
 reached only with a non-NULL thread, which the proof does not pass.  No bug
 found.
 
+Harness `sockbuf/sbcreatecontrol.c`, for `sbcreatecontrol()`, same file:
+build a control-message (cmsg) mbuf of `size` payload bytes, used by the
+socket layer to hand ancillary data (SCM_RIGHTS, SCM_CREDS, IPv6 options) to
+`recvmsg(2)`.  It sizes the mbuf by `CMSG_SPACE(size)`, zeroes it, copies
+`size` payload bytes in, and writes the cmsg header.  This covers the plain
+path (`CMSG_SPACE(size) <= MLEN`), where the mbuf data area is a real MLEN
+object.  Proven: the `CMSG_SPACE` zero and the `size`-byte payload copy stay
+within the mbuf for a small payload (`sbctl_small`) and the largest that fits
+MLEN (`sbctl_fit`).  The open question `sbctl_wrap` records a latent gap: for
+a `size` where `_ALIGN(size)` overflows `u_int`, `CMSG_SPACE(size)` collapses
+below MLEN and the mbuf is sized small, yet the payload `memcpy` still uses
+the full `size`, writing past the mbuf.  No in-tree caller passes such a
+`size` (the variable-size callers bound it to a packet, or pass `p == NULL`
+so the copy is skipped), so it is not reachable today; `reports/socket.md` has
+the analysis.
+
 ## mmap(2): what is proven
 
 Harness `mmap/mmap_len.c`, for the length/offset validation of

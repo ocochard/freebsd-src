@@ -133,6 +133,10 @@ cbmc_ktls_enable="--no-signed-overflow-check"
 cbmc_tcp="--no-signed-overflow-check"
 cbmc_read="--no-signed-overflow-check"
 cbmc_sbreserve="--unsigned-overflow-check"
+# sbcreatecontrol's bzero/memcpy are byte loops in the kern.h model; a size
+# near UINT_MAX would blow up their unwinding, so swap in touch models.
+replace_sbcreatecontrol="cbmc_memset:cbmc_sb_memset
+	cbmc_memcpy:cbmc_sb_memcpy"
 cbmc_mmap_len="--no-signed-overflow-check"
 cbmc_mlock_len="--no-signed-overflow-check"
 replace_sack="tcp_record_dsack:cbmc_tcp_record_dsack"
@@ -1881,6 +1885,27 @@ if want sockbuf; then
 	# The cap is load-bearing: dropping it lets cc * sb_efficiency overflow.
 	mutant sbreserve_cap "$r" "$s" proof_sbreserve "" "" \
 	    '/^sbreserve_locked_limit(/,/^}/s/if (cc > BUF_MAX_ADJ(buf_max))/if (0)/'
+
+	# sbcreatecontrol(), same file: build a control-message (cmsg) mbuf of
+	# size payload bytes, used by the socket layer to hand ancillary data to
+	# recvmsg(2).  It sizes the mbuf by CMSG_SPACE(size), zeroes it, copies
+	# size payload bytes in, and writes the cmsg header.  The zero and the
+	# copy must stay within the mbuf storage.  This covers the plain-mbuf
+	# path (CMSG_SPACE(size) <= MLEN); the mbuf data area is a real MLEN
+	# object.  SIZE is a constant per job: small payloads, the largest that
+	# still fits MLEN, and the value where _ALIGN(size) wraps u_int.
+	c="$here/sockbuf/sbcreatecontrol.c"
+	cc="sbcreatecontrol.0:2"
+	proof sbctl_small "$c" "$s" proof_sbcreatecontrol "-DSIZE=8" "$cc"
+	proof sbctl_fit "$c" "$s" proof_sbcreatecontrol "-DSIZE=(MLEN-16)" "$cc"
+	# A latent gap, left open as a question: for a size where _ALIGN(size)
+	# overflows u_int, CMSG_SPACE(size) collapses below MLEN so the mbuf is
+	# sized small (plain path), yet the payload memcpy still uses the full
+	# size, writing past the mbuf.  No in-tree caller passes such a size
+	# (the variable-size callers bound it to a packet, or pass p == NULL so
+	# the memcpy is skipped), so this is not reachable today; see README and
+	# reports/socket.md.
+	question sbctl_wrap "$c" "$s" proof_sbcreatecontrol "-DSIZE=0xfffffff9U" "$cc"
 fi
 
 if want mmap; then
