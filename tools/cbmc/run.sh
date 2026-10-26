@@ -1967,6 +1967,28 @@ if want bpf; then
 	# program that does not end in BPF_RET.
 	mutant bpfval_ret "$h" "$s" proof_bpf_validate "-DLEN=2" "$bv" \
 	    '/^bpf_validate(/,/^}/s/return (BPF_CLASS(f\[len - 1\].code) == BPF_RET);/return (1);/'
+
+	# bpf_filter(), same file: the interpreter.  Its packet loads (BPF_LD of
+	# a word/half/byte, absolute or X-indexed) guard the read against buflen
+	# before touching p[k]; a wrong guard reads past the packet and leaks
+	# adjacent memory into the accumulator.  The packet is a BUFLEN-byte CBMC
+	# object; a short program drives one load with a nondet X and k, and CBMC
+	# bounds-checks the read.  buflen is non-zero, so the mbuf fallback is not
+	# the subject.  LOAD selects the load per job.
+	hf="$here/bpf/bpf_filter.c"
+	bf="bpf_filter.3:4"
+	for l in 0 1 2 3 4 5; do
+		proof bpffilt_ld$l "$hf" "$s" proof_bpf_filter "-DLOAD=$l -DBUFLEN=8" "$bf"
+	done
+	# The absolute-word load guards k > buflen || sizeof > buflen - k;
+	# dropping the first clause lets a large k with the unsigned buflen - k
+	# wrapping slip a read past the packet.
+	mutant bpffilt_absw "$hf" "$s" proof_bpf_filter "-DLOAD=0 -DBUFLEN=8" "$bf" \
+	    '/case BPF_LD|BPF_W|BPF_ABS:/,/continue;/s/if (k > buflen || sizeof(int32_t) > buflen - k)/if (sizeof(int32_t) > buflen - k)/'
+	# The X-indexed byte load guards pc->k >= buflen || X >= buflen - pc->k;
+	# dropping the second clause lets X push the read past the packet.
+	mutant bpffilt_indb "$hf" "$s" proof_bpf_filter "-DLOAD=5 -DBUFLEN=8" "$bf" \
+	    '/case BPF_LD|BPF_B|BPF_IND:/,/continue;/s/if (pc->k >= buflen || X >= buflen - pc->k)/if (pc->k >= buflen)/'
 fi
 
 if want sysctl; then
