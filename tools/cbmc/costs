@@ -79,6 +79,10 @@ getsockaddr_max 1 101
 getsockaddr_over 0 100
 getsockaddr_salen 1 100
 getsockaddr_small 0 100
+hmacparam_empty 1 90
+hmacparam_full 1 91
+hmacparam_small 1 90
+hmacparam_underflow 1 90
 ip6_fragment_exact 1 90
 ip6_fragment_last 2 90
 ip6_fragment_rem 2 89

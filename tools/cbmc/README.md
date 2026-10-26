@@ -1193,6 +1193,24 @@ absolute-word guard, and `bpffilt_indb`, dropping the `X >= buflen - pc->k`
 clause of the indexed-byte guard, are each caught by an out-of-bounds packet
 read.  No bug found.
 
+## SCTP AUTH parameters: what is proven
+
+Harness `sctp/hmac_param.c`, for `sctp_verify_hmac_param()`,
+`sys/netinet/sctp_auth.c`: the scan of a peer's HMAC-algorithm list, carried
+in an INIT/INIT-ACK `SCTP_HMAC_LIST` parameter, for the mandatory SHA1.  The
+caller derives `num_hmacs` from the parameter length `plen` as `(plen -
+sizeof(*hmacs)) / sizeof(hmac_ids[0])`, then the scan reads `hmac_ids[0 ..
+num_hmacs)`, which must stay within the `plen`-byte parameter buffer.  The
+buffer is a `PLEN`-byte CBMC object; `PLEN` is a constant per job.  Proven,
+for the smallest valid parameter (no ids), a few ids, and the full
+`SCTP_PARAM_BUFFER_SIZE` buffer: the scan stays within the buffer.  The open
+question `hmacparam_underflow` records the precondition the caller
+establishes: `sctp_verify_auth_params()` breaks on `plen < sizeof(struct
+sctp_paramhdr)` before computing `num_hmacs`, and since `sizeof(struct
+sctp_paramhdr) == sizeof(*hmacs)`, `plen - sizeof(*hmacs)` never underflows;
+a `plen` below that (which no caller passes) makes `num_hmacs` huge and the
+scan runs off the buffer.  No bug found.
+
 ## How it works
 
 - The harness `#include`s the kernel source whole: the code proven is
