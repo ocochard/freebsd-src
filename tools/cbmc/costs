@@ -373,6 +373,10 @@ mcopyout_guard 2 90
 mcopyout_one 2 90
 mcopyout_short 2 90
 mcopyout_two 2 90
+mgetptr_bound 0 87
+mgetptr_geo0 0 87
+mgetptr_geo1 0 86
+mgetptr_geo2 0 87
 mlock_len 1 90
 mlock_wrap 1 91
 mmap_len 1 92
