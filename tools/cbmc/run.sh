@@ -2004,6 +2004,25 @@ if want sctp; then
 	# first); see README.
 	question hmacparam_underflow "$h" "$s" proof_hmac_param \
 	    "-DINET -DINET6 -DPLEN=2" "$hp"
+
+	# sctp_unpack_auth_chunks(), same file: unpack a peer's AUTH chunk-list
+	# parameter into the chklist bitmap, either a flat list of num_chunks
+	# bytes or (num_chunks > 32) a 32-byte bitfield.  Each byte read must stay
+	# within the wire buffer, and every marked chunk type must index
+	# chunks[256] in bounds.  The wire buffer is sized to the bytes read; the
+	# chklist is a real struct.  NUM_CHUNKS sweeps an empty list, a small
+	# flat list, the 32-byte boundary, and the bitfield form.
+	hu="$here/sctp/unpack_auth.c"
+	uu="sctp_unpack_auth_chunks.0:33,sctp_unpack_auth_chunks.1:9"
+	uu="$uu,sctp_unpack_auth_chunks.2:33,proof_unpack_auth.0:257"
+	proof unpackauth_empty "$hu" "$s" proof_unpack_auth "-DINET -DINET6 -DNUM_CHUNKS=0"  "$uu"
+	proof unpackauth_small "$hu" "$s" proof_unpack_auth "-DINET -DINET6 -DNUM_CHUNKS=5"  "$uu"
+	proof unpackauth_32    "$hu" "$s" proof_unpack_auth "-DINET -DINET6 -DNUM_CHUNKS=32" "$uu"
+	proof unpackauth_bits  "$hu" "$s" proof_unpack_auth "-DINET -DINET6 -DNUM_CHUNKS=40" "$uu"
+	# The flat form reads exactly num_chunks bytes; an off-by-one in the loop
+	# bound reads one byte past the wire buffer.
+	mutant unpackauth_over "$hu" "$s" proof_unpack_auth "-DINET -DINET6 -DNUM_CHUNKS=5" "$uu" \
+	    '/^sctp_unpack_auth_chunks(/,/^}/s/for (i = 0; i < num_chunks; i++)/for (i = 0; i <= num_chunks; i++)/'
 fi
 
 if want bpf; then

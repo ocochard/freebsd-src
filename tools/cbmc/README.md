@@ -1211,6 +1211,19 @@ sctp_paramhdr) == sizeof(*hmacs)`, `plen - sizeof(*hmacs)` never underflows;
 a `plen` below that (which no caller passes) makes `num_hmacs` huge and the
 scan runs off the buffer.  No bug found.
 
+Harness `sctp/unpack_auth.c`, for `sctp_unpack_auth_chunks()`, same file:
+unpack a peer's AUTH chunk-list parameter (from an INIT/INIT-ACK) into the
+chklist bitmap, either a flat list of `num_chunks` bytes read one each or
+(for `num_chunks > 32`) a fixed 32-byte bitfield.  The wire buffer is a CBMC
+object of exactly the bytes the chosen form reads; the chklist is a real
+`sctp_auth_chklist_t`.  Proven, for an empty list, a small flat list, the
+32-byte boundary, and the bitfield form: every byte read stays within the
+wire buffer, and every chunk type the unpack marks (through
+`sctp_auth_add_chunk`, `list->chunks[chunk]` with a `uint8_t` index) indexes
+the 256-entry array in bounds.  The mutant `unpackauth_over`, an off-by-one
+in the flat-list loop bound, is caught by a read one byte past the wire
+buffer.  `NUM_CHUNKS` is a constant per job.  No bug found.
+
 ## How it works
 
 - The harness `#include`s the kernel source whole: the code proven is
