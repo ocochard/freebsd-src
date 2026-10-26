@@ -824,6 +824,20 @@ Geometry is a constant per job: a fit in the trailing space, a spill to a
 fresh mbuf, a full last mbuf, and a two-mbuf destination spilling off the end.
 No bug found.
 
+Harness `mbuf/m_apply.c`, for `m_apply()`, same file: run a caller function
+`f` over `len` bytes of a chain starting `off` bytes in, used by the checksum
+and crypto paths to walk a run of packet data in place.  It skips to the mbuf
+holding byte `off`, then hands `f` each sub-run `[m_data + off, +min(m_len -
+off, len))`.  The chain is real `struct mbuf`s, each a separate object; `f`
+is pinned to the harness callback, which checks the run it is handed lies
+within the mbuf.  Proven, over the plain (non-`M_EXTPG`) path: each sub-run
+stays within its mbuf's data and the runs cover exactly `len` bytes.  The
+mutant `mapply_min`, handing `f` the whole remaining `len` from a shorter
+mbuf, is caught by an out-of-bounds read in a geometry placing the mbuf at
+the `MLEN` tail.  Geometry is a constant per job: a run inside the first
+mbuf, one starting mid-mbuf, a three-mbuf span, a run reaching the last byte,
+and the tail case.  The `M_EXTPG` path is not covered.  No bug found.
+
 Harness `mbuf/m_copyback.c`, for `m_copyback()`, same file: the writing
 counterpart, which puts `len` bytes at `off` into a chain, grows a mbuf
 into its trailing room, and allocates fresh mbufs when `off` or `len`
