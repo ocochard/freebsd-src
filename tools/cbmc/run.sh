@@ -1979,6 +1979,33 @@ if want mmap; then
 	    '/^kern_mlock(/,/^}/s/if (last < addr || end < addr)/if (0)/'
 fi
 
+if want sctp; then
+	# sctp_verify_hmac_param(), sys/netinet/sctp_auth.c: scan a peer's
+	# HMAC-algorithm list from an INIT/INIT-ACK parameter for the mandatory
+	# SHA1.  num_hmacs is derived from the parameter length as (plen -
+	# sizeof(*hmacs)) / sizeof(hmac_ids[0]); the scan reads hmac_ids[0 ..
+	# num_hmacs), which must stay within the plen-byte buffer.  The buffer is
+	# a PLEN-byte CBMC object; PLEN is a constant per job.
+	h="$here/sctp/hmac_param.c"
+	s="$top/sys/netinet/sctp_auth.c"
+	# num_hmacs can be up to (512 - 4) / 2 = 254; unwind the scan to cover
+	# the largest job.
+	hp="sctp_verify_hmac_param.0:255"
+	# PLEN sweeps the smallest valid parameter (no ids), a few ids, and the
+	# full SCTP_PARAM_BUFFER_SIZE buffer.
+	proof hmacparam_empty "$h" "$s" proof_hmac_param "-DINET -DINET6 -DPLEN=4" "$hp"
+	proof hmacparam_small "$h" "$s" proof_hmac_param "-DINET -DINET6 -DPLEN=12" "$hp"
+	proof hmacparam_full  "$h" "$s" proof_hmac_param "-DINET -DINET6 -DPLEN=512" "$hp"
+	# The caller's guard plen >= sizeof(struct sctp_paramhdr) (== sizeof(*hmacs))
+	# keeps (plen - sizeof(*hmacs)) from underflowing.  Left open as a
+	# question: a plen below it makes num_hmacs huge and the scan reads far
+	# past the buffer.  No caller reaches sctp_verify_hmac_param() without
+	# that guard (sctp_verify_auth_params breaks on plen < sizeof(paramhdr)
+	# first); see README.
+	question hmacparam_underflow "$h" "$s" proof_hmac_param \
+	    "-DINET -DINET6 -DPLEN=2" "$hp"
+fi
+
 if want bpf; then
 	# bpf_validate(), sys/net/bpf_filter.c: the check of a classic-BPF
 	# program before BIOCSETF installs it and bpf_filter() runs it on every
