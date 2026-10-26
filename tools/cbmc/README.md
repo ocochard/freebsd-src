@@ -1147,6 +1147,23 @@ dropping the memory-index check, by an index past `BPF_MEMWORDS`; and
 `bpfval_ret`, dropping the trailing-return check, by an accepted program that
 does not end in a return.  No bug found.
 
+Harness `bpf/bpf_filter.c`, for `bpf_filter()`, same file: the interpreter
+that `bpf_validate()` gates, run on every captured packet.  Its packet loads
+(`BPF_LD` of a word, half or byte, by absolute or `X`-indexed offset) each
+guard the access against `buflen` before reading `p[k]`; a wrong guard reads
+past the packet and leaks adjacent memory into the accumulator.  The packet
+is a `BUFLEN`-byte CBMC object, so an in-buffer load past it is an
+out-of-bounds read.  A short program -- an `X` seed, the load under test, and
+a return -- drives one load with a nondeterministic `X` and `k`; `buflen` is
+non-zero, so the `m_xword`/`m_xhalf` mbuf fallback (taken only at `buflen ==
+0`) is not the subject.  Proven, for each of the six loads (word/half/byte x
+absolute/indexed): the read stays within the packet for any `X` and `k`,
+including the unsigned `X + k` and `buflen - k` arithmetic the guards hinge
+on.  The mutant `bpffilt_absw`, dropping the `k > buflen` clause of the
+absolute-word guard, and `bpffilt_indb`, dropping the `X >= buflen - pc->k`
+clause of the indexed-byte guard, are each caught by an out-of-bounds packet
+read.  No bug found.
+
 ## How it works
 
 - The harness `#include`s the kernel source whole: the code proven is
