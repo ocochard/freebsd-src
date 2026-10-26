@@ -18,6 +18,9 @@ accept_nonblock 3 147
 accept_retlen 3 147
 accept_retval 3 140
 accept_setown 3 142
+addhmac_full 1 90
+addhmac_max2 1 90
+addhmac_max4 1 91
 addopt_sackclamp 48 2972
 bpffilt_absw 0 85
 bpffilt_indb 0 86
