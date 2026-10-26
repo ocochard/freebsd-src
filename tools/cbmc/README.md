@@ -861,6 +861,22 @@ ran the parser past the time budget); the jobs sweep the minimum and sizes
 reaching the record-route and timestamp opcodes, up to 12 bytes -- the
 full 40-byte area is too slow and adds no opcode.  No bug found.
 
+Harness `ip/ip_fragment.c`, for `ip_fragment()`, `sys/netinet/ip_output.c`:
+split an IPv4 packet too large for the outgoing MTU into fragments.  The
+fragments it builds are collected off the original's `m_nextpkt` chain and
+their `(ip_off, ip_len)` checked.  Proven: the fragments tile `[hlen,
+ip_len)` exactly -- contiguous 8-byte-aligned offsets, each payload at most
+the MTU payload, the More-Fragments bit set on every fragment but the last,
+and together covering the whole payload.  The per-fragment mbuf helpers
+(`m_gethdr` via the UMA model, `m_dup_pkthdr`, `m_copym`, `in_cksum`,
+`ip_optcopy`) are modelled; the packet carries no options (`hlen = 20`) and
+no delayed checksum.  The mutant `ip_fragment_last`, dropping the trim of
+the final fragment to the remainder, is caught by the coverage check (an
+over-long last fragment, with a spurious MF bit, breaks the tiling).
+`ip_len` and `mtu` are constants per job (a symbolic length makes the
+fragment loop unbounded); the jobs sweep an exact multiple of the fragment
+payload, a remainder, and a two-fragment split.  No bug found.
+
 ## TCP reassembly accounting: what is proven
 
 Harness `tcp/reass.c`, for the reassembly helpers of

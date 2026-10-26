@@ -79,6 +79,9 @@ replace_recvmsg="getsock:cbmc_getsock
 	m_dispose_extcontrolm:cbmc_dispose"
 replace_mmap_len="vm_mmap_object:cbmc_vm_mmap_object
 	kern_mmap_maxprot:cbmc_kern_mmap_maxprot"
+replace_ip_fragment="m_copym:cbmc_m_copym
+	m_dup_pkthdr:cbmc_m_dup_pkthdr
+	in_cksum:cbmc_in_cksum"
 replace_syncookie="syncookie_mac:cbmc_syncookie_mac"
 replace_ktls="ktls_buffer_alloc:cbmc_ktls_buffer_alloc
 	ktls_drop:cbmc_ktls_drop
@@ -212,7 +215,7 @@ for f in $(sed -n 's/^#include "\(opt_[a-z0-9_]*\.h\)"/\1/p' \
     "$top/sys/kern/uipc_usrreq.c" "$top/sys/netinet/tcp_input.c" \
     "$top/sys/kern/kern_exec.c" "$top/sys/netinet/tcp_syncache.c" \
     "$top/sys/netinet/ip_options.c" "$top/sys/vm/vm_mmap.c" \
-    "$top/sys/kern/kern_sysctl.c"); do
+    "$top/sys/kern/kern_sysctl.c" "$top/sys/netinet/ip_output.c"); do
 	: >"$work/inc/$f"
 done
 
@@ -1616,6 +1619,29 @@ if want ip; then
 	# ... the record-route pointer is checked against the option length.
 	mutant ip_rroff "$h" "$s" proof_dooptions "-DINET -DOPTLEN=12" "$ui" \
 	    '/case IPOPT_RR:/,/case IPOPT_TS:/s/if (off > optlen - (int)sizeof(struct in_addr))/if (0)/'
+
+	# ip_fragment(), sys/netinet/ip_output.c: split an IPv4 packet too large
+	# for the MTU into fragments.  The fragments must tile [hlen, ip_len)
+	# exactly: contiguous 8-aligned offsets, each payload <= the MTU payload,
+	# the More-Fragments bit on all but the last.  The per-fragment mbuf
+	# helpers are modelled; ip_len and mtu are constants per job (a symbolic
+	# length makes the loop unbounded).  The jobs sweep an exact multiple of
+	# the fragment payload, a remainder, and a single fragment.
+	hf="$here/ip/ip_fragment.c"
+	sf="$top/sys/netinet/ip_output.c"
+	uf="ip_fragment.0:12,ip_fragment.1:12,ip_fragment.2:12,ip_fragment.3:12"
+	uf="$uf,ip_fragment.4:12,proof_fragment.0:16,cbmc_memmove.0:9"
+	df="-DINET -DIPSTAT_ADD(n,v)= -DIPSTAT_INC(n)= "
+	# MTU 48 -> payload (48-20)&~7 = 24.  ip_fragment is called only when the
+	# packet exceeds the MTU, so IPLEN > MTU.  IPLEN-20 payload: 92-20=72=3*24
+	# exact tiling, 100-20=80 a remainder, 68-20=48=2*24 two fragments.
+	proof ip_fragment_exact "$hf" "$sf" proof_fragment "$df -DMTU=48 -DIPLEN=92" "$uf"
+	proof ip_fragment_rem "$hf" "$sf" proof_fragment "$df -DMTU=48 -DIPLEN=100" "$uf"
+	proof ip_fragment_two "$hf" "$sf" proof_fragment "$df -DMTU=48 -DIPLEN=68" "$uf"
+	# The last fragment's length is trimmed to the remainder: dropping the
+	# trim leaves it over-long and sets MF, breaking the tiling.
+	mutant ip_fragment_last "$hf" "$sf" proof_fragment "$df -DMTU=48 -DIPLEN=100" "$uf" \
+	    '/^ip_fragment(/,/^}/s/if (off + len >= ip_len)/if (0)/'
 fi
 
 if want reass; then
