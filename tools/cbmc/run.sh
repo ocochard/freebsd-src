@@ -143,6 +143,12 @@ cbmc_sbreserve="--unsigned-overflow-check"
 # near UINT_MAX would blow up their unwinding, so swap in touch models.
 replace_sbcreatecontrol="cbmc_memset:cbmc_sb_memset
 	cbmc_memcpy:cbmc_sb_memcpy"
+# sctp_process_asconf_add_ip()'s address-add tail is pcb/timer/notify heavy;
+# stub it so the harness proves the parse/validate/address-read core.
+replace_asconf_addip="sctp_add_remote_addr:cbmc_add_remote_addr
+	sctp_ulp_notify:cbmc_ulp_notify
+	sctp_timer_start:cbmc_timer_start
+	sctp_send_hb:cbmc_send_hb"
 cbmc_mmap_len="--no-signed-overflow-check"
 cbmc_mlock_len="--no-signed-overflow-check"
 replace_sack="tcp_record_dsack:cbmc_tcp_record_dsack"
@@ -2179,6 +2185,29 @@ if want sctp; then
 	# MLEN tail so the over-long copy runs off the mbuf.
 	mutant sgetptr_min "$hg" "$s2" proof_getptr "-DINET -DINET6 -DGEO=3" "$ug" \
 	    '/^sctp_m_getptr(/,/^}/s/count = min(SCTP_BUF_LEN(m) - off, len);/count = len;/'
+
+	# sctp_process_asconf_add_ip(), sys/netinet/sctp_asconf.c: validate one
+	# inbound ASCONF add-IP parameter and read the address out of it.  The
+	# parameter is a CBMC object of exactly APLEN bytes; the size checks
+	# (aparam_length lower bound, param_length + asconf-hdr == aparam_length,
+	# param_length == the address-param size) must keep the v4addr/v6addr
+	# cast read within it.  The address-add tail is stubbed.  PTYPE/APLEN pick
+	# the IPv4 (16-byte) and IPv6 (28-byte) parameters.
+	s3="$top/sys/netinet/sctp_asconf.c"
+	ha="$here/sctp/asconf_addip.c"
+	aa="proof_asconf_addip.0:29,proof_asconf_addip.1:17,cbmc_memmove.0:17"
+	proof asconf_add4 "$ha" "$s3" proof_asconf_addip \
+	    "-DINET -DINET6 -DPTYPE=SCTP_IPV4_ADDRESS -DAPLEN=16" "$aa"
+	proof asconf_add6 "$ha" "$s3" proof_asconf_addip \
+	    "-DINET -DINET6 -DPTYPE=SCTP_IPV6_ADDRESS -DAPLEN=28" "$aa"
+	# The param_length == sizeof(address param) check is load-bearing: with
+	# APLEN=12 (inner param_length 4, still satisfying the param_length +
+	# asconf-hdr == aparam_length check) dropping it lets the fixed 8-byte
+	# ipv4addr cast read run past the 12-byte buffer, caught as an
+	# out-of-bounds access.
+	mutant asconf_add4_sz "$ha" "$s3" proof_asconf_addip \
+	    "-DINET -DINET6 -DPTYPE=SCTP_IPV4_ADDRESS -DAPLEN=12" "$aa" \
+	    '/case SCTP_IPV4_ADDRESS:/,/break;/s/if (param_length != sizeof(struct sctp_ipv4addr_param))/if (0)/'
 fi
 
 if want bpf; then
