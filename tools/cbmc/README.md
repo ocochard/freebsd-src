@@ -1280,8 +1280,20 @@ cstate store is `MAX_HDR` bytes.  Proven: the header-length read, the
 the `MAX_HDR` store.  The mutant `slunc_buflen`, dropping the `hlen > buflen`
 clause of the guard on the grown length, is caught by an out-of-bounds read
 of the wire buffer in the header copy.  `BUFLEN` is a constant per job.  No
-bug found.  (The compressed path's optimistic DECODE reads, validated only
-after the fact by `vjlen`, are not covered here.)
+bug found.
+
+Harness `slcompress/compress.c`, for the `TYPE_COMPRESSED_TCP` path of the
+same function: it walks the compressed header with `cp`, reading 1 to 3 bytes
+per changed field through the `DECODE` macros, and validates the consumed
+length only afterward (`vjlen = cp - buf; if (buflen < 0) bad`).  The wire
+buffer is a `BUFLEN`-byte object and the change mask is pinned per job (a
+symbolic mask blows up the field branching).  The open question `slcmp_short`
+records that for a buffer shorter than the mask's worst-case 19-byte walk,
+the `DECODE` reads run past the buffer before that check.  The `ng_vjc`
+caller pulls up `min(MAX_VJHEADER = 19, pkthdr.len)` bytes, which covers the
+worst case only when `pkthdr.len >= 19`; a shorter compressed packet reads
+past its valid data (and is tossed afterward).  `reports/net.md` has the
+analysis.
 
 ## How it works
 
