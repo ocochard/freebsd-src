@@ -1996,6 +1996,29 @@ if want slcompress; then
 	# length past the wire buffer drive a read and copy past it.
 	mutant slunc_buflen "$h" "$s" proof_uncompress "-DINET -DINET6 -DBUFLEN=40" "$su" \
 	    '/case TYPE_UNCOMPRESSED_TCP:/,/return (0);/s/if (hlen > MAX_HDR || hlen > buflen)/if (hlen > MAX_HDR)/'
+
+	# The TYPE_COMPRESSED_TCP path of the same function: it walks the
+	# compressed header with cp, reading 1-3 bytes per changed field through
+	# the DECODE macros, and validates the consumed length only afterward
+	# (vjlen = cp - buf; if (buflen < 0) bad).  With a wire buffer shorter
+	# than the worst-case compressed header, the DECODE reads run past it
+	# before that check.  BUFLEN is the (short) buffer the reads are checked
+	# against.
+	hc="$here/slcompress/compress.c"
+	sc="sl_uncompress_tcp_core.0:65,proof_compress.0:17,proof_compress.1:17"
+	# CHANGES pins the change mask (NEW_C explicit state + NEW_I + NEW_A +
+	# NEW_S, taking the default SPECIALS branch) so the field DECODEs run; a
+	# symbolic mask blows up the branching.  Left open as a question: the
+	# DECODE macros read 1-3 bytes per field and advance cp, validating the
+	# consumed length only afterward (vjlen = cp - buf; if (buflen < 0) bad),
+	# so a compressed packet shorter than its own change mask demands is read
+	# past before the check.  BUFLEN=8 is shorter than this mask's walk.  The
+	# ng_vjc caller pulls up min(MAX_VJHEADER=19, pkthdr.len) bytes, which
+	# covers the 19-byte worst case only when pkthdr.len >= 19; a shorter
+	# compressed packet reads past its valid data (tossed afterward).  See
+	# reports/net.md.
+	question slcmp_short "$hc" "$s" proof_compress \
+	    "-DINET -DINET6 -DBUFLEN=8 -DCHANGES=0x6c" "$sc"
 fi
 
 if want sctp; then
