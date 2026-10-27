@@ -1979,6 +1979,25 @@ if want mmap; then
 	    '/^kern_mlock(/,/^}/s/if (last < addr || end < addr)/if (0)/'
 fi
 
+if want slcompress; then
+	# The TYPE_UNCOMPRESSED_TCP path of sl_uncompress_tcp_core(),
+	# sys/net/slcompress.c: the Van Jacobson header decompressor, reached from
+	# SLIP/PPP and ng_vjc receive.  It reads the IP/TCP header length from the
+	# wire buffer, guards it against the buffer (hlen > buflen) and the MAX_HDR
+	# state store, then copies the header into the cstate.  The reads and the
+	# copy must stay within the BUFLEN wire buffer and the MAX_HDR store.  The
+	# buffer is a CBMC object; its bytes are nondeterministic.
+	h="$here/slcompress/uncompress.c"
+	s="$top/sys/net/slcompress.c"
+	su="sl_uncompress_tcp_core.0:65,proof_uncompress.0:65,cbmc_memmove.0:65"
+	proof slunc_small "$h" "$s" proof_uncompress "-DINET -DINET6 -DBUFLEN=40" "$su"
+	proof slunc_big   "$h" "$s" proof_uncompress "-DINET -DINET6 -DBUFLEN=60" "$su"
+	# The hlen > buflen guard is load-bearing: dropping it lets a header
+	# length past the wire buffer drive a read and copy past it.
+	mutant slunc_buflen "$h" "$s" proof_uncompress "-DINET -DINET6 -DBUFLEN=40" "$su" \
+	    '/case TYPE_UNCOMPRESSED_TCP:/,/return (0);/s/if (hlen > MAX_HDR || hlen > buflen)/if (hlen > MAX_HDR)/'
+fi
+
 if want sctp; then
 	# sctp_verify_hmac_param(), sys/netinet/sctp_auth.c: scan a peer's
 	# HMAC-algorithm list from an INIT/INIT-ACK parameter for the mandatory
