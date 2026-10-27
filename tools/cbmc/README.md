@@ -1265,6 +1265,24 @@ invariant the reads rely on (`num_algo <= max_algo`, which
 reads and writes past the objects; no path produces such a list.  `MAXALGO`
 is a constant per job.  No bug found.
 
+## VJ header decompression: what is proven
+
+Harness `slcompress/uncompress.c`, for the `TYPE_UNCOMPRESSED_TCP` path of
+`sl_uncompress_tcp_core()`, `sys/net/slcompress.c`: the Van Jacobson TCP/IP
+header decompressor, reached from the SLIP/PPP and `ng_vjc` receive paths.
+The uncompressed path reads the IP/TCP header length from the wire buffer
+(`ip_hl`, then the grown length after adding `th_off`), guards it against the
+buffer and the state's `MAX_HDR` store, and copies the header into the
+per-connection cstate.  The wire buffer is a `BUFLEN`-byte CBMC object with
+nondeterministic bytes (so `ip_hl` and `th_off` take any value), and the
+cstate store is `MAX_HDR` bytes.  Proven: the header-length read, the
+`th_off` read, and the `hlen`-byte copy all stay within the wire buffer and
+the `MAX_HDR` store.  The mutant `slunc_buflen`, dropping the `hlen > buflen`
+clause of the guard on the grown length, is caught by an out-of-bounds read
+of the wire buffer in the header copy.  `BUFLEN` is a constant per job.  No
+bug found.  (The compressed path's optimistic DECODE reads, validated only
+after the fact by `vjlen`, are not covered here.)
+
 ## How it works
 
 - The harness `#include`s the kernel source whole: the code proven is
