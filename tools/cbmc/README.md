@@ -1295,6 +1295,20 @@ worst case only when `pkthdr.len >= 19`; a shorter compressed packet reads
 past its valid data (and is tossed afterward).  `reports/net.md` has the
 analysis.
 
+## getgroups(2): what is proven
+
+Harness `getgroups/getgroups.c`, for `sys_getgroups()`,
+`sys/kern/kern_prot.c`: the syscall copies the credential's `cr_ngroups`
+groups out to a user buffer sized by the `gidsetsize` argument, guarding
+`gidsetsize < ngrp` with `EINVAL`.  `cr_groups` is a CBMC object of exactly
+`cr_ngroups` entries and the user buffer one of exactly `gidsetsize` entries,
+so a read or write past either is an out-of-bounds access; `gidsetsize` is
+nondeterministic, so the guard is exercised over every requested size.
+Proven: the copy-out reads within `cr_groups` and writes within the user
+buffer.  The mutant `getgroups_size`, dropping the `gidsetsize < ngrp` guard,
+is caught by a write past the user buffer when the caller's buffer is smaller
+than the group count.  `NGROUPS` is a constant per job.  No bug found.
+
 ## How it works
 
 - The harness `#include`s the kernel source whole: the code proven is

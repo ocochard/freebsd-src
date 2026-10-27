@@ -1979,6 +1979,23 @@ if want mmap; then
 	    '/^kern_mlock(/,/^}/s/if (last < addr || end < addr)/if (0)/'
 fi
 
+if want getgroups; then
+	# sys_getgroups(), sys/kern/kern_prot.c: getgroups(2) copies the
+	# credential's cr_ngroups groups out to a user buffer sized by
+	# gidsetsize, guarding gidsetsize < ngrp with EINVAL.  The copy-out must
+	# read within cr_groups (NGROUPS entries) and write within the user
+	# buffer (gidsetsize entries).  cr_groups and the user buffer are CBMC
+	# objects of exactly their sizes; gidsetsize is nondeterministic.
+	h="$here/getgroups/getgroups.c"
+	s="$top/sys/kern/kern_prot.c"
+	gg="proof_getgroups.0:2"
+	proof getgroups_n4 "$h" "$s" proof_getgroups "-DINET -DINET6 -DNGROUPS=4" "$gg"
+	# The gidsetsize >= ngrp guard is load-bearing: dropping it copies ngrp
+	# entries into a user buffer smaller than ngrp, overrunning it.
+	mutant getgroups_size "$h" "$s" proof_getgroups "-DINET -DINET6 -DNGROUPS=4" "$gg" \
+	    '/^sys_getgroups(/,/^}/s/if (uap->gidsetsize < ngrp)/if (0)/'
+fi
+
 if want slcompress; then
 	# The TYPE_UNCOMPRESSED_TCP path of sl_uncompress_tcp_core(),
 	# sys/net/slcompress.c: the Van Jacobson header decompressor, reached from
