@@ -130,6 +130,9 @@ cbmc_ktls_ocf="--no-signed-overflow-check"
 # m_apply() runs a caller function over the chain by pointer; pin it to the
 # harness callback so cbmc does not branch over every matching function.
 restrict_m_apply="m_apply_one.function_pointer_call.1/cbmc_apply_f"
+# sys_setgroups() calls kern_setgroups() to do the cred work; stub it so the
+# harness proves only the copy-in.
+replace_setgroups="kern_setgroups:cbmc_kern_setgroups"
 restrict_ktls_send="sosend_generic_locked.function_pointer_call.1/cbmc_pr_send"
 cbmc_ktls_send="--no-signed-overflow-check"
 cbmc_ktls_enable="--no-signed-overflow-check"
@@ -1994,6 +1997,22 @@ if want getgroups; then
 	# entries into a user buffer smaller than ngrp, overrunning it.
 	mutant getgroups_size "$h" "$s" proof_getgroups "-DINET -DINET6 -DNGROUPS=4" "$gg" \
 	    '/^sys_getgroups(/,/^}/s/if (uap->gidsetsize < ngrp)/if (0)/'
+
+	# sys_setgroups(), same file: setgroups(2) copies a user group array into
+	# a kernel buffer -- an on-stack smallgroups[CRED_SMALLGROUPS_NB] for a
+	# small set, else a malloc'd buffer -- before handing it to
+	# kern_setgroups.  The copy-in of gidsetsize entries must fit the chosen
+	# buffer.  The malloc model sizes the buffer to the request; the on-stack
+	# array is fixed.  gidsetsize is nondeterministic in [0, NMAX] with NMAX
+	# straddling CRED_SMALLGROUPS_NB so both branches are covered.
+	hsg="$here/getgroups/setgroups.c"
+	sgr="proof_setgroups.0:2"
+	proof setgroups_n "$hsg" "$s" proof_setgroups "-DINET -DINET6 -DNMAX=20" "$sgr"
+	# The small/large buffer branch is load-bearing: forcing the on-stack
+	# smallgroups array for a set larger than CRED_SMALLGROUPS_NB copies past
+	# it.
+	mutant setgroups_small "$hsg" "$s" proof_setgroups "-DINET -DINET6 -DNMAX=20" "$sgr" \
+	    '/^sys_setgroups(/,/^}/s/if (gidsetsize > CRED_SMALLGROUPS_NB)/if (0)/'
 fi
 
 if want slcompress; then
