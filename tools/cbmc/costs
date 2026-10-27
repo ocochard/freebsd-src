@@ -562,6 +562,11 @@ serhmac_max4 1 90
 serhmac_noinv 1 90
 setgroups_n 1 92
 setgroups_small 1 92
+sgetptr_geo0 3 94
+sgetptr_geo1 3 94
+sgetptr_geo2 3 94
+sgetptr_geo3 2 94
+sgetptr_min 3 94
 slcmp_short 277 7096
 slunc_big 328 2903
 slunc_buflen 330 2901

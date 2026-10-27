@@ -2160,6 +2160,25 @@ if want sctp; then
 	question serhmac_noinv "$hs" "$s" proof_serialize_hmac \
 	    "-DINET -DINET6 -DMAXALGO=2 -DNOINV" \
 	    "sctp_serialize_hmaclist.0:7,proof_serialize_hmac.0:3,cbmc_memmove.0:3"
+
+	# sctp_m_getptr(), sys/netinet/sctputil.c: fetch len bytes at offset off
+	# of an mbuf chain, returning an in-place pointer when contiguous or
+	# copying into the caller buffer when it spans mbufs.  It is the copy
+	# behind every SCTP wire-param parse (ASCONF, AUTH, INIT), so the per-mbuf
+	# copies must read within each mbuf and write within the LEN-byte caller
+	# buffer.  The chain is real mbufs, each a separate object; the geometry
+	# and (off, len) are concrete per job.
+	s2="$top/sys/netinet/sctputil.c"
+	hg="$here/sctp/m_getptr.c"
+	ug="sctp_m_getptr.0:4,sctp_m_getptr.1:4,proof_getptr.0:4,proof_getptr.1:4,cbmc_memmove.0:16"
+	for g in 0 1 2 3; do
+		proof sgetptr_geo$g "$hg" "$s2" proof_getptr "-DINET -DINET6 -DGEO=$g" "$ug"
+	done
+	# The per-mbuf count is min(SCTP_BUF_LEN(m) - off, len): copying the whole
+	# len from a shorter mbuf reads past it.  GEO 3 puts the first mbuf at the
+	# MLEN tail so the over-long copy runs off the mbuf.
+	mutant sgetptr_min "$hg" "$s2" proof_getptr "-DINET -DINET6 -DGEO=3" "$ug" \
+	    '/^sctp_m_getptr(/,/^}/s/count = min(SCTP_BUF_LEN(m) - off, len);/count = len;/'
 fi
 
 if want bpf; then
