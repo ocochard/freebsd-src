@@ -1265,6 +1265,25 @@ invariant the reads rely on (`num_algo <= max_algo`, which
 reads and writes past the objects; no path produces such a list.  `MAXALGO`
 is a constant per job.  No bug found.
 
+Harness `sctp/asconf_addip.c`, for `sctp_process_asconf_add_ip()`,
+`sys/netinet/sctp_asconf.c`: validate and act on one inbound ASCONF add-IP
+parameter.  The parameter has been copied into a buffer of `aparam_length`
+bytes; the function casts the inner address parameter to a fixed
+`sctp_ipv4addr_param` / `sctp_ipv6addr_param` and reads the address out.  The
+size checks (an `aparam_length` lower bound, `param_length + asconf-hdr ==
+aparam_length`, and `param_length ==` the address-param size) must keep that
+read within the buffer.  The parameter is a CBMC object of exactly `APLEN`
+bytes; the address-add tail (`sctp_add_remote_addr` and the notify/timer/hb
+calls) is stubbed via `--replace-calls`, so the proof is the
+parse/validate/read core.  Proven, for the IPv4 (16-byte) and IPv6 (28-byte)
+parameters: the address read stays within the buffer.  The mutant
+`asconf_add4_sz`, dropping the `param_length ==
+sizeof(struct sctp_ipv4addr_param)` check on a short (12-byte) parameter, is
+caught by an out-of-bounds read of the buffer.  `PTYPE`/`APLEN` select the
+parameter per job.  No bug found.  (This is one representative of the ASCONF
+add/delete/set-primary trio; the copy that fills the buffer is
+`sctp_m_getptr`, proven above.)
+
 Harness `sctp/m_getptr.c`, for `sctp_m_getptr()`, `sys/netinet/sctputil.c`:
 fetch `len` bytes at offset `off` of an mbuf chain, returning an in-place
 pointer when the run is contiguous or copying it into the caller buffer when
