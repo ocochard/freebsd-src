@@ -1309,6 +1309,19 @@ buffer.  The mutant `getgroups_size`, dropping the `gidsetsize < ngrp` guard,
 is caught by a write past the user buffer when the caller's buffer is smaller
 than the group count.  `NGROUPS` is a constant per job.  No bug found.
 
+Harness `getgroups/setgroups.c`, for `sys_setgroups()`, same file: the
+`setgroups(2)` syscall copies a user group array into a kernel buffer -- an
+on-stack `smallgroups[CRED_SMALLGROUPS_NB]` for a small set, else a malloc'd
+buffer -- before handing it to `kern_setgroups()` (stubbed here).  The
+copy-in of `gidsetsize` entries must fit the chosen buffer.  The malloc model
+sizes the buffer to the request, and the on-stack array is fixed, so a
+copy-in past either is an out-of-bounds write; `gidsetsize` is
+nondeterministic in `[0, NMAX]` with `NMAX` straddling `CRED_SMALLGROUPS_NB`
+so both branches are covered.  Proven: the copy-in fits whichever buffer the
+size branch chose.  The mutant `setgroups_small`, forcing the on-stack array
+for a set larger than `CRED_SMALLGROUPS_NB`, is caught by a write past it.
+No bug found.
+
 ## How it works
 
 - The harness `#include`s the kernel source whole: the code proven is
