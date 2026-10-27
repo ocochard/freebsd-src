@@ -1265,6 +1265,22 @@ invariant the reads rely on (`num_algo <= max_algo`, which
 reads and writes past the objects; no path produces such a list.  `MAXALGO`
 is a constant per job.  No bug found.
 
+Harness `sctp/m_getptr.c`, for `sctp_m_getptr()`, `sys/netinet/sctputil.c`:
+fetch `len` bytes at offset `off` of an mbuf chain, returning an in-place
+pointer when the run is contiguous or copying it into the caller buffer when
+it spans mbufs.  It is the copy behind every SCTP wire-parameter parse
+(ASCONF, AUTH, INIT), so each per-mbuf copy must read within the mbuf and
+write within the caller buffer.  The chain is real `struct mbuf`s, each a
+separate object, and the caller buffer a `LEN`-byte object; the geometry and
+`(off, len)` are concrete per job.  Proven, for a contiguous in-place fetch,
+a two-mbuf span, a three-mbuf span, and a first mbuf at the `MLEN` tail: each
+per-mbuf copy stays within the mbuf and the caller buffer.  The mutant
+`sgetptr_min`, dropping the per-mbuf `min(SCTP_BUF_LEN(m) - off, len)` count,
+is caught by a read past the mbuf at the tail geometry.  No bug found.  (This
+is the copy lemma the ASCONF / AUTH parameter parsers rely on: they bound
+`param_length` against their fixed buffer, then call `sctp_m_getptr` to fill
+it.)
+
 ## VJ header decompression: what is proven
 
 Harness `slcompress/uncompress.c`, for the `TYPE_UNCOMPRESSED_TCP` path of
