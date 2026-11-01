@@ -261,7 +261,7 @@ refuses one with EMSGSIZE all the same (`run.sh` mutant
 `ktls_rx_decrypt_tagless` takes it back).  Report:
 [reports/ktls.md](reports/ktls.md).
 
-Fix [a0d672151d9e](https://github.com/ocochard/freebsd-src/commit/a0d672151d9e):
+Fix [32a981471c01](https://github.com/freebsd/freebsd-src/commit/32a981471c01) (upstream):
 `ktls_reset_receive_tag()` tested the receive TLS capabilities with
 `IFCAP2_RXTLS4` and `IFCAP2_RXTLS6`, which are bit numbers (0 and 1),
 not masks: an IPv4 connection never got a new receive tag after packets
@@ -270,7 +270,7 @@ had RXTLS4 but not RXTLS6.  `ktls_alloc_rcv_tag()` had the same mistake,
 fixed in c721694a1ca8 (`run.sh` mutants `ktls_rx_tag_v4` and
 `ktls_rx_tag_v6` take this fix back).
 
-Fix [447cba6c6808](https://github.com/ocochard/freebsd-src/commit/447cba6c6808):
+Fix [c9599b80015a](https://github.com/freebsd/freebsd-src/commit/c9599b80015a) (upstream):
 `sbappend_ktls_rx()` read each packet's receiving interface from the
 chain's first mbuf, whose packet header it had demoted by then, so a
 chain of two packets or more had no interface and a change of input
@@ -986,6 +986,26 @@ model, `m_dup_pkthdr`, `m_copym`, `m_cat`) are modelled.  The mutant
 that fragment wrongly carrying the MF bit.  `tlen` and `fraglen` are
 constants per job, the jobs sweeping an exact multiple and a remainder.  No
 bug found.
+
+## icmp6_notify_error(): a fix
+
+Harness `ip6/icmp6_notify_error.c`, for `icmp6_notify_error()`,
+`sys/netinet6/icmp6.c`: the walk of the extension headers an ICMPv6 error
+quotes.  The chain is a cluster head and a plain mbuf split inside a type 0
+routing header, so the routing branch's second `m_pullup()` relocates and
+frees the head.  Proven: no read of the quoted headers touches a freed
+mbuf.  `__m_pullup()` is modelled (its byte copy turned the cluster into a
+symbolic array, 10^10 VCC terms; its copy is proven by the `mbuf/m_pullup.c`
+jobs); the model keeps the free of the old head.  Slow (~15 min, 33G): one
+job at a time under `SLOW=1`.
+
+| # | Bug | Fix | Status |
+|---|---|---|---|
+| 1 | reading `rth->ip6r_nxt` after the second `m_pullup()` frees the head is a use-after-free | [a07f0cadcfc4](https://github.com/ocochard/freebsd-src/commit/a07f0cadcfc4) | sent to glebius@ |
+
+The mutant `icmp6_notify_uaf` puts the read back after the pullup and is
+caught by the deallocated-object read at `icmp6.c` `nxt = rth->ip6r_nxt`.
+Report: [reports/ip6.md](reports/ip6.md).
 
 ## TCP reassembly accounting: what is proven
 

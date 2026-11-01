@@ -239,7 +239,7 @@ for f in $(sed -n 's/^#include "\(opt_[a-z0-9_]*\.h\)"/\1/p' \
     "$top/sys/kern/kern_exec.c" "$top/sys/netinet/tcp_syncache.c" \
     "$top/sys/netinet/ip_options.c" "$top/sys/vm/vm_mmap.c" \
     "$top/sys/kern/kern_sysctl.c" "$top/sys/netinet/ip_output.c" \
-    "$top/sys/netinet6/ip6_output.c"); do
+    "$top/sys/netinet6/ip6_output.c" "$top/sys/netinet6/icmp6.c"); do
 	: >"$work/inc/$f"
 done
 
@@ -1036,8 +1036,6 @@ if want unp; then
 	    '/^unp_externalize(/,/^}/s/free(fdep\[0\], M_FILECAPS);/;/'
 fi
 
-h="$here/ktls/ktls.c"
-s="$top/sys/kern/uipc_ktls.c"
 # Chains of up to three records (MAXREC), so walks of four iterations;
 # keys of up to 64 bytes.
 dk="-DKERN_TLS"
@@ -1693,7 +1691,7 @@ if want mbuf; then
 	# two-mbuf pull in place, a three-mbuf gather, and a > MHLEN request
 	# that must fail cleanly.
 	h="$here/mbuf/m_pullup.c"
-	uu="m_pullup.0:5,m_pullup.1:5,m_pullup.2:5,proof_pullup.0:9"
+	uu="__m_pullup.0:5,__m_pullup.1:5,__m_pullup.2:5,proof_pullup.0:9"
 	uu="$uu,proof_pullup.1:9,proof_pullup.2:9,m_freem.0:9,cbmc_memmove.0:65"
 	for g in 0 1 2 3; do
 		proof mpullup_geo$g "$h" "$s" proof_pullup "-DGEO=$g" "$uu"
@@ -1704,7 +1702,7 @@ if want mbuf; then
 	# the overshoot needs a geometry filling the head to the MLEN tail,
 	# whose large-offset bounds check is too slow to run here.)
 	mutant mpullup_early "$h" "$s" proof_pullup "-DGEO=1" "$uu" \
-	    '/^m_pullup(/,/^}/s/if (n->m_len >= len)/if (1)/'
+	    '/^__m_pullup(/,/^}/s/if (n->m_len >= len)/if (1)/'
 
 	# m_split(), same file: split a chain in two at byte offset len0,
 	# returning the tail.  The plain path (no M_PKTHDR, no external
@@ -1823,6 +1821,28 @@ if want ip6; then
 	# the last fragment and sets MF, breaking the tiling.
 	mutant ip6_fragment_last "$h6" "$s6" proof_ip6_fragment "$d6 -DTLEN=150 -DFRAGLEN=24" "$u6" \
 	    '/^ip6_fragment(/,/^}/s/if (off + fraglen >= tlen)/if (0)/'
+
+	# icmp6_notify_error(), sys/netinet6/icmp6.c: walk the extension headers
+	# of the packet an ICMPv6 error quotes to find its upper-layer protocol
+	# and, for a type 0 routing header, its final destination.  The quoted
+	# packet comes from the peer, so every read of it must stay within a
+	# live mbuf.  The chain is a cluster head and a plain mbuf with the
+	# boundary inside the routing header, so the second m_pullup() in the
+	# routing branch relocates and frees the head; reading rth afterwards is
+	# a use-after-free.  __m_pullup() is modelled (its byte copy made the
+	# cluster a symbolic array, 10^10 VCC terms; its copy is proven by the
+	# mbuf/m_pullup.c jobs), the notify-tail callees are stubbed.  The jobs
+	# are slow (~15 min, 33G each), so one at a time.
+	hn6="$here/ip6/icmp6_notify_error.c"
+	sn6="$top/sys/netinet6/icmp6.c"
+	dn6="-DINET -DINET6 -DIP6STAT_ADD(n,v)= -DIP6STAT_INC(n)= -DICMP6STAT_INC(n)="
+	un6="icmp6_notify_error.6:3,__m_pullup.0:4,m_freem.0:4"
+	slow proof icmp6_notify_error "$hn6" "$sn6" proof_notify_error "$dn6" "$un6"
+	# The fix reads nxt from the routing header before the second pullup;
+	# putting the read back after the pullup reads the freed head (the bug,
+	# a0d672-era; the UAF at icmp6.c nxt = rth->ip6r_nxt).
+	slow mutant icmp6_notify_uaf "$hn6" "$sn6" proof_notify_error "$dn6" "$un6" \
+	    '/^			eoff += rthlen;$/s/eoff += rthlen;/eoff += rthlen; nxt = rth->ip6r_nxt;/'
 fi
 
 if want reass; then
@@ -2296,6 +2316,8 @@ if want sysctl; then
 fi
 
 if want ktls; then
+	h="$here/ktls/ktls.c"
+	s="$top/sys/kern/uipc_ktls.c"
 	proof ktls_frame "$h" "$s" proof_frame "$dk" "$uk"
 	proof ktls_enqueue "$h" "$s" proof_enqueue "$dk" "$uk"
 	proof ktls_enqueue_turn "$h" "$s" proof_enqueue_turn "$dk" "$uk"

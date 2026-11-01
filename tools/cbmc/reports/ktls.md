@@ -8,8 +8,8 @@ again before filing.
 | # | Bug | Fix | Status |
 |---|---|---|---|
 | 1 | a NIC-decrypted record's length is not checked against its trailer (hardening) | [a482e648447b](https://github.com/ocochard/freebsd-src/commit/a482e648447b) | hardening, developer answered |
-| 2 | a receive tag reset tests the wrong capability bits | [a0d672151d9e](https://github.com/ocochard/freebsd-src/commit/a0d672151d9e) | ready |
-| 3 | a chain of packets loses its receiving interface | [447cba6c6808](https://github.com/ocochard/freebsd-src/commit/447cba6c6808) | ready |
+| 2 | a receive tag reset tests the wrong capability bits | [32a981471c01](https://github.com/freebsd/freebsd-src/commit/32a981471c01) | committed upstream |
+| 3 | a chain of packets loses its receiving interface | [c9599b80015a](https://github.com/freebsd/freebsd-src/commit/c9599b80015a) | committed upstream |
 | 4 | a CBC record with more than 128 bytes of padding is refused | [1ae48c201579](https://github.com/ocochard/freebsd-src/commit/1ae48c201579) | ready |
 | 5 | TLS receive on a spliced socket is refused with EALREADY, not EINVAL | [a71bb0992737](https://github.com/ocochard/freebsd-src/commit/a71bb0992737) | ready |
 | 6 | a record type message without its byte sends a byte of stale kernel memory | [dfa7f43dbdf6](https://github.com/ocochard/freebsd-src/commit/dfa7f43dbdf6) | ready |
@@ -69,7 +69,7 @@ decrypted: payload -9, `remain` 65527, NULL dereference reading
 
 ## 2. ktls_reset_receive_tag() tests the wrong receive TLS capability bits
 
-**Fix:** a0d672151d9e "ktls: Fix capability checks in ktls_reset_receive_tag()"
+**Fix:** 32a981471c01 (upstream) "ktls: Fix capability checks in ktls_reset_receive_tag()"
 (`Fixes: fe8c78f0d202`)
 
 **What happens:** when packets of a connection with NIC receive TLS
@@ -106,7 +106,7 @@ TLS" (`proof_rx_tag_reset`).
 
 ## 3. sbappend_ktls_rx() loses the interface of a chain of packets
 
-**Fix:** 447cba6c6808 "ktls: Take the receiving interface of each packet in sbappend_ktls_rx()"
+**Fix:** c9599b80015a (upstream) "ktls: Take the receiving interface of each packet in sbappend_ktls_rx()"
 (`Fixes: fe8c78f0d202`)
 
 **What happens:** `sbappend_ktls_rx()` turns the mbuf chain TCP appends
