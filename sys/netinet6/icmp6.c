@@ -957,6 +957,7 @@ icmp6_notify_error(struct mbuf **mp, int off, int icmp6len)
 			}
 			rth = (struct ip6_rthdr *)(mtod(m, char *) + eoff);
 			rthlen = (rth->ip6r_len + 1) << 3;
+			nxt = rth->ip6r_nxt;
 			/*
 			 * XXX: currently there is no officially defined type
 			 * other than type-0.  Note that if the segment left
@@ -980,7 +981,6 @@ icmp6_notify_error(struct mbuf **mp, int off, int icmp6len)
 					icmp6dst.sin6_addr = *((struct in6_addr *)(rth0 + 1) + (hops - 1));
 			}
 			eoff += rthlen;
-			nxt = rth->ip6r_nxt;
 			break;
 		case IPPROTO_FRAGMENT:
 			if ((m = m_pullup(m, eoff +
