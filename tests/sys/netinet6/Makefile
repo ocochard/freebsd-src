@@ -9,6 +9,7 @@ ATF_TESTS_SH=		exthdr \
 			mld \
 			scapyi386 \
 			redirect \
+			icmp6_rthdr_uaf \
 			divert \
 			forward6 \
 			output6 \
@@ -35,6 +36,8 @@ TEST_METADATA.redirect+= execenv="jail"		\
 			execenv_jail_params="vnet allow.raw_sockets"
 TEST_METADATA.scapyi386+= execenv="jail"		\
 			execenv_jail_params="vnet allow.raw_sockets"
+TEST_METADATA.icmp6_rthdr_uaf+= execenv="jail"		\
+			execenv_jail_params="vnet allow.raw_sockets"
 TEST_METADATA.addr6+= execenv="jail"		\
 			execenv_jail_params="vnet allow.raw_sockets"
 
@@ -42,13 +45,15 @@ ${PACKAGE}FILES+=	exthdr.py \
 			mld.py \
 			scapyi386.py \
 			ra.py \
-			redirect.py
+			redirect.py \
+			icmp6_rthdr_uaf.py
 
 ${PACKAGE}FILESMODE_exthdr.py=	0555
 ${PACKAGE}FILESMODE_mld.py=	0555
 ${PACKAGE}FILESMODE_scapyi386.py=0555
 ${PACKAGE}FILESMODE_ra.py=0555
 ${PACKAGE}FILESMODE_redirect.py=0555
+${PACKAGE}FILESMODE_icmp6_rthdr_uaf.py=0555
 
 TESTS_SUBDIRS+=	frag6
 
