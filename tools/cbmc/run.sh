@@ -88,6 +88,8 @@ replace_ip_fragment="m_copym:cbmc_m_copym
 replace_ip6_fragment="m_copym:cbmc_m_copym
 	m_dup_pkthdr:cbmc_m_dup_pkthdr
 	m_cat:cbmc_m_cat"
+replace_ip_reass="uma_zalloc_arg:ipr_zalloc
+	uma_zfree_arg:ipr_zfree"
 replace_frag6="cbmc_memmove:frag6_memmove
 	malloc:frag6_malloc
 	free:frag6_free"
@@ -243,7 +245,7 @@ for f in $(sed -n 's/^#include "\(opt_[a-z0-9_]*\.h\)"/\1/p' \
     "$top/sys/netinet/ip_options.c" "$top/sys/vm/vm_mmap.c" \
     "$top/sys/kern/kern_sysctl.c" "$top/sys/netinet/ip_output.c" \
     "$top/sys/netinet6/ip6_output.c" "$top/sys/netinet6/icmp6.c" \
-    "$top/sys/netinet6/frag6.c"); do
+    "$top/sys/netinet6/frag6.c" "$top/sys/netinet/ip_reass.c"); do
 	: >"$work/inc/$f"
 done
 
@@ -1801,6 +1803,84 @@ if want ip; then
 	# writes past the source option and the destination area.
 	mutant ip_optcopy_len "$hc" "$s" proof_optcopy "-DINET -DOPTLEN=40" "$uc" \
 	    '/^ip_optcopy(/,/^}/s/bcopy(cp, dp, optlen);/bcopy(cp, dp, optlen + 1);/'
+
+	# ip_reass(), sys/netinet/ip_reass.c: reassemble a peer's IPv4
+	# fragment (RFC 791).  An overlap trims the new fragment's front against
+	# its predecessor and the successors' fronts against it, or frees a
+	# covered successor.  One symbolic fragment (offset up to 64, length up
+	# to 40, MF) into a concrete queue per job: none, [0,16) MF, [0,16) MF
+	# + [32,48) last, [16,32) MF, [16,20) last.  Every queued fragment's
+	# ip_off and ip_len are where its data sits, the queue covers exactly
+	# the bytes accepted, a datagram is handed up exactly when complete, in
+	# order, and every mbuf and ipq is accounted for.  One hash bucket by
+	# V_ipq_hashsize, no source edit needed.
+	hr="$here/ip/ip_reass.c"
+	sr="$top/sys/netinet/ip_reass.c"
+	ur=""
+	for l in ip_reass.7 ip_reass.12 ip_reass.14 ip_reass.15 ip_reass.17 \
+	    ipq_free.0 ipq_reuse.1 ipr_mbidx.0 proof_reass.1 proof_reass.5 \
+	    proof_reass.6 proof_reass.7 proof_reass.8 proof_reass.9 \
+	    proof_reass.10 proof_reass.11 proof_reass.12 proof_reass.13 \
+	    proof_reass.14 proof_reass.15; do
+		ur="$ur$l:4,"
+	done
+	ur="${ur}ip_reass.18:3,ipq_reuse.7:2,proof_reass.16:105"
+	for g in 0 1 2 3 4; do
+		proof ip_reass_geo$g "$hr" "$sr" proof_reass "-DINET -DGEO=$g" "$ur"
+	done
+	# An empty fragment queued.
+	mutant reass_len0 "$hr" "$sr" proof_reass "-DINET -DGEO=0" "$ur" \
+	    's/if (ip->ip_len == htons(0) ||/if (0 ||/'
+	# MF set, length not a multiple of 8: queued.
+	mutant reass_mf_mult8 "$hr" "$sr" proof_reass "-DINET -DGEO=0" "$ur" \
+	    's/((ip->ip_off \& htons(IP_MF)) \&\& (ntohs(ip->ip_len) \& 0x7) != 0)) {/0) {/'
+	# A last fragment ending elsewhere than the one seen: queued.
+	mutant reass_maxoff "$hr" "$sr" proof_reass "-DINET -DGEO=2" "$ur" \
+	    's/	    i != fp->ipq_maxoff)) {/	    0)) {/'
+	# The new fragment put last rather than by offset.
+	mutant reass_sorted "$hr" "$sr" proof_reass "-DINET -DGEO=3" "$ur" \
+	    's/if (ntohs(GETIP(q)->ip_off) > ntohs(ip->ip_off))/if (0)/'
+	# A fragment its predecessor covers kept, trimmed to nothing.
+	mutant reass_pred_covered "$hr" "$sr" proof_reass "-DINET -DGEO=1" "$ur" \
+	    's/if (i >= ntohs(ip->ip_len))/if (0)/'
+	# Overlap with the predecessor: the header trimmed, not the data.
+	mutant reass_pred_trim "$hr" "$sr" proof_reass "-DINET -DGEO=1" "$ur" \
+	    's/	m_adj(m, i);/	;/'
+	# ... or the data, not the header.
+	mutant reass_pred_off "$hr" "$sr" proof_reass "-DINET -DGEO=1" "$ur" \
+	    's/ip->ip_off = htons(ntohs(ip->ip_off) + i);/;/'
+	# Overlap with a successor: its header trimmed, not its data.
+	mutant reass_succ_trim "$hr" "$sr" proof_reass "-DINET -DGEO=2" "$ur" \
+	    's/	m_adj(q, i);/	;/'
+	# ... or its offset moved, not its length.
+	mutant reass_succ_len "$hr" "$sr" proof_reass "-DINET -DGEO=2" "$ur" \
+	    's/GETIP(q)->ip_len = htons(ntohs(GETIP(q)->ip_len) - i);/;/'
+	# A covered successor unlinked, not freed.
+	mutant reass_succ_free "$hr" "$sr" proof_reass "-DINET -DGEO=2" "$ur" \
+	    '/^		atomic_subtract_int(&nfrags, 1);$/,/^	}$/s/m_freem(q);/;/'
+	# A covered successor freed, left linked.
+	mutant reass_succ_unlink "$hr" "$sr" proof_reass "-DINET -DGEO=2" "$ur" \
+	    's/	m->m_nextpkt = nq;/	;/'
+	# The queue's fragment count, then on a drop, not kept.
+	mutant reass_nfrag "$hr" "$sr" proof_reass "-DINET -DGEO=1" "$ur" \
+	    's/^		fp->ipq_nfrags++;/		;/'
+	mutant reass_drop_nfrag "$hr" "$sr" proof_reass "-DINET -DGEO=1" "$ur" \
+	    '/^dropfrag:/,/^done:/s/fp->ipq_nfrags--;/;/'
+	# A datagram with a hole handed up.
+	mutant reass_hole "$hr" "$sr" proof_reass "-DINET -DGEO=1" "$ur" \
+	    's/if (ntohs(GETIP(q)->ip_off) != next) {/if (0) {/'
+	# A datagram whose last fragment has MF handed up.
+	mutant reass_lastmf "$hr" "$sr" proof_reass "-DINET -DGEO=1" "$ur" \
+	    's/if (p->m_flags \& M_IP_FRAG) {/if (0) {/'
+	# The reassembled ip_len without its header.
+	mutant reass_iplen "$hr" "$sr" proof_reass "-DINET -DGEO=1" "$ur" \
+	    's/ip->ip_len = htons((ip->ip_hl << 2) + next);/ip->ip_len = htons(next);/'
+	# A reassembled queue removed without the bucket count.
+	mutant reass_bucketcount "$hr" "$sr" proof_reass "-DINET -DGEO=1" "$ur" \
+	    '/^ip_reass(/,/^}/s/V_ipq\[hash\].count--;/;/'
+	# ... or without freeing its ipq.
+	mutant reass_ipqleak "$hr" "$sr" proof_reass "-DINET -DGEO=1" "$ur" \
+	    '/^	V_ipq\[hash\].count--;$/,/^	m->m_len/s/uma_zfree(V_ipq_zone, fp);/;/'
 fi
 
 if want ip6; then

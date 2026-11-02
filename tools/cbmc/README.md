@@ -971,6 +971,47 @@ and the returned length is at most `MAX_IPOPTLEN`.  The mutant
 an out-of-bounds write.  The source option length is a constant per job (4,
 8, 40); the option data stays nondeterministic.  No bug found.
 
+Harness `ip/ip_reass.c`, for `ip_reass()`, `sys/netinet/ip_reass.c`: the
+reassembly of a peer's IPv4 fragments (RFC 791).  Unlike IPv6, an overlap
+is resolved by trimming: the new fragment's front against its
+predecessor, each successor's front against the new one, or a covered
+successor freed.  One fragment, its offset (0 to 64, a multiple of 8),
+length (0 to 40) and MF bit symbolic, with offset or MF set as
+`ip_input()` guarantees, goes into a queue of a concrete geometry per job:
+none, `[0,16)` MF, `[0,16)` MF with `[32,48)` last, `[16,32)` MF, `[16,20)`
+last.  Each fragment's payload is a typed object, so where an mbuf's data
+starts in it, plus the offset the fragment was sent at, is the datagram
+offset of its first byte.  Proven:
+
+- a fragment of length 0, or with MF and a length not a multiple of 8, is
+  dropped; so is one its predecessor covers, or one past the last
+  fragment seen; the queue is left as it was.
+- a queued fragment's `ip_off` and `ip_len` are where its data sits in the
+  datagram and how much of it: every trim moves the header with the data,
+  and stays within what the fragment carried; no trim empties a fragment.
+- the queue stays sorted without overlap and covers exactly the bytes of
+  the fragments accepted so far (checked byte by byte over `[0, 104)`).
+- the datagram is handed up when the queue tiles `[0, next)` with MF clear
+  on the last fragment, and only then: its pieces appended in order, each
+  at its offset, `ip_len` the header plus `next`.
+- `ipq_nfrags`, the global fragment count and the bucket count match the
+  queue; every mbuf is queued, handed up or freed, once; every `ipq` is
+  queued or freed, once.
+
+Eighteen mutants, one per property (`reass_*` in run.sh), are caught.  No
+bug found.  Models: the ipq zone by call replacement (it may fail, which
+sends a first fragment through `ipq_reuse()`, here with no queue to
+reuse), `m_adj()` as a front trim
+of a one-mbuf fragment, `m_freem()`, `m_cat()` recording the order, the
+callouts.  One hash bucket, by `V_ipq_hashsize` = 1: unlike `frag6.c`, the
+bucket array is allocated, so no source edit is needed.  The five proofs
+and the mutants run in under three minutes.  Not covered: ECN (Not-ECT
+throughout), IP options, more than one queue, the 64 KB limit checks, the
+per-packet fragment limit.  Observed, not a bug: `ipq_maxoff` is recorded
+before the overlap and ECN checks, so a last fragment then dropped (only an
+inconsistent or forged one can be covered by its predecessor) still fixes
+the datagram's end, and the datagram can then only time out.
+
 Harness `ip6/ip6_fragment.c`, for `ip6_fragment()`, `sys/netinet6/ip6_output.c`:
 the IPv6 counterpart, splitting a packet into fragments of a given `fraglen`.
 The fragments hang off the original's `m_nextpkt`; each fragment's
