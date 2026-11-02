@@ -245,7 +245,8 @@ for f in $(sed -n 's/^#include "\(opt_[a-z0-9_]*\.h\)"/\1/p' \
     "$top/sys/netinet/ip_options.c" "$top/sys/vm/vm_mmap.c" \
     "$top/sys/kern/kern_sysctl.c" "$top/sys/netinet/ip_output.c" \
     "$top/sys/netinet6/ip6_output.c" "$top/sys/netinet6/icmp6.c" \
-    "$top/sys/netinet6/frag6.c" "$top/sys/netinet/ip_reass.c"); do
+    "$top/sys/netinet6/frag6.c" "$top/sys/netinet/ip_reass.c" \
+    "$top/sys/netinet6/ip6_input.c" "$top/sys/netinet6/dest6.c"); do
 	: >"$work/inc/$f"
 done
 
@@ -1927,6 +1928,88 @@ if want ip6; then
 	# a0d672-era; the UAF at icmp6.c nxt = rth->ip6r_nxt).
 	slow mutant icmp6_notify_uaf "$hn6" "$sn6" proof_notify_error "$dn6" "$un6" \
 	    '/^			eoff += rthlen;$/s/eoff += rthlen;/eoff += rthlen; nxt = rth->ip6r_nxt;/'
+
+	# ip6_process_hopopts() and ip6_unknown_opt(), sys/netinet6/ip6_input.c,
+	# and dest6_input(), sys/netinet6/dest6.c: the option walks of the
+	# Hop-by-Hop and Destination Options headers a peer sends (RFC 8200
+	# 4.2-4.6).  Option bytes free, the header length a constant per job
+	# (the two shortest; the next, 22 or 24 bytes, takes minutes): no read
+	# outside the header, the mbuf consumed exactly on failure, and the
+	# outcome of a walk of the options per the RFC.  The hopopts jobs need
+	# the ICMPv6 pointer fix in ip6_input.c (erroff + (opt - opthead)).
+	hh="$here/ip6/hopopts.c"
+	sh6="$top/sys/netinet6/ip6_input.c"
+	dh="-DINET -DINET6"
+	for l in 6 14; do
+		proof hopopts_$l "$hh" "$sh6" proof_hopopts "$dh -DHBHLEN=$l" \
+		    "proof_hopopts.0:$((l + 1)),ip6_process_hopopts.3:$((l + 1)),cbmc_memmove.0:3"
+	done
+	uh="proof_hopopts.0:7,ip6_process_hopopts.3:7,cbmc_memmove.0:3"
+	# dest6_input() drops an option whose data runs past the header;
+	# ip6_process_hopopts() takes it (PadN 70 at the last 2 of 6 bytes):
+	# which is meant?  Linux drops it in both.
+	question hopopts_strict "$hh" "$sh6" proof_hopopts "$dh -DHBHLEN=6 -DSTRICT" "$uh"
+	# The fix: erroff + opt - opthead forms a pointer past the options.
+	mutant hop_ptr_ub "$hh" "$sh6" proof_hopopts "$dh -DHBHLEN=6" "$uh" \
+	    's/erroff + (opt - opthead));/erroff + opt - opthead);/'
+	# PadN read with one byte left: its length byte past the header.
+	mutant hop_padn_minlen "$hh" "$sh6" proof_hopopts "$dh -DHBHLEN=6" "$uh" \
+	    '/case IP6OPT_PADN:/,/optlen = \*(opt + 1) + 2;/s/if (hbhlen < IP6OPT_MINLEN) {/if (0) {/'
+	# A Router Alert read with fewer than its 4 bytes left.
+	mutant hop_rtalert_len "$hh" "$sh6" proof_hopopts "$dh -DHBHLEN=6" "$uh" \
+	    's/if (hbhlen < IP6OPT_RTALERT_LEN) {/if (0) {/'
+	# A Router Alert of the wrong length taken.
+	mutant hop_rtalert_optlen "$hh" "$sh6" proof_hopopts "$dh -DHBHLEN=6" "$uh" \
+	    's/if (\*(opt + 1) != IP6OPT_RTALERT_LEN - 2) {/if (0) {/'
+	# The Router Alert value not reported.
+	mutant hop_rtalert_value "$hh" "$sh6" proof_hopopts "$dh -DHBHLEN=6" "$uh" \
+	    's/\*rtalertp = ntohs(rtalert_val);/;/'
+	# A Jumbo Payload option accepted.
+	mutant hop_jumbo "$hh" "$sh6" proof_hopopts "$dh -DHBHLEN=6" "$uh" \
+	    '/We do not support the Jumbo/{n;s/goto bad;/break;/;}'
+	# An unknown option read with one byte left.
+	mutant hop_unknown_minlen "$hh" "$sh6" proof_hopopts "$dh -DHBHLEN=6" "$uh" \
+	    '/default:.*unknown option/,/optlen = ip6_unknown_opt/s/if (hbhlen < IP6OPT_MINLEN) {/if (0) {/'
+	# An unknown option skipped without its type and length bytes.
+	mutant hop_unknown_len "$hh" "$sh6" proof_hopopts "$dh -DHBHLEN=6" "$uh" \
+	    '/^ip6_process_hopopts(/,/^}/s/optlen += 2;/;/'
+	# The ICMPv6 pointer one past the option.
+	mutant hop_icmp_ptr "$hh" "$sh6" proof_hopopts "$dh -DHBHLEN=6" "$uh" \
+	    's/erroff + (opt - opthead));/erroff + (opt - opthead) + 1);/'
+	# Type bits 10: the wrong Parameter Problem code.
+	mutant hop_forceicmp_code "$hh" "$sh6" proof_hopopts "$dh -DHBHLEN=6" "$uh" \
+	    '/case IP6OPT_TYPE_FORCEICMP:/,/return/s/ICMP6_PARAMPROB_OPTION, off);/ICMP6_PARAMPROB_HEADER, off);/'
+	# Type bits 11: an ICMPv6 error to a multicast destination.
+	mutant hop_mcast "$hh" "$sh6" proof_hopopts "$dh -DHBHLEN=6" "$uh" \
+	    's/if (IN6_IS_ADDR_MULTICAST(&ip6->ip6_dst) ||/if (0 ||/'
+	hd="$here/ip6/dest6.c"
+	sd="$top/sys/netinet6/dest6.c"
+	for l in 8 16; do
+		proof dest6_$l "$hd" "$sd" proof_dest6 "$dh -DDLEN=$l" \
+		    "proof_dest6.0:$((l + 1)),dest6_input.3:$((l + 1))"
+	done
+	ud="proof_dest6.0:9,dest6_input.3:9"
+	# An option whose data runs past the header accepted.
+	mutant dest6_overrun "$hd" "$sd" proof_dest6 "$dh -DDLEN=8" "$ud" \
+	    's/(dstoptlen < IP6OPT_MINLEN || \*(opt + 1) + 2 > dstoptlen)) {/(dstoptlen < IP6OPT_MINLEN)) {/'
+	# An option read with one byte left.
+	mutant dest6_minlen "$hd" "$sd" proof_dest6 "$dh -DDLEN=8" "$ud" \
+	    's/(dstoptlen < IP6OPT_MINLEN ||/(0 ||/'
+	# The offset not moved past the header.
+	mutant dest6_off "$hd" "$sd" proof_dest6 "$dh -DDLEN=8" "$ud" \
+	    's/	off += dstoptlen;/	;/'
+	# The header used without being pulled up whole.
+	mutant dest6_pullup "$hd" "$sd" proof_dest6 "$dh -DDLEN=8" "$ud" \
+	    's/if ((m = m_pullup(m, off + dstoptlen)) == NULL) {/if (0) {/'
+	# The ICMPv6 pointer one past the option.
+	mutant dest6_icmp_ptr "$hd" "$sd" proof_dest6 "$dh -DDLEN=8" "$ud" \
+	    's/opt - mtod(m, u_int8_t \*));/opt - mtod(m, u_int8_t *) + 1);/'
+	# PadN skipped one byte short.
+	mutant dest6_padn "$hd" "$sd" proof_dest6 "$dh -DDLEN=8" "$ud" \
+	    's/optlen = \*(opt + 1) + 2;/optlen = *(opt + 1) + 1;/'
+	# An unknown option skipped without its type and length bytes.
+	mutant dest6_unknown_len "$hd" "$sd" proof_dest6 "$dh -DDLEN=8" "$ud" \
+	    's/optlen += 2;/;/'
 
 	# frag6_input(), sys/netinet6/frag6.c: reassemble a peer's IPv6
 	# fragment into its datagram's queue (RFC 8200 4.5).  One symbolic

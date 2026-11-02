@@ -1048,6 +1048,50 @@ The mutant `icmp6_notify_uaf` puts the read back after the pullup and is
 caught by the deallocated-object read at `icmp6.c` `nxt = rth->ip6r_nxt`.
 Report: [reports/ip6.md](reports/ip6.md).
 
+## IPv6 option headers: what is proven
+
+Harness `ip6/hopopts.c`, for `ip6_process_hopopts()` and
+`ip6_unknown_opt()`, `sys/netinet6/ip6_input.c`, and harness `ip6/dest6.c`,
+for `dest6_input()`, `sys/netinet6/dest6.c`: the option walks of the
+Hop-by-Hop and Destination Options headers a peer sends (RFC 8200 sections
+4.2 to 4.6, Router Alert RFC 2711).  The option bytes are free; the header
+length is a constant per job, the two shortest (6 and 14 option bytes, 8
+and 16 header bytes; the next takes minutes).  For dest6 the length byte
+is free too, so a header longer than the mbuf sends `m_pullup()` to fail.
+Proven:
+
+- no read outside the option area, or the header.
+- the mbuf consumed (freed or turned into an ICMPv6 error) exactly when
+  the walk fails, otherwise handed back; dest6 returns the Next Header with
+  the offset past the header.
+- the outcome is that of a walk of the options as the RFC has it: Pad1 and
+  PadN skipped; an unknown option acted on by its two top type bits (skip,
+  discard, ICMPv6 Parameter Problem code 2 pointing at the option, the
+  same unless the destination is multicast); in Hop-by-Hop, Jumbo refused,
+  a Router Alert of length 2 reported and of another length an ICMPv6
+  error at its length byte; an option the header has no room for dropped.
+
+Eighteen mutants (`hop_*`, `dest6_*` in run.sh) are caught.  dest6 runs on
+`ip6_unknown_opt()` modelled by what the hopopts proofs show of it.
+
+One fix: `ip6_process_hopopts()` computed the ICMPv6 pointer as `erroff +
+opt - opthead`, which forms `opt + 42`, a pointer past the option area,
+before the subtraction brings it back: undefined in C, harmless as
+compiled.  CBMC flags the pointer; `erroff + (opt - opthead)` computes the
+same value.  The mutant `hop_ptr_ub` puts the old expression back.
+
+| # | Bug | Fix | Status |
+|---|---|---|---|
+| 2 | `ip6_process_hopopts()` ICMPv6 pointer arithmetic past the option area | [4f2c4d73ff70](https://github.com/ocochard/freebsd-src/commit/4f2c4d73ff70) | ready (cleanup) |
+
+Open question (`run.sh` question `hopopts_strict`): `dest6_input()` drops
+an option whose data runs past the end of its header (`*(opt + 1) + 2 >
+dstoptlen`); `ip6_process_hopopts()` has no such check, and accepts it for
+PadN and skippable unknown options (counterexample, 6 option bytes: `01 02
+46 85 01 46`, a PadN of 70 at the last 2 bytes).  Nothing is read past the
+header either way; Linux drops it in both.  Report 3 in
+[reports/ip6.md](reports/ip6.md).
+
 ## frag6_input(): what is proven
 
 Harness `ip6/frag6.c`, for `frag6_input()`, `sys/netinet6/frag6.c`: the
