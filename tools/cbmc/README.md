@@ -971,6 +971,42 @@ and the returned length is at most `MAX_IPOPTLEN`.  The mutant
 an out-of-bounds write.  The source option length is a constant per job (4,
 8, 40); the option data stays nondeterministic.  No bug found.
 
+Harness `ip/icmp_input.c`, for `icmp_input()`, `sys/netinet/ip_icmp.c`: the
+checks and actions on an ICMP message a peer sends (RFC 792).  The datagram
+(an IP header without options and the message, every byte free) is one
+mbuf whose bytes are an object of exactly `ip_len` bytes, so a read past
+the message is a read out of bounds.  The message length is a constant per
+job (4, 8, 16, 28, 36, 44); the sysctls that select the paths are free.
+Proven:
+
+- no read or write outside the message, on any path.
+- an error (unreachable, time exceeded, parameter problem) reaches the
+  protocol's ctlinput only with the quoted IP header (`ip_hl` at least 5)
+  and 8 bytes of its payload in the message, contiguous to
+  `ICMP_ADVLENPREF`, as the function's comment promises.
+- the mbuf is consumed once; a message shorter than `ICMP_MINLEN` is
+  dropped.
+
+Eight mutants (`icmp_*` in run.sh) are caught.  `icmp_reflect()`, the
+redirect gateway check, the rate limit, `rip_input()`, the routing calls
+and the checksum are modelled.  Not covered: outer IP options
+(`ip_stripoptions()` modelled for none), a chain that needs pulling up,
+lengths 20 to 27 (cbmc bounds-checks the whole 20-byte `icmp_dun` union at
+the timestamp reply's writes, a false alarm: the `ICMP_TSLEN` check keeps
+them in the message), and the mask reply for 12 to 27 (the same).
+
+One fix: with `net.inet.icmp.log_redirect` set, a redirect was logged
+before its length was checked, reading the quoted `ip_dst` (offset 24) past
+a message of 8 to 27 bytes.  It is logged now only when the message holds
+the quoted header (`ICMP_ADVLENMIN`); the mutant `icmp_log` takes the fix
+back.
+
+| # | Bug | Fix | Status |
+|---|---|---|---|
+| 2 | `icmp_input()` reads past a short redirect to log it | [2679c48d4cbd](https://github.com/ocochard/freebsd-src/commit/2679c48d4cbd) | ready |
+
+Report: [reports/net.md](reports/net.md).
+
 Harness `ip/ip_reass.c`, for `ip_reass()`, `sys/netinet/ip_reass.c`: the
 reassembly of a peer's IPv4 fragments (RFC 791).  Unlike IPv6, an overlap
 is resolved by trimming: the new fragment's front against its

@@ -9,6 +9,7 @@ before filing.
 | # | Observation | Fix | Status |
 |---|---|---|---|
 | 1 | `sl_uncompress_tcp_core()` reads the VJ compressed header past a short wire buffer before validating the consumed length | (none) | latent, bounded by the caller's pullup; question to the maintainers |
+| 2 | `icmp_input()` logs a redirect (`log_redirect`) reading the quoted `ip_dst` past a message shorter than 28 bytes | [2679c48d4cbd](https://github.com/ocochard/freebsd-src/commit/2679c48d4cbd) | ready |
 
 ---
 
@@ -59,3 +60,40 @@ the wire buffer", which fails for a buffer shorter than the change mask's walk
 (the open question `slcmp_short`, `tools/cbmc/slcompress/compress.c`).  The
 `TYPE_UNCOMPRESSED_TCP` path, with explicit `hlen > buflen` guards, is proven
 safe (`slunc_small`, `slunc_big`).
+
+---
+
+## 2. icmp_input() reads past a short ICMP redirect to log it
+
+**Fix:** 2679c48d4cbd "icmp: Do not log a redirect too short to quote a header"
+(`Fixes: 18d3153eadbd`)
+
+**What happens:** with `net.inet.icmp.log_redirect=1`, the `ICMP_REDIRECT`
+case prints the redirect's quoted destination, `icp->icmp_ip.ip_dst` (ICMP
+offset 24 to 27), before the length check that follows it
+(`sys/netinet/ip_icmp.c`, `dst = ntohl(icp->icmp_ip.ip_dst.s_addr)`).
+`icmp_input()` has only checked `icmplen >= ICMP_MINLEN` (8) and pulled up
+`min(icmplen, ICMP_ADVLENMIN)`: for a redirect of 8 to 27 bytes the read
+is past the end of the message, in whatever the mbuf holds beyond its data.
+
+**Why:** the logging came with the sysctl (18d3153eadbd, 1999) and was put
+before the drop and length checks so that ignored redirects are logged too.
+
+**Reachability:** any host on the path can send a short redirect; the
+logging is off by default.  Up to 4 bytes beyond the packet go to the
+console as the "redirect from ... => ..." destination: stale mbuf contents,
+a small information leak to whoever reads the console log.  No write, no
+crash outside KASAN.
+
+**Fix detail:** log only when `icmplen >= ICMP_ADVLENMIN`, the length the
+redirect path itself requires; redirects that are then ignored (routers,
+`drop_redirect`) are still logged.
+
+**Reproduce:** no ATF test: the bytes read are stale mbuf contents, not a
+stable output.  CBMC: run.sh mutant `icmp_log` (the fix taken back), at
+`ICMPLEN=8`: type 5 code 0, `log_redirect` 1, `pointer outside object
+bounds in icp->icmp_dun` at the `ip_dst` read.
+
+**Found by:** CBMC's bounds checks, proof `icmp_input_8` (the datagram an
+object of exactly `ip_len` bytes).
+

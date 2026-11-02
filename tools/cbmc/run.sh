@@ -88,6 +88,10 @@ replace_ip_fragment="m_copym:cbmc_m_copym
 replace_ip6_fragment="m_copym:cbmc_m_copym
 	m_dup_pkthdr:cbmc_m_dup_pkthdr
 	m_cat:cbmc_m_cat"
+replace_icmp_input="icmp_reflect:cbmc_icmp_reflect
+	icmp_verify_redirect_gateway:cbmc_icmp_verify_redirect_gateway
+	badport_bandlim:cbmc_badport_bandlim
+	iptime:cbmc_iptime"
 replace_ip_reass="uma_zalloc_arg:ipr_zalloc
 	uma_zfree_arg:ipr_zfree"
 replace_frag6="cbmc_memmove:frag6_memmove
@@ -246,7 +250,8 @@ for f in $(sed -n 's/^#include "\(opt_[a-z0-9_]*\.h\)"/\1/p' \
     "$top/sys/kern/kern_sysctl.c" "$top/sys/netinet/ip_output.c" \
     "$top/sys/netinet6/ip6_output.c" "$top/sys/netinet6/icmp6.c" \
     "$top/sys/netinet6/frag6.c" "$top/sys/netinet/ip_reass.c" \
-    "$top/sys/netinet6/ip6_input.c" "$top/sys/netinet6/dest6.c"); do
+    "$top/sys/netinet6/ip6_input.c" "$top/sys/netinet6/dest6.c" \
+    "$top/sys/netinet/ip_icmp.c"); do
 	: >"$work/inc/$f"
 done
 
@@ -1882,6 +1887,44 @@ if want ip; then
 	# ... or without freeing its ipq.
 	mutant reass_ipqleak "$hr" "$sr" proof_reass "-DINET -DGEO=1" "$ur" \
 	    '/^	V_ipq\[hash\].count--;$/,/^	m->m_len/s/uma_zfree(V_ipq_zone, fp);/;/'
+
+	# icmp_input(), sys/netinet/ip_icmp.c: a peer's ICMP message (RFC 792).
+	# The datagram's bytes an object of exactly ip_len bytes, all free, so a
+	# read past the message is out of bounds; the length a constant per job.
+	# No read outside the message; an error reaches ctlinput only with the
+	# quoted header and 8 bytes, contiguous to ICMP_ADVLENPREF; the mbuf
+	# consumed once.  Lengths 12 to 27 meet cbmc's whole-union bounds check
+	# at the icmp_dun writes (the timestamp and mask replies), a false alarm:
+	# 16 runs with no mask reply, 20 to 27 are left out.
+	hi="$here/ip/icmp_input.c"
+	si="$top/sys/netinet/ip_icmp.c"
+	for l in 4 8 16 28 36 44; do
+		proof icmp_input_$l "$hi" "$si" proof_icmp "-DINET -DICMPLEN=$l" ""
+	done
+	# The fix: the redirect logged before its length is checked reads the quoted ip_dst past a short message.
+	mutant icmp_log "$hi" "$si" proof_icmp "-DINET -DICMPLEN=8" "" \
+	    's/if (V_log_redirect \&\& icmplen >= ICMP_ADVLENMIN) {/if (V_log_redirect) {/'
+	# A message shorter than ICMP_MINLEN reflected.
+	mutant icmp_minlen "$hi" "$si" proof_icmp "-DINET -DICMPLEN=4" "" \
+	    's/if (icmplen < ICMP_MINLEN) {/if (0) {/'
+	# An error delivered without the quoted header's options and 8 bytes.
+	mutant icmp_deliver_advlen "$hi" "$si" proof_icmp "-DINET -DICMPLEN=36" "" \
+	    '/deliver:/,/Discard ICMP/s/if (icmplen < ICMP_ADVLENMIN || icmplen < ICMP_ADVLEN(icp) ||/if (icmplen < ICMP_ADVLENMIN ||/'
+	# The quoted header length read past a short message.
+	mutant icmp_deliver_advlenmin "$hi" "$si" proof_icmp "-DINET -DICMPLEN=8" "" \
+	    '/deliver:/,/Discard ICMP/s/if (icmplen < ICMP_ADVLENMIN || icmplen < ICMP_ADVLEN(icp) ||/if (icmplen < ICMP_ADVLEN(icp) ||/'
+	# An error delivered with a quoted header length under 5.
+	mutant icmp_deliver_hl "$hi" "$si" proof_icmp "-DINET -DICMPLEN=36" "" \
+	    '/deliver:/,/Discard ICMP/s/icp->icmp_ip.ip_hl < (sizeof(struct ip) >> 2)) {/0) {/'
+	# A timestamp reply written past a short message.
+	mutant icmp_tstamp_len "$hi" "$si" proof_icmp "-DINET -DICMPLEN=16" "" \
+	    's/if (icmplen < ICMP_TSLEN) {/if (0) {/'
+	# A mask reply written past a short message.
+	mutant icmp_mask_len "$hi" "$si" proof_icmp "-DINET -DICMPLEN=8" "" \
+	    's/if (icmplen < ICMP_MASKLEN)/if (0)/'
+	# A dropped message not freed.
+	mutant icmp_freeit "$hi" "$si" proof_icmp "-DINET -DICMPLEN=28" "" \
+	    '/^freeit:/,/return/s/m_freem(m);/;/'
 fi
 
 if want ip6; then
