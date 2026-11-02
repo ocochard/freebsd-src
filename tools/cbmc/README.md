@@ -1007,6 +1007,49 @@ The mutant `icmp6_notify_uaf` puts the read back after the pullup and is
 caught by the deallocated-object read at `icmp6.c` `nxt = rth->ip6r_nxt`.
 Report: [reports/ip6.md](reports/ip6.md).
 
+## frag6_input(): what is proven
+
+Harness `ip6/frag6.c`, for `frag6_input()`, `sys/netinet6/frag6.c`: the
+reassembly of a peer's IPv6 fragments (RFC 8200 section 4.5).  One
+fragment, its offset (0 to 64, a multiple of 8), length (0 to 40) and M bit
+symbolic, goes into a queue of a concrete geometry per job: none, `[0,16)`
+M, `[0,16)` M with `[32,48)` last, `[16,32)` last.  Proven:
+
+- M set with a length not a multiple of 8, or an empty fragment: dropped;
+  offset 0 with M clear (atomic, RFC 6946): handed up without its fragment
+  header, the queue left alone.
+- a fragment overlapping a queued one discards the whole datagram, every
+  mbuf freed; an exact duplicate is dropped alone, the queue kept.
+- otherwise it is queued, and the datagram is handed up exactly when the
+  fragments tile `[0, P)` with M clear on the last, its payload length `P`.
+- every queue stays sorted by offset without overlap, its `ip6q_nfrag` the
+  list length; the bucket, packet and fragment counters match what is
+  queued; every mbuf, `ip6q` and `ip6asfrag` is queued, handed up or freed,
+  once.
+
+Fifteen mutants, one per property (`frag6_*` in run.sh), are caught.  The
+duplicate test in the block for the fragment after the new one is always
+true (that fragment starts past the new one): an equivalent mutant, left
+out.  Models: malloc/free by call replacement (kern.h's malloc hook cannot
+fail an allocation: its NULL means "not mine"), `icmp6_error()` and
+`m_freem()` free, `m_cat()` records, `m_adj()` and `m_demote_pkthdr()` do
+nothing, `__m_pullup()` is not reached.  Not covered: ECN (Not-ECT
+throughout), extension headers before the fragment header, a receive
+interface (the ICMPv6 time-exceeded path of `frag6_freef()`), the 64 KB
+limit checks, more than one queue.
+
+What it took: the source is proven with its 1024 reassembly buckets cut to
+one (run.sh seds `IP6REASS_NHASH_LOG2` to 0; the hash is modelled to return
+0).  With the array cbmc folded no bucket field and explored every branch:
+an empty queue took 82s of symbolic execution and a 17G formula, 1.7s with
+one bucket.  A packet is a typed object (IPv6 header, fragment header,
+payload) of fixed size, and `__m_pullup()` is defined: left undefined, its
+result points anywhere and cbmc 6.11 stops in symbolic execution
+(`l2_rename_rvalues case 'struct' not handled`).  The four proofs and the
+mutants run in under a minute.  No bug found.  Observed, not a bug: a new
+queue whose `ip6asfrag` allocation fails stays in the bucket empty until
+`frag6_slowtimo()` expires it.
+
 ## TCP reassembly accounting: what is proven
 
 Harness `tcp/reass.c`, for the reassembly helpers of
@@ -1027,9 +1070,8 @@ The mutants `reass_trimlen` (dropping the length trim) and `reass_overlap`
 (trimming one byte too few) are caught by the end no longer being
 preserved, and `reass_appendlen` by the length not growing fully.  `m_adj()`
 is modelled (it only trims the mbuf, which the accounting does not read);
-the per-CPU stat macros are compiled out.  This is the reassembly-overlap
-accounting the whole-function `frag6_input()` could not supply tractably
-(it is too large for the solver even with concrete input).  No bug found.
+the per-CPU stat macros are compiled out.  No bug found.  (The IPv6
+counterpart, `frag6_input()`, is proven as a whole function: see above.)
 
 Harness `tcp/reass_fwd.c`, for `tcp_reass_merge_forward()`, same file: once
 a segment `ent` is in the queue, this walks the segments after it and

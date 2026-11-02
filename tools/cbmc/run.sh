@@ -88,6 +88,9 @@ replace_ip_fragment="m_copym:cbmc_m_copym
 replace_ip6_fragment="m_copym:cbmc_m_copym
 	m_dup_pkthdr:cbmc_m_dup_pkthdr
 	m_cat:cbmc_m_cat"
+replace_frag6="cbmc_memmove:frag6_memmove
+	malloc:frag6_malloc
+	free:frag6_free"
 replace_syncookie="syncookie_mac:cbmc_syncookie_mac"
 replace_ktls="ktls_buffer_alloc:cbmc_ktls_buffer_alloc
 	ktls_drop:cbmc_ktls_drop
@@ -239,7 +242,8 @@ for f in $(sed -n 's/^#include "\(opt_[a-z0-9_]*\.h\)"/\1/p' \
     "$top/sys/kern/kern_exec.c" "$top/sys/netinet/tcp_syncache.c" \
     "$top/sys/netinet/ip_options.c" "$top/sys/vm/vm_mmap.c" \
     "$top/sys/kern/kern_sysctl.c" "$top/sys/netinet/ip_output.c" \
-    "$top/sys/netinet6/ip6_output.c" "$top/sys/netinet6/icmp6.c"); do
+    "$top/sys/netinet6/ip6_output.c" "$top/sys/netinet6/icmp6.c" \
+    "$top/sys/netinet6/frag6.c"); do
 	: >"$work/inc/$f"
 done
 
@@ -1843,6 +1847,86 @@ if want ip6; then
 	# a0d672-era; the UAF at icmp6.c nxt = rth->ip6r_nxt).
 	slow mutant icmp6_notify_uaf "$hn6" "$sn6" proof_notify_error "$dn6" "$un6" \
 	    '/^			eoff += rthlen;$/s/eoff += rthlen;/eoff += rthlen; nxt = rth->ip6r_nxt;/'
+
+	# frag6_input(), sys/netinet6/frag6.c: reassemble a peer's IPv6
+	# fragment into its datagram's queue (RFC 8200 4.5).  One symbolic
+	# fragment (offset up to 64, length up to 40, M bit) into a concrete
+	# queue per job: none, [0,16) M, [0,16) M + [32,48), [16,32) last.
+	# Malformed and atomic fragments, overlap (datagram discarded), exact
+	# duplicates (queue kept), the tiling that completes the datagram, the
+	# counters, and every mbuf and allocation freed once.  The source has
+	# its 1024 reassembly buckets cut to one: the hash is modelled to
+	# return 0, and the big array kept cbmc from folding any bucket field
+	# (symex 82s and a 17G formula for an empty queue, 1.7s with one).
+	hf6="$here/ip6/frag6.c"
+	sf6="$work/frag6_1bucket.c"
+	sed 's/^#define	IP6REASS_NHASH_LOG2	10$/#define	IP6REASS_NHASH_LOG2	0/' \
+	    "$top/sys/netinet6/frag6.c" >"$sf6"
+	cmp -s "$top/sys/netinet6/frag6.c" "$sf6" && {
+		echo "run.sh: frag6.c bucket count not found" >&2
+		exit 2
+	}
+	df6="-DINET6"
+	uf6=""
+	for l in frag6_input.10 frag6_input.20 frag6_input.24 frag6_input.32 \
+	    frag6_input.44 frag6_freef.5 frag6_mbidx.0 proof_frag6.5 \
+	    proof_frag6.9 proof_frag6.10 proof_frag6.11 proof_frag6.12 \
+	    proof_frag6.13 proof_frag6.14 proof_frag6.15 proof_frag6.16 \
+	    proof_frag6.17 proof_frag6.19 proof_frag6.20; do
+		uf6="$uf6$l:4,"
+	done
+	uf6="${uf6}proof_frag6.18:5,frag6_input.45:3,frag6_input.46:3,m_last.0:2"
+	uf6="$uf6,frag6_memmove.0:41,frag6_memmove.1:41,cbmc_memmove.0:41"
+	uf6="$uf6,cbmc_memcmp.0:17"
+	for g in 0 1 2 3; do
+		proof frag6_geo$g "$hf6" "$sf6" proof_frag6 "$df6 -DGEO=$g" "$uf6"
+	done
+	# Overlap with the fragment before: kept, the queue no longer sorted.
+	mutant frag6_overlap_prev "$hf6" "$sf6" proof_frag6 "$df6 -DGEO=1" "$uf6" \
+	    's/^	if (af6tmp != NULL) {$/	if (0) {/'
+	# Overlap with the fragment after.
+	mutant frag6_overlap_next "$hf6" "$sf6" proof_frag6 "$df6 -DGEO=2" "$uf6" \
+	    '/^	if (af6 != NULL) {$/s/if (af6 != NULL) {/if (0) {/'
+	# An exact duplicate discards the queue.  (The same test in the block
+	# for the fragment after is always true, af6 starting past ip6af: an
+	# equivalent mutant there.)
+	mutant frag6_dup_keep "$hf6" "$sf6" proof_frag6 "$df6 -DGEO=1" "$uf6" \
+	    '/^frag6_input(/,/^}/s/if (af6tmp->ip6af_off != ip6af->ip6af_off ||/if (1 ||/'
+	# M set, length not a multiple of 8: queued.
+	mutant frag6_mf_mult8 "$hf6" "$sf6" proof_frag6 "$df6 -DGEO=0" "$uf6" \
+	    's/if ((ip6f->ip6f_offlg & IP6F_MORE_FRAG) &&/if (0 \&\&/'
+	# An empty fragment queued.
+	mutant frag6_zerolen "$hf6" "$sf6" proof_frag6 "$df6 -DGEO=0" "$uf6" \
+	    's/if (frgpartlen == 0) {/if (0) {/'
+	# A datagram with a hole handed up.
+	mutant frag6_hole "$hf6" "$sf6" proof_frag6 "$df6 -DGEO=2" "$uf6" \
+	    's/if (af6->ip6af_off != plen) {/if (0) {/'
+	# A datagram whose last fragment has M set handed up.
+	mutant frag6_lastmf "$hf6" "$sf6" proof_frag6 "$df6 -DGEO=1" "$uf6" \
+	    's/if (af6->ip6af_mff) {/if (0) {/'
+	# The queue's fragment count, then the global one, not kept.
+	mutant frag6_nfrag "$hf6" "$sf6" proof_frag6 "$df6 -DGEO=0" "$uf6" \
+	    's/^	q6->ip6q_nfrag++;/	;/'
+	mutant frag6_nfrags "$hf6" "$sf6" proof_frag6 "$df6 -DGEO=0" "$uf6" \
+	    '/^postinsert:/,/^	q6->ip6q_nfrag++/s/atomic_add_int(&frag6_nfrags, 1);/if (0) atomic_add_int(\&frag6_nfrags, 1);/'
+	# A fragment queued last rather than in offset order.
+	mutant frag6_sorted "$hf6" "$sf6" proof_frag6 "$df6 -DGEO=3" "$uf6" \
+	    's/TAILQ_INSERT_BEFORE(af6, ip6af, ip6af_tq);/TAILQ_INSERT_TAIL(\&q6->ip6q_frags, ip6af, ip6af_tq);/'
+	# A discarded datagram's mbufs not freed.
+	mutant frag6_freef_m "$hf6" "$sf6" proof_frag6 "$df6 -DGEO=1" "$uf6" \
+	    '/^frag6_freef(/,/^}/s/m_freem(m);/;/'
+	# The reassembled payload length counts the unfragmentable part twice.
+	mutant frag6_plen "$hf6" "$sf6" proof_frag6 "$df6 -DGEO=1" "$uf6" \
+	    's/ip6->ip6_plen = htons((u_short)plen + offset - sizeof(struct ip6_hdr));/ip6->ip6_plen = htons((u_short)plen + offset);/'
+	# An atomic fragment's packet length keeps the fragment header.
+	mutant frag6_atomic_len "$hf6" "$sf6" proof_frag6 "$df6 -DGEO=0" "$uf6" \
+	    's/m->m_pkthdr.len -= sizeof(struct ip6_frag);/;/'
+	# A queue removed without the bucket count.
+	mutant frag6_bucketcount "$hf6" "$sf6" proof_frag6 "$df6 -DGEO=1" "$uf6" \
+	    '/^frag6_rmqueue(/,/^}/s/V_ip6qb\[bucket\].count--;/;/'
+	# The first fragment's ip6asfrag leaked on reassembly.
+	mutant frag6_afleak "$hf6" "$sf6" proof_frag6 "$df6 -DGEO=1" "$uf6" \
+	    '/offset = ip6af->ip6af_offset - sizeof(struct ip6_frag);/,/if ((u_int)plen/s/free(ip6af, M_FRAG6);/;/'
 fi
 
 if want reass; then
