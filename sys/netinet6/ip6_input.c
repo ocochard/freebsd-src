@@ -1013,7 +1013,7 @@ ip6_process_hopopts(struct mbuf *m, u_int8_t *opthead, int hbhlen,
 				/* XXX stat */
 				icmp6_error(m, ICMP6_PARAM_PROB,
 				    ICMP6_PARAMPROB_HEADER,
-				    erroff + opt + 1 - opthead);
+				    erroff + (opt + 1 - opthead));
 				return (-1);
 			}
 			optlen = IP6OPT_RTALERT_LEN;
@@ -1029,7 +1029,7 @@ ip6_process_hopopts(struct mbuf *m, u_int8_t *opthead, int hbhlen,
 				goto bad;
 			}
 			optlen = ip6_unknown_opt(opt, m,
-			    erroff + opt - opthead);
+			    erroff + (opt - opthead));
 			if (optlen == -1)
 				return (-1);
 			optlen += 2;
