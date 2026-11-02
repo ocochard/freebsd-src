@@ -656,7 +656,8 @@ reflect:
 		return (IPPROTO_DONE);
 
 	case ICMP_REDIRECT:
-		if (V_log_redirect) {
+		/* The addresses logged are read from the quoted header. */
+		if (V_log_redirect && icmplen >= ICMP_ADVLENMIN) {
 			u_long src, dst, gw;
 
 			src = ntohl(ip->ip_src.s_addr);
