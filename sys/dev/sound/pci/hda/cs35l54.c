@@ -1080,13 +1080,20 @@ cs_get_reset(struct cs35l54_softc *sc)
 	}
 }
 
+static const struct {
+	const char	*hid;
+} cs35l54_ids[] = {
+	{ "CSC3554" },
+	{ NULL },
+};
+
 static int
 cs35l54_probe(device_t dev)
 {
 	ACPI_HANDLE handle;
 
 	if ((handle = acpi_get_handle(dev)) == NULL ||
-	    acpi_MatchHid(handle, "CSC3554") == ACPI_MATCHHID_NOMATCH)
+	    acpi_MatchHid(handle, cs35l54_ids[0].hid) == ACPI_MATCHHID_NOMATCH)
 		return (ENXIO);
 	device_set_desc(dev, "Cirrus Logic CS35L54 speaker amplifiers");
 	return (BUS_PROBE_DEFAULT);
@@ -1212,3 +1219,4 @@ MODULE_DEPEND(cs35l54, iicbus, IICBUS_MINVER, IICBUS_PREFVER, IICBUS_MAXVER);
 MODULE_DEPEND(cs35l54, gpiobus, 1, 1, 1);
 MODULE_DEPEND(cs35l54, firmware, 1, 1, 1);
 MODULE_VERSION(cs35l54, 1);
+IICBUS_ACPI_PNP_INFO(cs35l54_ids);
