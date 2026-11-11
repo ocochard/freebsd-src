@@ -38,6 +38,7 @@
 #include <sys/systm.h>
 #include <sys/bus.h>
 #include <sys/ctype.h>
+#include <sys/efi.h>
 #include <sys/firmware.h>
 #include <sys/gpio.h>
 #include <sys/kernel.h>
@@ -503,8 +504,172 @@ cs_write_bin(struct cs35l54_softc *sc, uint16_t addr, const uint8_t *fw,
 	return (0);
 }
 
+/*
+ * Speaker calibration measured at the factory, in the UEFI variable
+ * CirrusSmartAmpCalibrationData: one entry per amplifier, matched by the
+ * amplifier silicon id, or by index when the entry has no id.
+ */
+#define	CS_OTP_UID		0x00300D4
+#define	CS_CAL_ALG		0x9F210
+#define	CS_CAL_MAX		4096
+
+struct cs_cal_entry {
+	uint32_t	target[2];	/* silicon id, low word first */
+	uint32_t	time[2];
+	int8_t		ambient;	/* degrees C */
+	uint8_t		status;
+	uint16_t	calr;
+} __packed;
+
+struct cs_cal_data {
+	uint32_t	size;
+	uint32_t	count;
+	struct cs_cal_entry entry[];
+} __packed;
+
+static struct cs_cal_data *
+cs_read_cal(struct cs35l54_softc *sc)
+{
+	static const char vname[] = "CirrusSmartAmpCalibrationData";
+	efi_guid_t guid = { 0x02f9af02, 0x7734, 0x4233,
+	    { 0xb4, 0x3d, 0x93, 0xfe, 0x5a, 0xa3, 0x5d, 0xb3 } };
+	uint16_t name[nitems(vname)];
+	struct cs_cal_data *cal;
+	size_t len = CS_CAL_MAX;
+	int error;
+
+	for (size_t i = 0; i < nitems(vname); i++)
+		name[i] = vname[i];
+	cal = malloc(CS_CAL_MAX, M_TEMP, M_WAITOK);
+	error = efi_var_get(name, &guid, NULL, &len, cal);
+	if (error != 0 || len < sizeof(*cal) ||
+	    cal->count > (len - sizeof(*cal)) / sizeof(cal->entry[0])) {
+		device_printf(sc->dev, "no speaker calibration in UEFI (%d)\n",
+		    error);
+		free(cal, M_TEMP);
+		return (NULL);
+	}
+	return (cal);
+}
+
+/*
+ * Find the word offset of a named control in the wmfw algorithm metadata
+ * regions.  Each region: algorithm id, name (8-bit length), description
+ * (16-bit length), coefficient count, then per coefficient an 8-byte header
+ * (offset, memory type, block size) followed by its name; strings are
+ * padded to 4 bytes.
+ */
 static int
-cs_load_amp(struct cs35l54_softc *sc, int index, const struct firmware *wmfw)
+cs_find_ctl(const uint8_t *fw, size_t len, uint32_t alg, int mtype,
+    const char *ctl, uint32_t *offp)
+{
+	const uint8_t *p, *end, *blk;
+	uint32_t rlen, n;
+	size_t pos;
+
+	for (pos = 40; pos + 8 <= len; pos += 8 + rlen) {
+		rlen = cs_le32(fw + pos + 4);
+		if (rlen > len - pos - 8)
+			return (EFTYPE);
+		if (fw[pos + 3] != 0xF2 || rlen < 12 ||
+		    cs_le32(fw + pos + 8) != alg)
+			continue;
+		p = fw + pos + 12;
+		end = fw + pos + 8 + rlen;
+		p += (p[0] + 1 + 3) & ~3u;
+		if (p + 2 > end)
+			return (EFTYPE);
+		p += (p[0] + (p[1] << 8) + 2 + 3) & ~3u;
+		if (p + 4 > end)
+			return (EFTYPE);
+		n = cs_le32(p);
+		p += 4;
+		for (; n > 0 && p + 9 <= end; n--, p = blk) {
+			blk = p + 8 + cs_le32(p + 4);
+			if (blk > end)
+				return (EFTYPE);
+			if ((p[2] | p[3] << 8) == mtype &&
+			    p[8] == strlen(ctl) && p + 9 + p[8] <= end &&
+			    memcmp(p + 9, ctl, p[8]) == 0) {
+				*offp = p[0] | p[1] << 8;
+				return (0);
+			}
+		}
+	}
+	return (ENOENT);
+}
+
+static int
+cs_apply_cal(struct cs35l54_softc *sc, int index, const uint8_t *fw,
+    size_t len, const struct cs_alg *algs, int nalgs,
+    const struct cs_cal_data *cal)
+{
+	static const char *const ctls[] = { "CAL_AMBIENT", "CAL_R",
+	    "CAL_STATUS", "CAL_CHECKSUM" };
+	const struct cs_cal_entry *e = NULL;
+	uint16_t addr = sc->addr[index];
+	uint32_t w[3], vals[4], regs[4], off, base;
+	uint64_t uid, target;
+	uint8_t b[12];
+	int error, i;
+
+	/* Silicon id from OTP, assembled as Linux cs35l56 does. */
+	if ((error = cs_read(sc, addr, CS_OTP_UID, w, 3)) != 0)
+		return (error);
+	for (i = 0; i < 3; i++)
+		cs_put_be32(b + 4 * i, w[i]);
+	uid = (uint64_t)(b[6] | b[5] << 8 | b[4] << 16) << 32 |
+	    (b[0] | b[7] << 8 | b[1] << 16 | (uint32_t)b[11] << 24);
+	for (i = 0; i < (int)cal->count; i++) {
+		target = (uint64_t)cal->entry[i].target[1] << 32 |
+		    cal->entry[i].target[0];
+		if ((cal->entry[i].time[0] || cal->entry[i].time[1]) &&
+		    target == uid) {
+			e = &cal->entry[i];
+			break;
+		}
+	}
+	if (e == NULL && index < (int)cal->count &&
+	    cal->entry[index].target[0] == 0 &&
+	    cal->entry[index].target[1] == 0)
+		e = &cal->entry[index];
+	if (e == NULL) {
+		device_printf(sc->dev, "0x%02x: no calibration for silicon id "
+		    "0x%jx\n", addr, (uintmax_t)uid);
+		return (ENOENT);
+	}
+	for (i = 0; i < nalgs && algs[i].id != CS_CAL_ALG; i++)
+		;
+	if (i == nalgs)
+		return (ENOENT);
+	base = algs[i].ym_base;
+	vals[0] = (uint32_t)(int32_t)e->ambient;
+	vals[1] = e->calr;
+	vals[2] = e->status;
+	vals[3] = e->calr + 1;
+	for (i = 0; i < (int)nitems(ctls); i++) {
+		if ((error = cs_find_ctl(fw, len, CS_CAL_ALG, CS_RT_YM, ctls[i],
+		    &off)) != 0) {
+			device_printf(sc->dev, "control %s not found\n",
+			    ctls[i]);
+			return (error);
+		}
+		regs[i] = cs_region_to_reg(CS_RT_YM, base + off);
+		if ((error = cs_wr32(sc, addr, regs[i], vals[i])) != 0)
+			return (error);
+	}
+	device_printf(sc->dev, "0x%02x: calibration R %u, ambient %d C\n",
+	    addr, e->calr, e->ambient);
+	if (bootverbose)
+		device_printf(sc->dev, "0x%02x: CAL_AMBIENT 0x%x CAL_R 0x%x "
+		    "CAL_STATUS 0x%x CAL_CHECKSUM 0x%x\n", addr, regs[0],
+		    regs[1], regs[2], regs[3]);
+	return (0);
+}
+
+static int
+cs_load_amp(struct cs35l54_softc *sc, int index, const struct firmware *wmfw,
+    const struct cs_cal_data *cal)
 {
 	const struct firmware *bin;
 	struct cs_alg *algs;
@@ -546,8 +711,14 @@ cs_load_amp(struct cs35l54_softc *sc, int index, const struct firmware *wmfw)
 	    (error = cs_write_bin(sc, addr, bin->data, bin->datasize, algs,
 	    nalgs)) != 0 ||
 	    (error = cs_system_reset(sc, addr)) != 0 ||
-	    (error = cs_setup(sc, addr)) != 0 ||
-	    (error = cs_mbox(sc, addr, CS_MBOX_REINIT)) != 0)
+	    (error = cs_setup(sc, addr)) != 0)
+		goto out;
+	/* Like Linux, play uncalibrated if calibration cannot be applied. */
+	if (cal != NULL && cs_apply_cal(sc, index, wmfw->data, wmfw->datasize,
+	    algs, nalgs, cal) != 0)
+		device_printf(sc->dev, "0x%02x: calibration not applied\n",
+		    addr);
+	if ((error = cs_mbox(sc, addr, CS_MBOX_REINIT)) != 0)
 		goto out;
 	if ((error = cs_rd32(sc, addr, CS_PROT_STS, &val)) == 0 &&
 	    (val & CS_FIRMWARE_MISSING) != 0)
@@ -579,6 +750,7 @@ cs_fw_task(void *arg, int pending)
 {
 	struct cs35l54_softc *sc = arg;
 	const struct firmware *wmfw;
+	struct cs_cal_data *cal;
 	uint32_t ver;
 	char name[64];
 	int error = 0;
@@ -590,10 +762,11 @@ cs_fw_task(void *arg, int pending)
 		    name);
 		return;
 	}
+	cal = cs_read_cal(sc);
 	sx_xlock(&sc->lock);
 	cs_hard_reset(sc);
 	for (int i = 0; i < sc->namps && error == 0 && !sc->detaching; i++)
-		error = cs_load_amp(sc, i, wmfw);
+		error = cs_load_amp(sc, i, wmfw, cal);
 	if (error == 0 && !sc->detaching) {
 		sc->loaded = true;
 		if (sc->stream)
@@ -604,6 +777,7 @@ cs_fw_task(void *arg, int pending)
 			    (ver >> 8) & 0xFF, ver & 0xFF);
 	}
 	sx_xunlock(&sc->lock);
+	free(cal, M_TEMP);
 	firmware_put(wmfw, FIRMWARE_UNLOAD);
 }
 
