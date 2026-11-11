@@ -146,6 +146,7 @@ struct cs35l54_softc {
 	struct sx	lock;
 	struct task	fw_task;
 	struct task	play_task;
+	struct task	resume_task;
 	eventhandler_tag speaker_tag;
 	eventhandler_tag mountroot_tag;
 	gpio_pin_t	reset;
@@ -158,6 +159,7 @@ struct cs35l54_softc {
 	bool		playing;
 	bool		stream;		/* HDA speaker stream on */
 	bool		detaching;
+	bool		suspended;
 };
 
 static int	cs_set_playing(struct cs35l54_softc *sc, bool on);
@@ -897,9 +899,42 @@ cs_play_task(void *arg, int pending)
 	struct cs35l54_softc *sc = arg;
 
 	sx_xlock(&sc->lock);
-	if (!sc->detaching)
+	if (!sc->detaching && !sc->suspended)
 		(void)cs_set_playing(sc, sc->stream);
 	sx_xunlock(&sc->lock);
+}
+
+/*
+ * After resume: if the amplifiers lost power they run the ROM firmware
+ * again (FIRMWARE_MISSING) and need a new download; otherwise cs_play()
+ * redoes the setup, so only restart a running stream.
+ */
+static void
+cs_resume_task(void *arg, int pending)
+{
+	struct cs35l54_softc *sc = arg;
+	uint32_t prot;
+	bool reload;
+
+	sx_xlock(&sc->lock);
+	if (sc->detaching || !sc->loaded) {
+		sx_xunlock(&sc->lock);
+		return;
+	}
+	cs_wake(sc, sc->addr[0]);
+	reload = cs_wait_boot(sc, sc->addr[0]) != 0 ||
+	    cs_rd32(sc, sc->addr[0], CS_PROT_STS, &prot) != 0 ||
+	    (prot & CS_FIRMWARE_MISSING) != 0;
+	if (reload) {
+		sc->loaded = false;
+		sc->playing = false;
+	} else if (sc->stream)
+		(void)cs_set_playing(sc, true);
+	sx_xunlock(&sc->lock);
+	if (reload) {
+		device_printf(sc->dev, "firmware lost on resume, reloading\n");
+		cs_fw_task(sc, 0);
+	}
 }
 
 /* hdaa_speaker event: called without hdaa locks, must not sleep. */
@@ -1083,6 +1118,7 @@ cs35l54_attach(device_t dev)
 	sx_init(&sc->lock, "cs35l54");
 	TASK_INIT(&sc->fw_task, 0, cs_fw_task, sc);
 	TASK_INIT(&sc->play_task, 0, cs_play_task, sc);
+	TASK_INIT(&sc->resume_task, 0, cs_resume_task, sc);
 	sc->speaker_tag = EVENTHANDLER_REGISTER(hdaa_speaker, cs_speaker_event,
 	    sc, EVENTHANDLER_PRI_ANY);
 
@@ -1119,6 +1155,7 @@ cs35l54_detach(device_t dev)
 	sc->detaching = true;
 	taskqueue_drain(taskqueue_thread, &sc->fw_task);
 	taskqueue_drain(taskqueue_thread, &sc->play_task);
+	taskqueue_drain(taskqueue_thread, &sc->resume_task);
 	sx_xlock(&sc->lock);
 	if (sc->playing)
 		cs_stop(sc);
@@ -1129,10 +1166,38 @@ cs35l54_detach(device_t dev)
 	return (0);
 }
 
+static int
+cs35l54_suspend(device_t dev)
+{
+	struct cs35l54_softc *sc = device_get_softc(dev);
+
+	sx_xlock(&sc->lock);
+	sc->suspended = true;
+	if (sc->playing) {
+		(void)cs_stop(sc);
+		sc->playing = false;
+	}
+	sx_xunlock(&sc->lock);
+	return (0);
+}
+
+/* I2C work sleeps: finish the resume from a task. */
+static int
+cs35l54_resume(device_t dev)
+{
+	struct cs35l54_softc *sc = device_get_softc(dev);
+
+	sc->suspended = false;
+	taskqueue_enqueue(taskqueue_thread, &sc->resume_task);
+	return (0);
+}
+
 static device_method_t cs35l54_methods[] = {
 	DEVMETHOD(device_probe,		cs35l54_probe),
 	DEVMETHOD(device_attach,	cs35l54_attach),
 	DEVMETHOD(device_detach,	cs35l54_detach),
+	DEVMETHOD(device_suspend,	cs35l54_suspend),
+	DEVMETHOD(device_resume,	cs35l54_resume),
 	DEVMETHOD_END
 };
 
