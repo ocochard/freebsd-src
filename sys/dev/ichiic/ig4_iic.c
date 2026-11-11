@@ -132,6 +132,14 @@ static const struct ig4_hw ig4iic_hw[] = {
 		.scl_fall_time = 290,
 		.sda_hold_time = 313,
 	},
+	[IG4_AMD] = {
+		.ic_clock_rate = 150,	/* as Linux acpi_apd for AMDI0010 */
+		.sda_fall_time = 280,
+		.scl_fall_time = 240,
+		.sda_hold_time = 60,
+		.txfifo_depth = 32,
+		.rxfifo_depth = 32,
+	},
 };
 
 static int ig4iic_set_config(ig4iic_softc_t *sc, bool reset, bool force_restore);
