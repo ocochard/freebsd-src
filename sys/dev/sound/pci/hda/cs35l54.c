@@ -147,6 +147,7 @@ struct cs35l54_softc {
 	struct task	fw_task;
 	struct task	play_task;
 	eventhandler_tag speaker_tag;
+	eventhandler_tag mountroot_tag;
 	gpio_pin_t	reset;
 	char		sub[16];	/* ACPI _SUB, lower case */
 	uint32_t	subsystem;	/* _SUB, as HDA reports it */
@@ -667,6 +668,30 @@ cs_apply_cal(struct cs35l54_softc *sc, int index, const uint8_t *fw,
 	return (0);
 }
 
+/*
+ * Firmware file "cirrus/<file>" (linux-firmware name) is looked up first as
+ * a firmware(9) module image, named after the path with '/', '-' and '.'
+ * replaced by '_' so that firmware_get() can load the module on demand,
+ * then as the raw file in /boot/firmware/.
+ */
+static const struct firmware *
+cs_firmware_get(struct cs35l54_softc *sc, const char *file)
+{
+	const struct firmware *fw;
+	char path[80], kmod[80];
+
+	snprintf(path, sizeof(path), "cirrus/%s", file);
+	strlcpy(kmod, path, sizeof(kmod));
+	for (char *p = kmod; *p != '\0'; p++)
+		if (*p == '/' || *p == '-' || *p == '.')
+			*p = '_';
+	if ((fw = firmware_get_flags(kmod, FIRMWARE_GET_NOWARN)) == NULL &&
+	    (fw = firmware_get_flags(path, FIRMWARE_GET_NOWARN)) == NULL)
+		device_printf(sc->dev, "firmware %s (module %s) not found\n",
+		    path, kmod);
+	return (fw);
+}
+
 static int
 cs_load_amp(struct cs35l54_softc *sc, int index, const struct firmware *wmfw,
     const struct cs_cal_data *cal)
@@ -678,9 +703,9 @@ cs_load_amp(struct cs35l54_softc *sc, int index, const struct firmware *wmfw,
 	uint32_t val;
 	int error, nalgs;
 
-	snprintf(name, sizeof(name), "cirrus/cs35l54-b0-dsp1-misc-%s-amp%d.bin",
+	snprintf(name, sizeof(name), "cs35l54-b0-dsp1-misc-%s-amp%d.bin",
 	    sc->sub, index + 1);
-	if ((bin = firmware_get(name)) == NULL)
+	if ((bin = cs_firmware_get(sc, name)) == NULL)
 		return (ENOENT);
 	algs = malloc(sizeof(*algs) * (CS_MAX_ALGS + 1), M_TEMP, M_WAITOK);
 	cs_wake(sc, addr);
@@ -755,13 +780,9 @@ cs_fw_task(void *arg, int pending)
 	char name[64];
 	int error = 0;
 
-	snprintf(name, sizeof(name), "cirrus/cs35l54-b0-dsp1-misc-%s.wmfw",
-	    sc->sub);
-	if ((wmfw = firmware_get(name)) == NULL) {
-		device_printf(sc->dev, "%s not found in /boot/firmware\n",
-		    name);
+	snprintf(name, sizeof(name), "cs35l54-b0-dsp1-misc-%s.wmfw", sc->sub);
+	if ((wmfw = cs_firmware_get(sc, name)) == NULL)
 		return;
-	}
 	cal = cs_read_cal(sc);
 	sx_xlock(&sc->lock);
 	cs_hard_reset(sc);
@@ -1036,6 +1057,14 @@ cs35l54_probe(device_t dev)
 	return (BUS_PROBE_DEFAULT);
 }
 
+static void
+cs_mountroot(void *arg)
+{
+	struct cs35l54_softc *sc = arg;
+
+	taskqueue_enqueue(taskqueue_thread, &sc->fw_task);
+}
+
 static int
 cs35l54_attach(device_t dev)
 {
@@ -1067,8 +1096,15 @@ cs35l54_attach(device_t dev)
 	SYSCTL_ADD_BOOL(ctx, tree, OID_AUTO, "loaded", CTLFLAG_RD,
 	    &sc->loaded, 0, "DSP firmware downloaded");
 
-	/* The download takes seconds and needs the root file system. */
-	taskqueue_enqueue(taskqueue_thread, &sc->fw_task);
+	/*
+	 * The download takes seconds, and raw firmware files and on-demand
+	 * firmware modules need the root file system.
+	 */
+	if (root_mounted())
+		taskqueue_enqueue(taskqueue_thread, &sc->fw_task);
+	else
+		sc->mountroot_tag = EVENTHANDLER_REGISTER(mountroot,
+		    cs_mountroot, sc, EVENTHANDLER_PRI_ANY);
 	return (0);
 }
 
@@ -1078,6 +1114,8 @@ cs35l54_detach(device_t dev)
 	struct cs35l54_softc *sc = device_get_softc(dev);
 
 	EVENTHANDLER_DEREGISTER(hdaa_speaker, sc->speaker_tag);
+	if (sc->mountroot_tag != NULL)
+		EVENTHANDLER_DEREGISTER(mountroot, sc->mountroot_tag);
 	sc->detaching = true;
 	taskqueue_drain(taskqueue_thread, &sc->fw_task);
 	taskqueue_drain(taskqueue_thread, &sc->play_task);
