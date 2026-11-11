@@ -1,0 +1,145 @@
+.\"
+.\" SPDX-License-Identifier: BSD-2-Clause
+.\"
+.\" Copyright (c) 2026 Olivier Cochard-Labbe <olivier@FreeBSD.org>
+.\"
+.\" Redistribution and use in source and binary forms, with or without
+.\" modification, are permitted provided that the following conditions
+.\" are met:
+.\" 1. Redistributions of source code must retain the above copyright
+.\"    notice, this list of conditions and the following disclaimer.
+.\" 2. Redistributions in binary form must reproduce the above copyright
+.\"    notice, this list of conditions and the following disclaimer in the
+.\"    documentation and/or other materials provided with the distribution.
+.\"
+.\" THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+.\" ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+.\" IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+.\" ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+.\" FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+.\" DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+.\" OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+.\" HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+.\" LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+.\" OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+.\" SUCH DAMAGE.
+.\"
+.Dd November 11, 2026
+.Dt SND_CS35L54 4
+.Os
+.Sh NAME
+.Nm snd_cs35l54
+.Nd "Cirrus Logic CS35L54 speaker amplifier driver"
+.Sh SYNOPSIS
+To load the driver as a module at boot time, place the following line in
+.Xr rc.conf 5 :
+.Bd -literal -offset indent
+kld_list="amdgpio snd_cs35l54"
+.Ed
+.Sh DESCRIPTION
+Some laptops route the internal speakers through smart amplifiers that sit
+on an I2C bus, behind the HDA codec driven by
+.Xr snd_hda 4 .
+These amplifiers stay silent until their DSP firmware is downloaded and
+they are told to play.
+.Pp
+The
+.Nm
+driver attaches to the ACPI device that describes the amplifiers and reads
+the amplifier addresses, the platform subsystem id, and the shared reset
+line from it.
+It downloads the DSP program and one tuning file per amplifier, applies the
+factory speaker calibration stored in the UEFI variable
+.Va CirrusSmartAmpCalibrationData ,
+and starts or pauses the amplifiers whenever
+.Xr snd_hda 4
+starts or stops a stream to the internal speakers.
+.Pp
+The firmware download needs the root file system: when the driver attaches
+before it is mounted, the download waits for it.
+.Sh HARDWARE
+The
+.Nm
+driver supports Cirrus Logic CS35L54 amplifiers, revision B0, attached by
+I2C and described by the ACPI hardware id
+.Li CSC3554 ,
+including:
+.Pp
+.Bl -bullet -compact
+.It
+HP ZBook Ultra G1a 14 inch Mobile Workstation
+.El
+.Sh FILES
+The firmware files come from linux-firmware and are named after the ACPI
+subsystem id
+.Ar sub
+in lower case, with
+.Ar N
+the amplifier index starting at 1:
+.Bl -tag -width indent
+.It Pa /boot/firmware/cirrus/cs35l54-b0-dsp1-misc- Ns Ar sub Ns Pa .wmfw
+DSP program.
+.It Pa /boot/firmware/cirrus/cs35l54-b0-dsp1-misc- Ns Ar sub Ns Pa -amp Ns Ar N Ns Pa .bin
+Tuning of amplifier
+.Ar N .
+.El
+.Pp
+The driver first asks
+.Xr firmware 9
+for a firmware module image of the same name with
+.Ql / ,
+.Ql -
+and
+.Ql \&.
+replaced by
+.Ql _ ,
+then for the raw file.
+The
+.Pa audio/sound-firmware-cirrus-kmod
+port installs the raw files;
+.Xr fwget 8
+detects the amplifiers and installs it.
+.Sh SYSCTL VARIABLES
+.Bl -tag -width indent
+.It Va dev.cs35l54.%d.loaded
+Read-only, 1 once the firmware is downloaded.
+.It Va dev.cs35l54.%d.play
+1 while the amplifiers play.
+Writing 1 or 0 starts or pauses them by hand, for tests.
+.It Va dev.cs35l54.%d.volume
+Amplifier volume in dB, from -100 to 12.
+The default is -30.
+.El
+.Sh SEE ALSO
+.Xr gpio 4 ,
+.Xr snd_hda 4 ,
+.Xr sound 4 ,
+.Xr fwget 8 ,
+.Xr firmware 9
+.Sh HISTORY
+The
+.Nm
+driver first appeared in
+.Fx 16.0 .
+.Sh AUTHORS
+.An -nosplit
+The
+.Nm
+driver and this manual page were written by
+.An Olivier Cochard-Labbe Aq Mt olivier@FreeBSD.org .
+.Sh CAVEATS
+The reset line is a GPIO of the AMD GPIO controller, so the
+.Cm amdgpio
+module must be loaded first; without it, the driver only wakes the
+amplifiers.
+.Pp
+The amplifier interrupt is not used.
+.Sh BUGS
+Through
+.Xr ig4 4 ,
+the first 32-bit word of each read from the amplifiers is stale; the driver
+reads one extra word and drops it.
+.Pp
+Only the HP ZBook Ultra G1a has been tested.
+CS35L56 and CS35L57 amplifiers, speaker-id variants, and SPI or SoundWire
+attachment are not supported.
