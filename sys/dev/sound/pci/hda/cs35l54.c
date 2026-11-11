@@ -53,6 +53,7 @@
 #include <dev/gpio/gpiobusvar.h>
 #include <dev/iicbus/iicbus.h>
 #include <dev/iicbus/iiconf.h>
+#include <dev/sound/pci/hda/hdaa_speaker.h>
 
 #define	CS_MAX_AMPS		4
 
@@ -143,15 +144,21 @@ struct cs35l54_softc {
 	device_t	dev;
 	struct sx	lock;
 	struct task	fw_task;
+	struct task	play_task;
+	eventhandler_tag speaker_tag;
 	gpio_pin_t	reset;
 	char		sub[16];	/* ACPI _SUB, lower case */
+	uint32_t	subsystem;	/* _SUB, as HDA reports it */
 	uint16_t	addr[CS_MAX_AMPS];
 	int		namps;
 	int		volume;		/* dB */
 	bool		loaded;
 	bool		playing;
+	bool		stream;		/* HDA speaker stream on */
 	bool		detaching;
 };
+
+static int	cs_set_playing(struct cs35l54_softc *sc, bool on);
 
 static int
 cs_sleep(int us)
@@ -589,6 +596,8 @@ cs_fw_task(void *arg, int pending)
 		error = cs_load_amp(sc, i, wmfw);
 	if (error == 0 && !sc->detaching) {
 		sc->loaded = true;
+		if (sc->stream)
+			(void)cs_set_playing(sc, true);
 		if (cs_rd32(sc, sc->addr[0], CS_FW_VER, &ver) == 0)
 			device_printf(sc->dev, "%d amplifiers, firmware "
 			    "%u.%u.%u\n", sc->namps, (ver >> 16) & 0xFF,
@@ -653,6 +662,24 @@ cs_stop(struct cs35l54_softc *sc)
 }
 
 static int
+cs_set_playing(struct cs35l54_softc *sc, bool on)
+{
+	int error = 0;
+
+	sx_assert(&sc->lock, SA_XLOCKED);
+	if (!sc->loaded)
+		return (ENXIO);
+	if (on && !sc->playing) {
+		if ((error = cs_play(sc)) == 0)
+			sc->playing = true;
+	} else if (!on && sc->playing) {
+		error = cs_stop(sc);
+		sc->playing = false;
+	}
+	return (error);
+}
+
+static int
 cs_sysctl_play(SYSCTL_HANDLER_ARGS)
 {
 	struct cs35l54_softc *sc = arg1;
@@ -663,17 +690,33 @@ cs_sysctl_play(SYSCTL_HANDLER_ARGS)
 	if (error != 0 || req->newptr == NULL)
 		return (error);
 	sx_xlock(&sc->lock);
-	if (!sc->loaded)
-		error = ENXIO;
-	else if (val != 0 && !sc->playing) {
-		if ((error = cs_play(sc)) == 0)
-			sc->playing = true;
-	} else if (val == 0 && sc->playing) {
-		error = cs_stop(sc);
-		sc->playing = false;
-	}
+	error = cs_set_playing(sc, val != 0);
 	sx_xunlock(&sc->lock);
 	return (error);
+}
+
+/* Follow the HDA speaker stream; runs in taskqueue_thread. */
+static void
+cs_play_task(void *arg, int pending)
+{
+	struct cs35l54_softc *sc = arg;
+
+	sx_xlock(&sc->lock);
+	if (!sc->detaching)
+		(void)cs_set_playing(sc, sc->stream);
+	sx_xunlock(&sc->lock);
+}
+
+/* hdaa_speaker event: called without hdaa locks, must not sleep. */
+static void
+cs_speaker_event(void *arg, device_t hdaa, uint32_t subsystem, bool active)
+{
+	struct cs35l54_softc *sc = arg;
+
+	if (subsystem != sc->subsystem)
+		return;
+	sc->stream = active;
+	taskqueue_enqueue(taskqueue_thread, &sc->play_task);
 }
 
 static int
@@ -832,9 +875,13 @@ cs35l54_attach(device_t dev)
 		device_printf(dev, "incomplete ACPI description\n");
 		return (ENXIO);
 	}
+	sc->subsystem = strtoul(sc->sub, NULL, 16);
 	cs_get_reset(sc);
 	sx_init(&sc->lock, "cs35l54");
 	TASK_INIT(&sc->fw_task, 0, cs_fw_task, sc);
+	TASK_INIT(&sc->play_task, 0, cs_play_task, sc);
+	sc->speaker_tag = EVENTHANDLER_REGISTER(hdaa_speaker, cs_speaker_event,
+	    sc, EVENTHANDLER_PRI_ANY);
 
 	tree = SYSCTL_CHILDREN(device_get_sysctl_tree(dev));
 	SYSCTL_ADD_PROC(ctx, tree, OID_AUTO, "play",
@@ -856,8 +903,10 @@ cs35l54_detach(device_t dev)
 {
 	struct cs35l54_softc *sc = device_get_softc(dev);
 
+	EVENTHANDLER_DEREGISTER(hdaa_speaker, sc->speaker_tag);
 	sc->detaching = true;
 	taskqueue_drain(taskqueue_thread, &sc->fw_task);
+	taskqueue_drain(taskqueue_thread, &sc->play_task);
 	sx_xlock(&sc->lock);
 	if (sc->playing)
 		cs_stop(sc);
