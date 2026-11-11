@@ -1,0 +1,30 @@
+#
+# Copyright (c) 2026 Olivier Cochard-Labbe <olivier@FreeBSD.org>
+#
+# SPDX-License-Identifier: BSD-2-Clause
+
+# Map the vendor prefix of an ACPI hardware id to a vendor script.
+acpi_get_vendor()
+{
+	case "$1" in
+		CSC*)	echo "cirrus" ;;	# Cirrus Logic
+	esac
+}
+
+acpi_search_packages()
+{
+	local hid vendor
+
+	# Hardware ids of all ACPI devices, with or without a driver.
+	for hid in $(devinfo -v | sed -n 's/.*_HID=\([^ ]*\).*/\1/p' | sort -u); do
+		vendor=$(acpi_get_vendor "${hid}")
+		if [ -z "${vendor}" ]; then
+			continue
+		fi
+		log_verbose "Trying to match device ${hid} with acpi_${vendor}"
+		if [ -f "${LIBEXEC_PATH}/acpi_${vendor}" ]; then
+			. "${LIBEXEC_PATH}/acpi_${vendor}"
+			acpi_${vendor} "${hid}"
+		fi
+	done
+}

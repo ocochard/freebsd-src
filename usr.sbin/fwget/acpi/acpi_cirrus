@@ -1,0 +1,12 @@
+#
+# Copyright (c) 2026 Olivier Cochard-Labbe <olivier@FreeBSD.org>
+#
+# SPDX-License-Identifier: BSD-2-Clause
+
+acpi_cirrus()
+{
+
+	case "$1" in
+	CSC3554)	addpkg "sound-firmware-cirrus-kmod-cs35l54"; return 1 ;;
+	esac
+}
