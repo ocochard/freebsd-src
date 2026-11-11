@@ -44,6 +44,7 @@
 #include <dev/sound/pci/hda/hdac.h>
 #include <dev/sound/pci/hda/hdaa.h>
 #include <dev/sound/pci/hda/hda_reg.h>
+#include <dev/sound/pci/hda/hdaa_speaker.h>
 
 #include "mixer_if.h"
 
@@ -2219,10 +2220,38 @@ hdaa_channel_start(struct hdaa_chan *ch)
 	return (0);
 }
 
+/*
+ * True if the association drives a fixed internal speaker, which may sit
+ * behind external amplifiers that must follow the stream.
+ */
+static bool
+hdaa_as_has_speaker(struct hdaa_devinfo *devinfo, struct hdaa_audio_as *as)
+{
+	struct hdaa_widget *w;
+	uint32_t conf;
+
+	for (int i = 0; i < 16; i++) {
+		if (as->pins[i] <= 0)
+			continue;
+		w = hdaa_widget_get(devinfo, as->pins[i]);
+		if (w == NULL ||
+		    w->type != HDA_PARAM_AUDIO_WIDGET_CAP_TYPE_PIN_COMPLEX)
+			continue;
+		conf = w->wclass.pin.config;
+		if ((conf & HDA_CONFIG_DEFAULTCONF_DEVICE_MASK) ==
+		    HDA_CONFIG_DEFAULTCONF_DEVICE_SPEAKER &&
+		    (conf & HDA_CONFIG_DEFAULTCONF_CONNECTIVITY_MASK) ==
+		    HDA_CONFIG_DEFAULTCONF_CONNECTIVITY_FIXED)
+			return (true);
+	}
+	return (false);
+}
+
 static int
 hdaa_channel_trigger(kobj_t obj, void *data, int go)
 {
 	struct hdaa_chan *ch = data;
+	bool speaker;
 	int error = 0;
 
 	if (!PCMTRIG_COMMON(go))
@@ -2240,7 +2269,13 @@ hdaa_channel_trigger(kobj_t obj, void *data, int go)
 	default:
 		break;
 	}
+	speaker = error == 0 && ch->dir == PCMDIR_PLAY &&
+	    hdaa_as_has_speaker(ch->devinfo, &ch->devinfo->as[ch->as]);
 	hdaa_unlock(ch->devinfo);
+	if (speaker)
+		EVENTHANDLER_INVOKE(hdaa_speaker, ch->devinfo->dev,
+		    hda_get_subsystem_id(ch->devinfo->dev),
+		    go == PCMTRIG_START);
 
 	return (error);
 }
