@@ -570,6 +570,7 @@ MAN=	aac.4 \
 	snd_als4000.4 \
 	snd_atiixp.4 \
 	snd_cmi.4 \
+	${_snd_cs35l54.4} \
 	snd_cs4281.4 \
 	snd_csa.4 \
 	snd_dummy.4 \
@@ -940,6 +941,7 @@ _pchtherm.4=	pchtherm.4
 _qat.4=		qat.4
 _qat_c2xxx.4=	qat_c2xxx.4
 _rr232x.4=	rr232x.4
+_snd_cs35l54.4=	snd_cs35l54.4
 _speaker.4=	speaker.4
 _spkr.4=	spkr.4
 _superio.4=	superio.4
