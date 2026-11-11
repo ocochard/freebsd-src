@@ -2005,6 +2005,9 @@ acpi_device_get_prop(device_t bus, device_t dev, const char *propname,
 	ACPI_STATUS status;
 	int i;
 
+	/* Only our own children carry struct acpi_device ivars. */
+	if (device_get_parent(dev) != bus)
+		return (AE_BAD_PARAMETER);
 	ad = device_get_ivars(dev);
 
 	if (ad == NULL || propname == NULL)
