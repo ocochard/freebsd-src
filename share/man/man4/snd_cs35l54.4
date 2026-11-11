@@ -31,10 +31,13 @@
 .Nm snd_cs35l54
 .Nd "Cirrus Logic CS35L54 speaker amplifier driver"
 .Sh SYNOPSIS
-To load the driver as a module at boot time, place the following line in
+The driver is loaded at boot by
+.Xr devmatch 8
+when the amplifiers are present.
+To load it explicitly, place the following line in
 .Xr rc.conf 5 :
 .Bd -literal -offset indent
-kld_list="amdgpio snd_cs35l54"
+kld_list="snd_cs35l54"
 .Ed
 .Sh DESCRIPTION
 Some laptops route the internal speakers through smart amplifiers that sit
@@ -114,6 +117,7 @@ The default is -30.
 .Xr gpio 4 ,
 .Xr snd_hda 4 ,
 .Xr sound 4 ,
+.Xr devmatch 8 ,
 .Xr fwget 8 ,
 .Xr firmware 9
 .Sh HISTORY
@@ -128,10 +132,13 @@ The
 driver and this manual page were written by
 .An Olivier Cochard-Labbe Aq Mt olivier@FreeBSD.org .
 .Sh CAVEATS
-The reset line is a GPIO of the AMD GPIO controller, so the
+The reset line is a GPIO of the AMD GPIO controller.
+If the
 .Cm amdgpio
-module must be loaded first; without it, the driver only wakes the
-amplifiers.
+module is not loaded before the driver attaches, the driver only wakes
+the amplifiers and cannot reset them; add it to
+.Va kld_list
+to use the reset line.
 .Pp
 The amplifier interrupt is not used.
 .Sh BUGS
