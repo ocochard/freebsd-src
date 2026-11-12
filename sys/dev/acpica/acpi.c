@@ -3636,6 +3636,37 @@ do_sleep(struct acpi_softc *sc, enum acpi_sleep_state *slp_state,
 }
 
 #if defined(__i386__) || defined(__amd64__)
+/*
+ * Interrupts besides the SCI that may wake the system from suspend-to-idle,
+ * e.g. a GPIO controller with wake pins.  Changed and used with the bus
+ * topology lock held.
+ */
+static u_int acpi_s2idle_wake_irqs[4];
+static u_int acpi_s2idle_wake_nirqs;
+
+int
+acpi_s2idle_wake_irq_register(u_int irq)
+{
+
+    if (acpi_s2idle_wake_nirqs == nitems(acpi_s2idle_wake_irqs))
+	return (ENOSPC);
+    acpi_s2idle_wake_irqs[acpi_s2idle_wake_nirqs++] = irq;
+    return (0);
+}
+
+void
+acpi_s2idle_wake_irq_unregister(u_int irq)
+{
+
+    for (u_int i = 0; i < acpi_s2idle_wake_nirqs; i++) {
+	if (acpi_s2idle_wake_irqs[i] != irq)
+	    continue;
+	acpi_s2idle_wake_irqs[i] =
+	    acpi_s2idle_wake_irqs[--acpi_s2idle_wake_nirqs];
+	return;
+    }
+}
+
 static void
 do_idle(struct acpi_softc *sc, enum acpi_sleep_state *slp_state,
     register_t rflags)
@@ -3662,6 +3693,8 @@ do_idle(struct acpi_softc *sc, enum acpi_sleep_state *slp_state,
      * proper wake event.
      */
     intr_enable_src(AcpiGbl_FADT.SciInterrupt);
+    for (u_int i = 0; i < acpi_s2idle_wake_nirqs; i++)
+	intr_enable_src(acpi_s2idle_wake_irqs[i]);
 
     cpu_idle(0);
 
