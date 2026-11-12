@@ -311,6 +311,17 @@ static const struct amd_pingroup kernzp_groups[] = {
 #define	AMDGPIO_ASSERT_LOCKED(_sc)	mtx_assert(&(_sc)->sc_mtx, MA_OWNED)
 #define	AMDGPIO_ASSERT_UNLOCKED(_sc)	mtx_assert(&(_sc)->sc_mtx, MA_NOTOWNED)
 
+/* A wake capable GPIO interrupt from _AEI. */
+struct amdgpio_wake_pin {
+	int		pin;
+	uint8_t		triggering;	/* ACPI_LEVEL_SENSITIVE or _EDGE_ */
+	uint8_t		polarity;	/* ACPI_ACTIVE_HIGH, _LOW or _BOTH */
+	bool		armed;
+	uint32_t	saved;		/* Pin register before suspend. */
+};
+
+#define	AMDGPIO_WAKE_PINS_MAX	16
+
 struct amdgpio_softc {
 	ACPI_HANDLE		sc_handle;
 	device_t		sc_dev;
@@ -327,6 +338,9 @@ struct amdgpio_softc {
 	const struct pin_info	*sc_pin_info;
 	const struct amd_pingroup *sc_groups;
 	void			*sc_intr_handle;
+	struct amdgpio_wake_pin	sc_wake[AMDGPIO_WAKE_PINS_MAX];
+	int			sc_nwake;
+	bool			sc_wake_irq;
 };
 
 struct amdgpio_sysctl {

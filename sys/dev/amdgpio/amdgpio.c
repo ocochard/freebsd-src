@@ -430,6 +430,39 @@ amdgpio_intr_handler(void *arg)
 	/* TODO */
 }
 
+static ACPI_STATUS
+amdgpio_find_wake_pins(ACPI_RESOURCE *res, void *arg)
+{
+	struct amdgpio_softc *sc = arg;
+	ACPI_RESOURCE_GPIO *gpio = &res->Data.Gpio;
+	struct amdgpio_wake_pin *wp;
+
+	if (res->Type != ACPI_RESOURCE_TYPE_GPIO ||
+	    gpio->ConnectionType != ACPI_RESOURCE_GPIO_TYPE_INT ||
+	    gpio->WakeCapable != ACPI_WAKE_CAPABLE)
+		return (AE_OK);
+	for (int i = 0; i < gpio->PinTableLength; i++) {
+		if (sc->sc_nwake == nitems(sc->sc_wake) ||
+		    gpio->PinTable[i] >= AMD_GPIO_PINS_MAX)
+			break;
+		wp = &sc->sc_wake[sc->sc_nwake++];
+		wp->pin = gpio->PinTable[i];
+		wp->triggering = gpio->Triggering;
+		wp->polarity = gpio->Polarity;
+	}
+	return (AE_OK);
+}
+
+static bool
+amdgpio_is_wake_pin(struct amdgpio_softc *sc, int pin)
+{
+
+	for (int i = 0; i < sc->sc_nwake; i++)
+		if (sc->sc_wake[i].pin == pin)
+			return (true);
+	return (false);
+}
+
 static int
 amdgpio_attach(device_t dev)
 {
@@ -500,6 +533,12 @@ amdgpio_attach(device_t dev)
 	}
 	amdgpio_eoi(sc);
 
+	/* Wake capable _AEI interrupts must stay armed in suspend-to-idle. */
+	AcpiWalkResources(sc->sc_handle, "_AEI", amdgpio_find_wake_pins, sc);
+	if (sc->sc_nwake > 0 && acpi_s2idle_wake_irq_register(
+	    rman_get_start(sc->sc_res[1])) == 0)
+		sc->sc_wake_irq = true;
+
 	sc->sc_busdev = gpiobus_add_bus(dev);
 	if (sc->sc_busdev == NULL) {
 		device_printf(dev, "could not attach gpiobus\n");
@@ -510,6 +549,8 @@ amdgpio_attach(device_t dev)
 	return (0);
 
 err_bus:
+	if (sc->sc_wake_irq)
+		acpi_s2idle_wake_irq_unregister(rman_get_start(sc->sc_res[1]));
 	bus_teardown_intr(dev, sc->sc_res[1], sc->sc_intr_handle);
 err_intr:
 	bus_release_resources(dev, amdgpio_spec, sc->sc_res);
@@ -527,6 +568,8 @@ amdgpio_detach(device_t dev)
 
 	if (sc->sc_busdev)
 		gpiobus_detach_bus(dev);
+	if (sc->sc_wake_irq)
+		acpi_s2idle_wake_irq_unregister(rman_get_start(sc->sc_res[1]));
 	if (sc->sc_intr_handle)
 		bus_teardown_intr(dev, sc->sc_res[1], sc->sc_intr_handle);
 	bus_release_resources(dev, amdgpio_spec, sc->sc_res);
@@ -548,6 +591,8 @@ amdgpio_suspend(device_t dev)
 
 	for (i = 0; i < AMD_GPIO_PINS_EXPOSED; i++) {
 		pin = kernzp_pins[i].pin_num;
+		if (amdgpio_is_wake_pin(sc, pin))
+			continue;
 		off = AMDGPIO_PIN_REGISTER(pin);
 
 		reg = amdgpio_read_4(sc, off);
@@ -566,6 +611,39 @@ amdgpio_suspend(device_t dev)
 		amdgpio_write_4(sc, off, reg);
 	}
 
+	/*
+	 * Arm the wake pins: interrupt enabled and unmasked, S0i3 and S3 wake,
+	 * no debounce (as Linux does).  Skip an asserted level pin, it would
+	 * interrupt continuously as nothing runs _EVT to clear its source yet.
+	 */
+	for (i = 0; i < sc->sc_nwake; i++) {
+		struct amdgpio_wake_pin *wp = &sc->sc_wake[i];
+		bool high;
+
+		off = AMDGPIO_PIN_REGISTER(wp->pin);
+		reg = amdgpio_read_4(sc, off);
+		wp->saved = reg & ~UNSERVICED_INTERRUPT_MASK;
+		wp->armed = false;
+		high = (reg & (1 << PIN_STS_OFF)) != 0;
+		if (wp->triggering == ACPI_LEVEL_SENSITIVE &&
+		    high == (wp->polarity == ACPI_ACTIVE_HIGH)) {
+			device_printf(dev, "wake pin %d asserted, not armed\n",
+			    wp->pin);
+			continue;
+		}
+		reg &= ~(DB_CNTRL_MASK << DB_CNTRL_OFF);
+		reg &= ~((1 << LEVEL_TRIG_OFF) |
+		    (ACTIVE_LEVEL_MASK << ACTIVE_LEVEL_OFF));
+		if (wp->triggering == ACPI_LEVEL_SENSITIVE)
+			reg |= LEVEL_TRIGGER << LEVEL_TRIG_OFF;
+		/* ACPI and the controller encode the polarity the same way. */
+		reg |= (uint32_t)wp->polarity << ACTIVE_LEVEL_OFF;
+		reg |= (1 << INTERRUPT_ENABLE_OFF) | (1 << INTERRUPT_MASK_OFF) |
+		    (1 << WAKE_CNTRL_OFF_S0I3) | (1 << WAKE_CNTRL_OFF_S3);
+		amdgpio_write_4(sc, off, reg);
+		wp->armed = true;
+	}
+
 	amdgpio_eoi_locked(sc);
 	AMDGPIO_UNLOCK(sc);
 
@@ -575,10 +653,25 @@ amdgpio_suspend(device_t dev)
 static int
 amdgpio_resume(device_t dev)
 {
+	struct amdgpio_softc *sc = device_get_softc(dev);
+
 	/*
 	 * XXX Will have to resume properly once we're actually able to use
-	 * amdgpio for interrupts.
+	 * amdgpio for interrupts.  For now, disarm the wake pins.
 	 */
+	AMDGPIO_LOCK(sc);
+	for (int i = 0; i < sc->sc_nwake; i++) {
+		struct amdgpio_wake_pin *wp = &sc->sc_wake[i];
+
+		if (!wp->armed)
+			continue;
+		amdgpio_write_4(sc, AMDGPIO_PIN_REGISTER(wp->pin),
+		    wp->saved | UNSERVICED_INTERRUPT_MASK);
+		wp->armed = false;
+	}
+	amdgpio_eoi_locked(sc);
+	AMDGPIO_UNLOCK(sc);
+
 	return (0);
 }
 
