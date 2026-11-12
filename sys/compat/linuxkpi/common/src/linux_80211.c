@@ -6152,7 +6152,13 @@ lkpi_80211_txq_tx_one(struct lkpi_sta *lsta, struct mbuf *m)
 	skb_set_queue_mapping(skb, ac);
 
 	info = IEEE80211_SKB_CB(skb);
-	info->flags |= IEEE80211_TX_CTL_REQ_TX_STATUS;
+	/*
+	 * Like mac80211, only ask for TX status when someone waits for it:
+	 * mt76 sends frames with a status request outside the BA session.
+	 */
+	if (!ieee80211_is_data(hdr->frame_control) ||
+	    (m->m_flags & (M_EAPOL | M_TXCB)) != 0)
+		info->flags |= IEEE80211_TX_CTL_REQ_TX_STATUS;
 	/* Slight delay; probably only happens on scanning so fine? */
 	if (c == NULL || c == IEEE80211_CHAN_ANYC)
 		c = ic->ic_curchan;
@@ -9240,8 +9246,11 @@ linuxkpi_ieee80211_tx_status_ext(struct ieee80211_hw *hw,
 		status = 1;
 		txs.status = IEEE80211_RATECTL_TX_FAIL_UNSPECIFIED;
 	}
+	/* No status was requested or reported: unknown, not a failure. */
+	if (txstat->info == NULL)
+		status = 0;
 
-	if (ni != NULL) {
+	if (ni != NULL && txstat->info != NULL) {
 		txs.pktlen = skb->len;
 		txs.flags |= IEEE80211_RATECTL_STATUS_PKTLEN;
 		if (info->status.rates[0].count > 1) {
