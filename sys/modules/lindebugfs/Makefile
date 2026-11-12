@@ -9,6 +9,7 @@ CFLAGS+= ${LINUXKPI_INCLUDES}
 EXPORT_SYMS=	debugfs_create_atomic_t
 EXPORT_SYMS+=	debugfs_create_blob
 EXPORT_SYMS+=	debugfs_create_bool
+EXPORT_SYMS+=	debugfs_create_devm_seqfile
 EXPORT_SYMS+=	debugfs_create_dir
 EXPORT_SYMS+=	debugfs_create_file
 EXPORT_SYMS+=	debugfs_create_file_size
