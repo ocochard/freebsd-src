@@ -351,11 +351,13 @@ linuxkpi_kfree_skb(struct sk_buff *skb)
 			shinfo->frags[fragno].size = 0;
 			shinfo->frags[fragno].offset = 0;
 			shinfo->frags[fragno].page = NULL;
-#ifdef PAGE_IS_LKPI_PAGE
 			if ((skb->_flags & _SKB_PP_RECYCLE) != 0)
+#ifdef PAGE_IS_LKPI_PAGE
 				page_pool_put_full_page(p->pp, p, false);
-			else
+#else
+				page_pool_put_full_page(NULL, p, false);
 #endif
+			else
 				__free_page(p);
 			count++;
 		}
@@ -365,7 +367,13 @@ linuxkpi_kfree_skb(struct sk_buff *skb)
 		void *p;
 
 		p = skb->head;
-		skb_free_frag(p);
+#ifndef PAGE_IS_LKPI_PAGE
+		if ((skb->_flags & _SKB_PP_RECYCLE) != 0)
+			page_pool_put_full_page(NULL, virt_to_head_page(p),
+			    false);
+		else
+#endif
+			skb_free_frag(p);
 		skb->head = NULL;
 	}
 
