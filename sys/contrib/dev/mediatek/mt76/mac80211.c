@@ -623,6 +623,11 @@ void mt76_unregister_phy(struct mt76_phy *phy)
 	if (!test_bit(MT76_STATE_REGISTERED, &phy->state))
 		return;
 
+#if defined(__FreeBSD__) && defined(CONFIG_MAC80211_DEBUGFS)
+	/* Linux removes it with the wiphy debugfs dir. */
+	debugfs_remove_recursive(phy->debugfs_dir);
+	phy->debugfs_dir = NULL;
+#endif
 #if defined(CONFIG_MT76_LEDS)
 	if (IS_ENABLED(CONFIG_MT76_LEDS))
 		mt76_led_cleanup(phy);
@@ -831,6 +836,11 @@ void mt76_unregister_device(struct mt76_dev *dev)
 	if (!test_bit(MT76_STATE_REGISTERED, &dev->phy.state))
 		return;
 
+#if defined(__FreeBSD__) && defined(CONFIG_MAC80211_DEBUGFS)
+	/* Linux removes it with the wiphy debugfs dir. */
+	debugfs_remove_recursive(dev->phy.debugfs_dir);
+	dev->phy.debugfs_dir = NULL;
+#endif
 #if defined(CONFIG_MT76_LEDS)
 	if (IS_ENABLED(CONFIG_MT76_LEDS))
 		mt76_led_cleanup(&dev->phy);

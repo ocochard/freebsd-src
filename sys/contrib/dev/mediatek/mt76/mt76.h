@@ -861,6 +861,9 @@ struct mt76_phy {
 	unsigned long state;
 	unsigned int num_sta;
 	u8 band_idx;
+#if defined(__FreeBSD__)
+	struct dentry *debugfs_dir;	/* No wiphy debugfs dir to remove it. */
+#endif
 
 	spinlock_t tx_lock;
 	struct list_head tx_list;
