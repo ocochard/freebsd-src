@@ -234,6 +234,17 @@ static int mt7921_init_hardware(struct mt792x_dev *dev)
 	return 0;
 }
 
+/*
+ * On FreeBSD mt7921_register_device() waits for the init work: wake it up
+ * when the work fails, it checks MT76_STATE_REGISTERED.
+ */
+static void mt7921_init_done(struct mt792x_dev *dev)
+{
+#if defined(__FreeBSD__)
+	complete(&dev->mt76.drv_start_complete);
+#endif
+}
+
 static void mt7921_init_work(struct work_struct *work)
 {
 	struct mt792x_dev *dev = container_of(work, struct mt792x_dev,
@@ -241,8 +252,10 @@ static void mt7921_init_work(struct work_struct *work)
 	int ret;
 
 	ret = mt7921_init_hardware(dev);
-	if (ret)
+	if (ret) {
+		mt7921_init_done(dev);
 		return;
+	}
 
 	mt76_set_stream_caps(&dev->mphy, true);
 	mt7921_set_stream_he_caps(&dev->phy);
@@ -252,6 +265,7 @@ static void mt7921_init_work(struct work_struct *work)
 				   ARRAY_SIZE(mt76_rates));
 	if (ret) {
 		dev_err(dev->mt76.dev, "register device failed\n");
+		mt7921_init_done(dev);
 		return;
 	}
 
@@ -364,6 +378,8 @@ int mt7921_register_device(struct mt792x_dev *dev)
 
 #if defined(__FreeBSD__)
 	wait_for_completion(&dev->mt76.drv_start_complete);
+	if (!test_bit(MT76_STATE_REGISTERED, &dev->mphy.state))
+		return -ENXIO;
 #endif
 
 	return 0;
