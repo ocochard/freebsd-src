@@ -317,3 +317,7 @@ int mt7925_init_debugfs(struct mt792x_dev *dev)
 
 	return 0;
 }
+
+#if defined(__FreeBSD__)
+MODULE_DEPEND(mt7925_pci, lindebugfs, 1, 1, 1);
+#endif
