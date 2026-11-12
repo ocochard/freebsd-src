@@ -273,6 +273,9 @@ idr_remove(struct idr *idr, int id)
 {
 	void *res;
 
+	/* Linux allows lookups on an idr after idr_destroy(): it is empty. */
+	if (IDR_LOCK_INITALIZED(idr) == 0)
+		return (NULL);
 	IDR_LOCK(idr);
 	res = idr_remove_locked(idr, id);
 	IDR_UNLOCK(idr);
@@ -340,6 +343,8 @@ idr_find(struct idr *idr, int id)
 {
 	void *res;
 
+	if (IDR_LOCK_INITALIZED(idr) == 0)
+		return (NULL);
 	IDR_LOCK(idr);
 	res = idr_find_locked(idr, id);
 	IDR_UNLOCK(idr);
@@ -352,6 +357,8 @@ idr_get_next(struct idr *idr, int *nextidp)
 	void *res = NULL;
 	int id = *nextidp;
 
+	if (IDR_LOCK_INITALIZED(idr) == 0)
+		return (NULL);
 	IDR_LOCK(idr);
 	for (; id <= idr_max(idr); id++) {
 		res = idr_find_locked(idr, id);
