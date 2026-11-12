@@ -113,6 +113,9 @@ static const struct amdsmu_product {
 	{ CPU_VENDOR_AMD,	PCI_DEVICEID_AMD_KRACKAN_POINT_ROOT,	0x70,
 	    SMU_REG_IDLEMASK_KRACKAN,	25,	amdsmu_ip_blocks_names_v2,
 	    SMU_REG_MSG_KRACKAN },
+	{ CPU_VENDOR_AMD,	PCI_DEVICEID_AMD_STRIX_HALO_ROOT,	0x70,
+	    SMU_REG_IDLEMASK_KRACKAN,	25,	amdsmu_ip_blocks_names_v2,
+	    SMU_REG_MSG_KRACKAN },
 	/*
 	 * XXX Strix Point (PCI_DEVICEID_AMD_STRIX_POINT_ROOT) doesn't support
 	 * S0i3 and thus doesn't have an idlemask.  Since our driver doesn't
