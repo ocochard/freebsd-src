@@ -1141,7 +1141,10 @@ napi_consume_skb(struct sk_buff *skb, int budget)
 {
 
 	SKB_TRACE(skb);
-	SKB_TODO();
+	if (skb == NULL)
+		return;
+	/* No NAPI skb cache; budget only selects it on Linux. */
+	consume_skb(skb);
 }
 
 static inline struct sk_buff *
