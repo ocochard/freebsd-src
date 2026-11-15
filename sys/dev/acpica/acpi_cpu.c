@@ -30,6 +30,7 @@
 #include <sys/param.h>
 #include <sys/bus.h>
 #include <sys/cpu.h>
+#include <sys/eventhandler.h>
 #include <sys/kernel.h>
 #include <sys/malloc.h>
 #include <sys/module.h>
@@ -98,6 +99,7 @@ struct acpi_cpu_softc {
     struct sysctl_oid	*cpu_sysctl_tree;
     int			 cpu_cx_lowest;
     int			 cpu_cx_lowest_lim;
+    int			 cpu_cx_lowest_lim_saved; /* Over suspend-to-idle. */
     int			 cpu_disable_idle; /* Disable entry to idle function */
     char 		 cpu_cx_supported[64];
 };
@@ -186,6 +188,8 @@ static int	acpi_cpu_usage_sysctl(SYSCTL_HANDLER_ARGS);
 static int	acpi_cpu_usage_counters_sysctl(SYSCTL_HANDLER_ARGS);
 static int	acpi_cpu_duration_counters_sysctl(SYSCTL_HANDLER_ARGS);
 static int	acpi_cpu_set_cx_lowest(struct acpi_cpu_softc *sc);
+static void	acpi_cpu_s2idle_suspend(void *arg, enum power_stype stype);
+static void	acpi_cpu_s2idle_resume(void *arg, enum power_stype stype);
 static int	acpi_cpu_cx_lowest_sysctl(SYSCTL_HANDLER_ARGS);
 static int	acpi_cpu_global_cx_lowest_sysctl(SYSCTL_HANDLER_ARGS);
 #if defined(__i386__) || defined(__amd64__)
@@ -1061,6 +1065,11 @@ acpi_cpu_startup(void *arg)
 #if defined(__i386__) || defined(__amd64__)
     cpu_idle_hook = acpi_cpu_idle;
 #endif
+
+    EVENTHANDLER_REGISTER(acpi_post_dev_suspend, acpi_cpu_s2idle_suspend,
+	NULL, EVENTHANDLER_PRI_ANY);
+    EVENTHANDLER_REGISTER(acpi_pre_dev_resume, acpi_cpu_s2idle_resume,
+	NULL, EVENTHANDLER_PRI_ANY);
 }
 
 static void
@@ -1543,6 +1552,48 @@ acpi_cpu_set_cx_lowest(struct acpi_cpu_softc *sc)
     /* Reset the statistics counters. */
     bzero(sc->cpu_cx_stats, sizeof(sc->cpu_cx_stats));
     return (0);
+}
+
+/*
+ * The platform reaches its deepest suspend-to-idle state (S0i3 on AMD) only
+ * with every core in its deepest Cx state, and may not wake from a
+ * shallower one: use it whatever cx_lowest says, as Linux does.
+ */
+static void
+acpi_cpu_s2idle_suspend(void *arg __unused, enum power_stype stype)
+{
+    struct acpi_cpu_softc *sc;
+    int i;
+
+    if (stype != POWER_STYPE_SUSPEND_TO_IDLE)
+	return;
+    ACPI_SERIAL_BEGIN(cpu);
+    CPU_FOREACH(i) {
+	if ((sc = cpu_softc[i]) == NULL)
+	    continue;
+	sc->cpu_cx_lowest_lim_saved = sc->cpu_cx_lowest_lim;
+	sc->cpu_cx_lowest_lim = sc->cpu_cx_count - 1;
+	acpi_cpu_set_cx_lowest(sc);
+    }
+    ACPI_SERIAL_END(cpu);
+}
+
+static void
+acpi_cpu_s2idle_resume(void *arg __unused, enum power_stype stype)
+{
+    struct acpi_cpu_softc *sc;
+    int i;
+
+    if (stype != POWER_STYPE_SUSPEND_TO_IDLE)
+	return;
+    ACPI_SERIAL_BEGIN(cpu);
+    CPU_FOREACH(i) {
+	if ((sc = cpu_softc[i]) == NULL)
+	    continue;
+	sc->cpu_cx_lowest_lim = sc->cpu_cx_lowest_lim_saved;
+	acpi_cpu_set_cx_lowest(sc);
+    }
+    ACPI_SERIAL_END(cpu);
 }
 
 static int
