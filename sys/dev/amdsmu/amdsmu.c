@@ -295,6 +295,9 @@ amdsmu_suspend(device_t dev, enum power_stype stype)
 {
 	if (stype != POWER_STYPE_SUSPEND_TO_IDLE)
 		return;
+	/* Restart the SMU log so the metrics cover only this suspend. */
+	amdsmu_cmd(dev, SMU_MSG_LOG_RESET, 0, NULL);
+	amdsmu_cmd(dev, SMU_MSG_LOG_START, 0, NULL);
 	/*
 	 * XXX It seems that Cezanne needs a special workaround here for
 	 * firmware versions < 64.53.  See amd_pmc_verify_czn_rtc() in Linux.
