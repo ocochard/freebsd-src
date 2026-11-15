@@ -344,6 +344,7 @@ amdsmu_resume_check(device_t dev, enum power_stype stype)
 	switch (sc->product->amdsmu_deviceid) {
 	case PCI_DEVICEID_AMD_PHOENIX_ROOT:
 	case PCI_DEVICEID_AMD_KRACKAN_POINT_ROOT:
+	case PCI_DEVICEID_AMD_STRIX_HALO_ROOT:
 		break;
 	default:
 		device_printf(dev, "only limited diagnostic information "
@@ -359,6 +360,9 @@ amdsmu_resume_check(device_t dev, enum power_stype stype)
 		 * for the entire time spent in "SWDRIPS".
 		 */
 		if (m->ip_block_last_active_time[i] < m->time_last_in_sw_drips)
+			continue;
+		/* More than the whole time is garbage (USB4_1 on Strix Halo). */
+		if (m->ip_block_last_active_time[i] > m->time_last_in_sw_drips)
 			continue;
 		/* Check if this IP block should be ignored. */
 		d = NULL;
