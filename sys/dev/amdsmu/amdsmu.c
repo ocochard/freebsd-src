@@ -355,6 +355,9 @@ amdsmu_resume_check(device_t dev, enum power_stype stype)
 	}
 
 	for (size_t i = 0; i < sc->product->ip_block_count; i++) {
+		/* The SMU does not track this block; its time is meaningless. */
+		if (!sc->ip_blocks_active[i])
+			continue;
 		/*
 		 * An IP block only truly blocked S0i3 entry if it was active
 		 * for the entire time spent in "SWDRIPS".
