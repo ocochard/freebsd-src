@@ -644,7 +644,16 @@ static driver_t acp_driver = {
 	PCM_SOFTC_SIZE,
 };
 
+static const struct {
+	uint16_t	vendor;
+	uint16_t	device;
+} acp_ids[] = {
+	{ ACP_VENDOR, ACP_DEVICE },
+};
+
 DRIVER_MODULE(snd_acp, pci, acp_driver, 0, 0);
+MODULE_PNP_INFO("U16:vendor;U16:device", pci, snd_acp, acp_ids,
+    nitems(acp_ids));
 MODULE_DEPEND(snd_acp, sound, 1, 1, 1);
 MODULE_DEPEND(snd_acp, acpi, 1, 1, 1);
 MODULE_VERSION(snd_acp, 1);
