@@ -28,8 +28,18 @@
 #define	_LINUXKPI_LINUX_SRCU_H_
 
 #include <linux/compiler.h>
+#include <linux/types.h>
 
+/*
+ * Each srcu_struct is its own grace period domain: readers count
+ * themselves in the counter of the current phase, and
+ * synchronize_srcu() flips the phase and waits for the old counter to
+ * drain.  A zeroed structure is ready for use.
+ */
 struct srcu_struct {
+	volatile u_int	ss_phase;	/* low bit selects ss_readers[] */
+	volatile u_int	ss_readers[2];
+	volatile u_int	ss_writer;	/* serializes synchronize_srcu() */
 };
 
 #define	srcu_dereference(p, srcu) \
