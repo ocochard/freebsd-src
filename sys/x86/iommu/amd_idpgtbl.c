@@ -174,6 +174,7 @@ retry:
 			ptep->pte = VM_PAGE_TO_PHYS(m) |  AMDIOMMU_PTE_IR |
 			    AMDIOMMU_PTE_IW | AMDIOMMU_PTE_PR |
 			    ((domain->pglvl - lvl) << AMDIOMMU_PTE_NLVL_SHIFT);
+			domain->pde_set = true;
 			vm_page_wire(sf_buf_page(sfp));
 			vm_page_unwire_noq(m);
 			iommu_unmap_pgtbl(sfp);
@@ -236,6 +237,7 @@ amdiommu_map_buf(struct iommu_domain *iodom, struct iommu_map_entry *entry,
 	uint64_t pflags;
 	iommu_gaddr_t base, size;
 	int error;
+	bool pde_set;
 
 	base = entry->start;
 	size = entry->end - entry->start;
@@ -273,16 +275,22 @@ amdiommu_map_buf(struct iommu_domain *iodom, struct iommu_map_entry *entry,
 	KASSERT((flags & ~IOMMU_PGF_WAITOK) == 0, ("invalid flags %x", flags));
 
 	AMDIOMMU_DOMAIN_PGLOCK(domain);
+	domain->pde_set = false;
 	error = amdiommu_map_buf_locked(domain, base, size, ma, pflags,
 	    flags, entry);
+	pde_set = domain->pde_set;
 	AMDIOMMU_DOMAIN_PGUNLOCK(domain);
 
 	/*
-	 * XXXKIB invalidation seems to be needed even for non-valid->valid
-	 * updates.  Recheck.
+	 * Filling a non-present PTE needs no invalidation unless the
+	 * IOMMU caches non-present entries (NpCache).  A new PDE does:
+	 * unmap clears a PDE before its invalidation is done, so the
+	 * IOMMU may still hold the old one.
 	 */
-	iommu_qi_invalidate_sync(iodom, base, size,
-	    (flags & IOMMU_PGF_WAITOK) != 0);
+	if (pde_set ||
+	    (DOM2AMD(domain)->cap_hdr & PCIM_AMDIOMMU_CAP_NPCACHE) != 0)
+		iommu_qi_invalidate_sync(iodom, base, size,
+		    (flags & IOMMU_PGF_WAITOK) != 0);
 	return (error);
 }
 
