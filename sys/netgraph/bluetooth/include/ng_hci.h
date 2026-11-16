@@ -2086,6 +2086,19 @@ typedef struct {
 	u_int8_t	page_scan_rep_mode; /* page scan repetition mode */
 } __attribute__ ((packed)) ng_hci_page_scan_rep_mode_change_ep;
 
+#define NG_HCI_EVENT_SYNC_CON_COMPL		0x2c
+typedef struct {
+	u_int8_t	status;          /* 0x00 - success */
+	u_int16_t	con_handle;      /* connection handle */
+	bdaddr_t	bdaddr;          /* remote unit address */
+	u_int8_t	link_type;       /* 0x00 - SCO, 0x02 - eSCO */
+	u_int8_t	tx_interval;     /* transmission interval */
+	u_int8_t	retrans_window;  /* retransmission window */
+	u_int16_t	rx_pkt_len;      /* RX packet length */
+	u_int16_t	tx_pkt_len;      /* TX packet length */
+	u_int8_t	air_mode;        /* air mode */
+} __attribute__ ((packed)) ng_hci_sync_con_compl_ep;
+
 #define	NG_HCI_EVENT_IO_CAPABILITY_REQUEST	0x31
 typedef struct {
 	bdaddr_t	bdaddr;

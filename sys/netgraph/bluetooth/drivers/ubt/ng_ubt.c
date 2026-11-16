@@ -266,6 +266,7 @@ static usb_callback_t	ubt_isoc_write_callback;
 
 static int		ubt_fwd_mbuf_up(ubt_softc_p, struct mbuf **);
 static int		ubt_isoc_read_one_frame(struct usb_xfer *, int);
+static void		ubt_sco_track(ubt_softc_p, ng_hci_event_pkt_t *);
 
 /*
  * USB config
@@ -1052,6 +1053,8 @@ ubt_intr_read_callback(struct usb_xfer *xfer, usb_error_t error)
 		UBT_INFO(sc, "got complete HCI event frame, pktlen=%d, " \
 			"length=%d\n", m->m_pkthdr.len, hdr->length);
 
+		ubt_sco_track(sc, hdr);
+
 		UBT_STAT_PCKTS_RECV(sc);
 		UBT_STAT_BYTES_RECV(sc, m->m_pkthdr.len);
 
@@ -1080,6 +1083,101 @@ submit_next:
 		break;
 	}
 } /* ubt_intr_read_callback */
+
+/*
+ * Track open SCO and eSCO links from HCI events, so that isoc. transfers
+ * run only while a link uses them.  Idle isoc. transfers cost about one
+ * interrupt per USB frame.
+ * USB context.
+ */
+
+static void
+ubt_sco_track(ubt_softc_p sc, ng_hci_event_pkt_t *hdr)
+{
+	ng_hci_con_compl_ep		*cc;
+	ng_hci_sync_con_compl_ep	*scc;
+	ng_hci_discon_compl_ep		*dc;
+	ng_hci_command_compl_ep		*cmd;
+	uint16_t			h;
+	int				i, links;
+	bool				add;
+
+	add = false;
+	h = 0;
+	switch (hdr->event) {
+	case NG_HCI_EVENT_CON_COMPL:
+		if (hdr->length < sizeof(*cc))
+			return;
+		cc = (ng_hci_con_compl_ep *)(hdr + 1);
+		if (cc->status != 0 || cc->link_type != NG_HCI_LINK_SCO)
+			return;
+		h = NG_HCI_CON_HANDLE(le16toh(cc->con_handle));
+		add = true;
+		break;
+
+	case NG_HCI_EVENT_SYNC_CON_COMPL:
+		if (hdr->length < sizeof(*scc))
+			return;
+		scc = (ng_hci_sync_con_compl_ep *)(hdr + 1);
+		if (scc->status != 0)
+			return;
+		h = NG_HCI_CON_HANDLE(le16toh(scc->con_handle));
+		add = true;
+		break;
+
+	case NG_HCI_EVENT_DISCON_COMPL:
+		if (hdr->length < sizeof(*dc))
+			return;
+		dc = (ng_hci_discon_compl_ep *)(hdr + 1);
+		if (dc->status != 0)
+			return;
+		h = NG_HCI_CON_HANDLE(le16toh(dc->con_handle));
+		break;
+
+	case NG_HCI_EVENT_COMMAND_COMPL:
+		if (hdr->length < sizeof(*cmd))
+			return;
+		cmd = (ng_hci_command_compl_ep *)(hdr + 1);
+		if (le16toh(cmd->opcode) != NG_HCI_OPCODE(
+		    NG_HCI_OGF_HC_BASEBAND, NG_HCI_OCF_RESET))
+			return;
+		break;
+
+	default:
+		return;
+	}
+
+	UBT_NG_LOCK(sc);
+	if (sc->sc_hook == NULL) {
+		UBT_NG_UNLOCK(sc);
+		return;
+	}
+	links = sc->sc_sco_links + sc->sc_sco_untracked;
+
+	if (hdr->event == NG_HCI_EVENT_COMMAND_COMPL) {
+		/* HCI_Reset drops all links without Disconnection events */
+		sc->sc_sco_links = 0;
+		sc->sc_sco_untracked = 0;
+	} else if (add) {
+		if (sc->sc_sco_links < UBT_SCO_MAX)
+			sc->sc_sco_handle[sc->sc_sco_links++] = h;
+		else
+			sc->sc_sco_untracked++;
+	} else {
+		/* Disconnection Complete does not tell the link type */
+		for (i = 0; i < sc->sc_sco_links; i++) {
+			if (sc->sc_sco_handle[i] == h) {
+				sc->sc_sco_handle[i] =
+				    sc->sc_sco_handle[--sc->sc_sco_links];
+				break;
+			}
+		}
+	}
+
+	if ((links == 0) != (sc->sc_sco_links + sc->sc_sco_untracked == 0))
+		ubt_task_schedule(sc, UBT_FLAG_T_ISOC);
+	UBT_NG_UNLOCK(sc);
+} /* ubt_sco_track */
 
 /*
  * Called when incoming bulk transfer (ACL packet) has completed, i.e.
@@ -1573,10 +1671,12 @@ ubt_task(void *context, int pending)
 {
 	ubt_softc_p	sc = context;
 	int		task_flags, i;
+	bool		sco;
 
 	UBT_NG_LOCK(sc);
 	task_flags = sc->sc_task_flags;
 	sc->sc_task_flags = 0;
+	sco = sc->sc_sco_links + sc->sc_sco_untracked > 0;
 	UBT_NG_UNLOCK(sc);
 
 	/*
@@ -1589,29 +1689,28 @@ ubt_task(void *context, int pending)
 		for (i = 0; i < UBT_N_TRANSFER; i ++)
 			usbd_transfer_drain(sc->sc_xfer[i]);
 
-	/* Start incoming interrupt and bulk, and all isoc. USB transfers */
+	/* Start incoming interrupt and bulk USB transfers */
 	if (task_flags & UBT_FLAG_T_START_ALL) {
-		/*
-		 * Interface #0
-		 */
-
 		mtx_lock(&sc->sc_if_mtx);
-
 		ubt_xfer_start(sc, UBT_IF_0_INTR_DT_RD);
 		ubt_xfer_start(sc, UBT_IF_0_BULK_DT_RD);
+		mtx_unlock(&sc->sc_if_mtx);
+	}
 
-		/*
-		 * Interface #1
-		 * Start both read and write isoc. transfers by default.
-		 * Get them going all the time even if we have nothing
-		 * to send to avoid any delays.
-		 */
-
-		ubt_xfer_start(sc, UBT_IF_1_ISOC_DT_RD1);
-		ubt_xfer_start(sc, UBT_IF_1_ISOC_DT_RD2);
-		ubt_xfer_start(sc, UBT_IF_1_ISOC_DT_WR1);
-		ubt_xfer_start(sc, UBT_IF_1_ISOC_DT_WR2);
-
+	/*
+	 * Interface #1: run both read and write isoc. transfers while a
+	 * SCO link is open, even with nothing to send, to avoid delays.
+	 */
+	if (task_flags & (UBT_FLAG_T_START_ALL | UBT_FLAG_T_ISOC)) {
+		mtx_lock(&sc->sc_if_mtx);
+		for (i = UBT_IF_1_ISOC_DT_RD1; i <= UBT_IF_1_ISOC_DT_WR2; i++) {
+			if (sco)
+				ubt_xfer_start(sc, i);
+			else
+				usbd_transfer_stop(sc->sc_xfer[i]);
+		}
+		if (!sco)
+			NG_FREE_M(sc->sc_isoc_in_buffer);
 		mtx_unlock(&sc->sc_if_mtx);
 	}
 
@@ -1732,6 +1831,8 @@ ng_ubt_disconnect(hook_p hook)
 	}
 
 	sc->sc_hook = NULL;
+	sc->sc_sco_links = 0;
+	sc->sc_sco_untracked = 0;
 
 	/* Kick off task to stop all USB xfers */
 	ubt_task_schedule(sc, UBT_FLAG_T_STOP_ALL);

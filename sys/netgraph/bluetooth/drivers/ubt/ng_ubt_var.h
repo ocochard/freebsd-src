@@ -55,6 +55,7 @@ do {								\
 #define	UBT_HCI_REQUEST		0x20
 #define	UBT_DEFAULT_QLEN	64
 #define	UBT_ISOC_NFRAMES	32	/* should be factor of 8 */
+#define	UBT_SCO_MAX		4	/* BR/EDR allows 3 SCO */
 
 /* Bluetooth USB defines */
 enum {
@@ -142,6 +143,9 @@ struct ubt_softc {
 	/* SCO data */
 	struct ng_bt_mbufq	sc_scoq;	/* SCO data queue */
 	struct mbuf		*sc_isoc_in_buffer; /* SCO reassembly buffer */
+	uint16_t		sc_sco_handle[UBT_SCO_MAX]; /* open SCO links */
+	int			sc_sco_links;	/* used sc_sco_handle */
+	int			sc_sco_untracked; /* beyond UBT_SCO_MAX */
 
 	/* Netgraph specific */
 	node_p			sc_node;	/* pointer back to node */
@@ -155,6 +159,7 @@ struct ubt_softc {
 						   write xfers */
 #define UBT_FLAG_T_START_CTRL	(1 << 3)	/* start control xfer (write) */
 #define UBT_FLAG_T_START_BULK	(1 << 4)	/* start bulk xfer (write) */
+#define UBT_FLAG_T_ISOC		(1 << 5)	/* start/stop isoc xfers */
 
 	struct task		sc_task;
 };
