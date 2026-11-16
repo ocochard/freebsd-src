@@ -72,6 +72,15 @@ driver supports the following devices:
 AMD Audio Coprocessor 7.x (PCI 1022:15e2, revisions 0x70 to 0x72),
 as found in the Ryzen AI Max (Strix Halo) processors
 .El
+.Sh SYSCTL VARIABLES
+.Bl -tag -width indent
+.It Va dev.pcm.%d.dc_filter
+Remove the DC offset that the microphones carry, with a high-pass filter
+at about 7.5 Hz.
+Default 1; 0 delivers the samples unchanged.
+In both cases the first 100 ms of each recording are muted: the
+microphones start with a full-scale burst.
+.El
 .Sh SEE ALSO
 .Xr sound 4
 .Sh HISTORY
@@ -83,4 +92,3 @@ driver first appeared in
 .An Olivier Cochard Aq Mt olivier@FreeBSD.org
 .Sh BUGS
 The microphones' gain cannot be changed; there is no mixer.
-Recordings carry a DC offset that the driver does not remove.
