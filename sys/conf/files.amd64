@@ -388,6 +388,7 @@ dev/smartpqi/smartpqi_request.c optional 	smartpqi
 dev/smartpqi/smartpqi_response.c	optional 	smartpqi
 dev/smartpqi/smartpqi_sis.c     optional 	smartpqi
 dev/smartpqi/smartpqi_tag.c     optional 	smartpqi
+dev/sound/pci/acp.c		optional	snd_acp pci acpi
 dev/sume/if_sume.c		optional	sume
 dev/syscons/apm/apm_saver.c	optional	apm_saver apm
 dev/thunderbolt/hcm.c		optional	thunderbolt
