@@ -38,6 +38,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <syslog.h>
 #include <unistd.h>
 
 #include <libusb.h>
@@ -323,6 +324,9 @@ main(int argc, char *argv[])
 	struct rtlbt_firmware fw, cfg;
 	enum rtlbt_fw_type fw_type;
 	uint16_t fw_lmp_subversion;
+
+	/* devd(8) runs us with stderr on /dev/null: report errors to syslog. */
+	openlog("rtlbtfw", LOG_CONS | LOG_NDELAY | LOG_PID, LOG_USER);
 
 	/* Parse command line arguments */
 	while ((n = getopt(argc, argv, "Dd:f:hIm:p:v:")) != -1) {

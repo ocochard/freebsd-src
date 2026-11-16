@@ -32,12 +32,12 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 
-#include <err.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <syslog.h>
 #include <unistd.h>
 
 #include "rtlbt_fw.h"
@@ -171,26 +171,26 @@ rtlbt_fw_read(struct rtlbt_firmware *fw, const char *fwname)
 
 	fd = open(fwname, O_RDONLY);
 	if (fd < 0) {
-		warn("%s: open: %s", __func__, fwname);
+		rtlbt_err("open: %s: %s", fwname, strerror(errno));
 		return (0);
 	}
 
 	if (fstat(fd, &sb) != 0) {
-		warn("%s: stat: %s", __func__, fwname);
+		rtlbt_err("stat: %s: %s", fwname, strerror(errno));
 		close(fd);
 		return (0);
 	}
 
 	buf = calloc(1, sb.st_size);
 	if (buf == NULL) {
-		warn("%s: calloc", __func__);
+		rtlbt_err("calloc: %s", strerror(errno));
 		close(fd);
 		return (0);
 	}
 
 	mmap_addr = mmap(NULL, sb.st_size, PROT_READ, MAP_SHARED, fd, 0);
 	if (mmap_addr == MAP_FAILED) {
-		warn("%s: mmap: %s", __func__, fwname);
+		rtlbt_err("mmap: %s: %s", fwname, strerror(errno));
 		free(buf);
 		close(fd);
 		return (0);

@@ -32,8 +32,10 @@
 extern	int rtlbt_do_debug;
 extern	int rtlbt_do_info;
 
-#define	rtlbt_err(fmt, ...)						\
-	fprintf(stderr, "rtlbtfw: %s: "fmt"\n", __func__, ##__VA_ARGS__)
+#define	rtlbt_err(fmt, ...)	do {					\
+	fprintf(stderr, "rtlbtfw: %s: "fmt"\n", __func__, ##__VA_ARGS__);\
+	syslog(LOG_ERR, "%s: "fmt, __func__, ##__VA_ARGS__);		\
+} while (0)
 #define	rtlbt_info(fmt, ...)	do {					\
 	if (rtlbt_do_info)						\
 		fprintf(stderr, "%s: "fmt"\n", __func__, ##__VA_ARGS__);\
