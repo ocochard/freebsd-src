@@ -427,31 +427,68 @@ linux_call_rcu(unsigned type, struct rcu_head *context, rcu_callback_t func)
 int
 init_srcu_struct(struct srcu_struct *srcu)
 {
+	memset(srcu, 0, sizeof(*srcu));
 	return (0);
 }
 
 void
 cleanup_srcu_struct(struct srcu_struct *srcu)
 {
+	MPASS(srcu->ss_readers[0] == 0 && srcu->ss_readers[1] == 0);
 }
 
 int
 srcu_read_lock(struct srcu_struct *srcu)
 {
-	linux_rcu_read_lock(RCU_TYPE_SLEEPABLE);
-	return (0);
+	int idx;
+
+	if (RCU_SKIP())
+		return (0);
+
+	/*
+	 * No preemption between sampling the phase and counting the
+	 * reader: synchronize_srcu() relies on quiesce_all_critical() to
+	 * see every reader that sampled the old phase.
+	 */
+	critical_enter();
+	idx = atomic_load_acq_int(&srcu->ss_phase) & 1;
+	atomic_add_acq_int(&srcu->ss_readers[idx], 1);
+	critical_exit();
+	return (idx);
 }
 
 void
-srcu_read_unlock(struct srcu_struct *srcu, int key __unused)
+srcu_read_unlock(struct srcu_struct *srcu, int idx)
 {
-	linux_rcu_read_unlock(RCU_TYPE_SLEEPABLE);
+	if (RCU_SKIP())
+		return;
+
+	atomic_subtract_rel_int(&srcu->ss_readers[idx], 1);
 }
 
 void
 synchronize_srcu(struct srcu_struct *srcu)
 {
-	linux_synchronize_rcu(RCU_TYPE_SLEEPABLE);
+	int idx;
+
+	if (RCU_SKIP())
+		return;
+
+	WITNESS_WARN(WARN_GIANTOK | WARN_SLEEPOK, NULL,
+	    "synchronize_srcu() can sleep");
+
+	while (atomic_cmpset_acq_int(&srcu->ss_writer, 0, 1) == 0)
+		pause("lsrcuw", 1);
+
+	/* Readers from now on count in the other phase. */
+	atomic_thread_fence_seq_cst();
+	idx = atomic_fetchadd_int(&srcu->ss_phase, 1) & 1;
+	quiesce_all_critical();
+	while (atomic_load_acq_int(&srcu->ss_readers[idx]) != 0)
+		pause("lsrcu", 1);
+	atomic_thread_fence_seq_cst();
+
+	atomic_store_rel_int(&srcu->ss_writer, 0);
 }
 
 void
