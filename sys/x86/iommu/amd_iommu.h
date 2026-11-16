@@ -31,6 +31,7 @@
 #ifndef __X86_IOMMU_AMD_IOMMU_H
 #define	__X86_IOMMU_AMD_IOMMU_H
 
+#include <sys/bitstring.h>
 #include <dev/iommu/iommu.h>
 
 #define	AMDIOMMU_DEV_REPORTED	0x00000001
@@ -55,7 +56,7 @@ struct amdiommu_ctx {
 	struct iommu_ctx context;
 	struct amdiommu_irte_basic_novapic *irtb;
 	struct amdiommu_irte_basic_vapic_x2 *irtx2;
-	vmem_t *irtids;
+	bitstr_t *irtids;		/* IRTE indexes in use */
 };
 
 struct amdiommu_unit {

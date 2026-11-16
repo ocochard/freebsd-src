@@ -82,9 +82,8 @@ int
 amdiommu_alloc_msi_intr(device_t src, u_int *cookies, u_int count)
 {
 	struct amdiommu_ctx *ctx;
-	vmem_addr_t vmem_res;
+	struct amdiommu_unit *unit;
 	u_int idx, i;
-	int error;
 
 	ctx = amdiommu_ir_find(src, NULL, NULL);
 	if (ctx == NULL || !CTX2AMD(ctx)->irte_enabled) {
@@ -92,15 +91,23 @@ amdiommu_alloc_msi_intr(device_t src, u_int *cookies, u_int count)
 			cookies[i] = -1;
 		return (EOPNOTSUPP);
 	}
+	unit = CTX2AMD(ctx);
 
-	error = vmem_alloc(ctx->irtids, count, M_FIRSTFIT | M_NOWAIT,
-	    &vmem_res);
-	if (error != 0) {
-		KASSERT(error != EOPNOTSUPP,
-		    ("impossible EOPNOTSUPP from vmem"));
-		return (error);
+	/*
+	 * The MSI data is the IRTE index, and a multiple message device
+	 * ORs the message number into it: align the block on count.
+	 */
+	AMDIOMMU_LOCK(unit);
+	for (idx = 0; idx + count <= unit->irte_nentries; idx += count) {
+		if (bit_ntest(ctx->irtids, idx, idx + count - 1, 0))
+			break;
 	}
-	idx = vmem_res;
+	if (idx + count > unit->irte_nentries) {
+		AMDIOMMU_UNLOCK(unit);
+		return (ENOMEM);
+	}
+	bit_nset(ctx->irtids, idx, idx + count - 1);
+	AMDIOMMU_UNLOCK(unit);
 	for (i = 0; i < count; i++)
 		cookies[i] = idx + i;
 	return (0);
@@ -301,6 +308,7 @@ amdiommu_ir_free_irte(struct amdiommu_ctx *ctx, device_t src,
 	MPASS(error == 0);
 	AMDIOMMU_LOCK(unit);
 	amdiommu_qi_invalidate_ir_locked(unit, rid);
+	bit_clear(ctx->irtids, cookie);
 	AMDIOMMU_UNLOCK(unit);
 }
 
@@ -339,8 +347,7 @@ amdiommu_ctx_init_irte(struct amdiommu_ctx *ctx)
 		ctx->irtx2 = ptr;
 	else
 		ctx->irtb = ptr;
-	ctx->irtids = vmem_create("amdirt", 0, unit->irte_nentries, 1, 0,
-	    M_FIRSTFIT | M_NOWAIT);
+	ctx->irtids = bit_alloc(unit->irte_nentries, M_DEVBUF, M_WAITOK);
 
 	intr_reprogram();	// XXXKIB
 
@@ -359,7 +366,7 @@ amdiommu_ctx_fini_irte(struct amdiommu_ctx *ctx)
 		free(ctx->irtx2, M_DEVBUF);
 	else
 		free(ctx->irtb, M_DEVBUF);
-	vmem_destroy(ctx->irtids);
+	free(ctx->irtids, M_DEVBUF);
 }
 
 int
