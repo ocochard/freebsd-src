@@ -11,6 +11,7 @@ usb_get_vendor()
 	local hexvendor=$(echo $1 | sed 's/.*idVendor=\(0x[0-9a-z]*\).*/\1/')
 	case "${hexvendor}" in
 		0x148f)	echo "ralink" ;;
+		0x8087)	echo "intel" ;;
 	esac
 }
 

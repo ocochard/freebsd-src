@@ -1,0 +1,25 @@
+#
+# Copyright (c) 2026 Olivier Cochard <olivier@FreeBSD.org>
+#
+# SPDX-License-Identifier: BSD-2-Clause
+
+# Bluetooth devices handled by ng_ubt_intel and iwmbtfw(8).
+# Keep in sync with usr.sbin/bluetooth/iwmbtfw/iwmbtfw.conf.
+usb_intel()
+{
+
+	case "$1" in
+	0x07dc)	addpkg "iwmbt-firmware"; return 1 ;;
+	0x0a2a)	addpkg "iwmbt-firmware"; return 1 ;;
+	0x0aa7)	addpkg "iwmbt-firmware"; return 1 ;;
+	0x0a2b)	addpkg "iwmbt-firmware"; return 1 ;;
+	0x0aaa)	addpkg "iwmbt-firmware"; return 1 ;;
+	0x0025)	addpkg "iwmbt-firmware"; return 1 ;;
+	0x0026)	addpkg "iwmbt-firmware"; return 1 ;;
+	0x0029)	addpkg "iwmbt-firmware"; return 1 ;;
+	0x0032)	addpkg "iwmbt-firmware"; return 1 ;;
+	0x0033)	addpkg "iwmbt-firmware"; return 1 ;;
+	0x0035)	addpkg "iwmbt-firmware"; return 1 ;;
+	0x0036)	addpkg "iwmbt-firmware"; return 1 ;;
+	esac
+}
