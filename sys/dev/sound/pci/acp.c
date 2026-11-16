@@ -110,6 +110,8 @@
 #define	ACP_RATE		48000
 #define	ACP_POLL_US		5
 #define	ACP_TIMEOUT_US		500
+#define	ACP_DC_SHIFT		10	/* high-pass at about 7.5 Hz */
+#define	ACP_MUTE_BYTES		(ACP_RATE / 10 * 8)	/* first 100 ms */
 
 struct acp_info;
 
@@ -118,6 +120,8 @@ struct acp_chinfo {
 	struct pcm_channel	*channel;
 	struct acp_info		*parent;
 	uint64_t		start_pos;
+	uint64_t		hpos;	/* bytes since start, processed */
+	int64_t			dc[2];	/* DC estimate per channel, Q10 */
 	uint32_t		blksz;
 	bool			running;
 };
@@ -132,6 +136,7 @@ struct acp_info {
 	void			*ih;
 	bus_dma_tag_t		dmat;
 	struct acp_chinfo	rch;
+	int			dc_filter;
 };
 
 static uint32_t acp_fmt[] = {
@@ -267,6 +272,7 @@ acp_pdm_start(struct acp_info *sc, struct acp_chinfo *ch)
 	acp_wr(sc, ACP_ATU_CTRL, 1);
 
 	ch->start_pos = acp_pdm_pos(sc);
+	ch->hpos = 0;
 	acp_wr(sc, ACP_PDM_ENABLE, 1);
 	acp_wr(sc, ACP_PDM_DMA_ENABLE, 1);
 	if (acp_poll(sc, ACP_PDM_DMA_ENABLE, ACP_PDM_DMA_RUNNING,
@@ -376,6 +382,47 @@ acpchan_trigger(kobj_t obj, void *data, int go)
 	return (0);
 }
 
+/*
+ * Process the samples that arrived since the last call, in place: mute
+ * the first 100 ms (the microphones start with a full-scale burst), then
+ * remove their DC offset with a first-order high-pass, y = x - mean, the
+ * mean being a running average over 2^ACP_DC_SHIFT samples.
+ */
+static void
+acp_rec_process(struct acp_info *sc, struct acp_chinfo *ch, uint64_t end)
+{
+	struct snd_dbuf *b = ch->buffer;
+	int32_t *s = (int32_t *)b->buf;
+	int32_t *p;
+	int64_t y;
+	uint64_t k;
+	int c;
+
+	if (end - ch->hpos > b->bufsize)
+		ch->hpos = end - b->bufsize;	/* overrun */
+	if (sc->dc_filter == 0 && ch->hpos >= ACP_MUTE_BYTES)
+		ch->hpos = end;
+	if (ch->hpos == end)
+		return;
+	bus_dmamap_sync(b->dmatag, b->dmamap, BUS_DMASYNC_POSTREAD);
+	for (k = ch->hpos; k < end; k += 4) {
+		p = &s[(k % b->bufsize) / 4];
+		c = (k / 4) & 1;
+		if (k < ACP_MUTE_BYTES) {
+			*p = 0;
+			continue;
+		}
+		if (k < ACP_MUTE_BYTES + 8)
+			ch->dc[c] = (int64_t)*p << ACP_DC_SHIFT;
+		if (sc->dc_filter == 0)
+			continue;
+		ch->dc[c] += *p - (ch->dc[c] >> ACP_DC_SHIFT);
+		y = *p - (ch->dc[c] >> ACP_DC_SHIFT);
+		*p = MIN(MAX(y, INT32_MIN), INT32_MAX);
+	}
+	ch->hpos = end;
+}
+
 static uint32_t
 acpchan_getptr(kobj_t obj, void *data)
 {
@@ -384,9 +431,10 @@ acpchan_getptr(kobj_t obj, void *data)
 	uint64_t pos;
 
 	mtx_lock(&sc->lock);
-	pos = acp_pdm_pos(sc) - ch->start_pos;
+	pos = (acp_pdm_pos(sc) - ch->start_pos) & ~7ULL;
+	acp_rec_process(sc, ch, pos);
 	mtx_unlock(&sc->lock);
-	return ((uint32_t)(pos % ch->buffer->bufsize) & ~7U);
+	return ((uint32_t)(pos % ch->buffer->bufsize));
 }
 
 static struct pcmchan_caps *
@@ -508,6 +556,12 @@ acp_attach(device_t dev)
 		device_printf(dev, "cannot set up interrupt\n");
 		goto bad_hw;
 	}
+
+	sc->dc_filter = 1;
+	SYSCTL_ADD_INT(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
+	    "dc_filter", CTLFLAG_RW, &sc->dc_filter, 0,
+	    "Remove the DC offset of the microphones");
 
 	pcm_init(dev, sc);
 	pcm_addchan(dev, PCMDIR_REC, &acpchan_class, sc);
