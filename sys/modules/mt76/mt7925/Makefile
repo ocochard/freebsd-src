@@ -1,4 +1,6 @@
 MT76_DRIVER_NAME=	mt7925
+# Suspend and resume (dev_pm_ops) through LinuxKPI.
+MT76_CONFIG_PM=		1
 
 .include <kmod.opts.mk>
 
@@ -16,6 +18,9 @@ SRCS+=	init.c main.c mac.c mcu.c regd.c
 .if defined(MT76_PCI) && ${MT76_PCI} > 0 && ${KERN_OPTS:MDEV_PCI} && \
     defined(MT7925_PCI) && ${MT7925_PCI} > 0
 SRCS+=	pci.c pci_mac.c pci_mcu.c
+.if defined(MT76_CONFIG_PM) && ${MT76_CONFIG_PM} > 0
+SRCS+=	lkpi_mt7925_pm.c
+.endif
 .endif
 
 # USB parts; USB can be loaded and is unconditional on any kernel config.

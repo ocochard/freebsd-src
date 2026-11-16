@@ -1,4 +1,6 @@
 MT76_DRIVER_NAME=	mt76_core
+# Suspend and resume (dev_pm_ops) through LinuxKPI.
+MT76_CONFIG_PM=		1
 
 .include <kmod.opts.mk>
 
