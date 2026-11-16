@@ -1004,20 +1004,22 @@ linuxkpi_pcim_iomap(struct pci_dev *pdev, int bar, unsigned long maxlen)
 	if (dr == NULL)
 		return (NULL);
 
-	if (dr->res_table[bar] != NULL)
-		return (dr->res_table[bar]);
-
-	res = linuxkpi_pci_iomap(pdev, bar, maxlen);
-	if (res == NULL) {
-		/*
-		 * Do not free the devres in case there were
-		 * other valid mappings before already.
-		 */
-		return (NULL);
+	if (dr->res_table[bar] == NULL) {
+		res = _lkpi_pci_iomap(pdev, bar, maxlen);
+		if (res == NULL) {
+			/*
+			 * Do not free the devres in case there were
+			 * other valid mappings before already.
+			 */
+			return (NULL);
+		}
+		lkpi_set_pcim_iomap_devres(dr, bar, res);
 	}
-	lkpi_set_pcim_iomap_devres(dr, bar, res);
 
-	return (res);
+	/* This is a FreeBSD extension so we can use bus_*(). */
+	if (pdev->want_iomap_res)
+		return (dr->res_table[bar]);
+	return (dr->mmio_table[bar]);
 }
 
 void
@@ -1101,10 +1103,12 @@ lkpi_pcim_iomap_table_release(struct device *dev, void *p)
 	pdev = to_pci_dev(dev);
 	for (bar = PCIR_MAX_BAR_0; bar >= 0; bar--) {
 
-		if (dr->mmio_table[bar] == NULL)
+		if (dr->res_table[bar] == NULL)
 			continue;
 
-		pci_iounmap(pdev, dr->mmio_table[bar]);
+		/* pci_iounmap() takes what pcim_iomap() returned. */
+		pci_iounmap(pdev, pdev->want_iomap_res ?
+		    (void *)dr->res_table[bar] : dr->mmio_table[bar]);
 	}
 }
 
