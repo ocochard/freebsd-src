@@ -154,6 +154,13 @@ sysctl_handle_attr(SYSCTL_HANDLER_ARGS)
 			if (error != EIO)
 				goto out;
 			buf[0] = '\0';
+		} else if (len > 0 && memchr(buf, '\0', MIN(len, PAGE_SIZE))) {
+			/* Binary attribute, such as amdgpu gpu_metrics. */
+			if (req->newptr != NULL)
+				error = EPERM;
+			else
+				error = SYSCTL_OUT(req, buf, MIN(len, PAGE_SIZE));
+			goto out;
 		} else if (len) {
 			len--;
 			if (len >= PAGE_SIZE)
