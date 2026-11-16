@@ -32,12 +32,12 @@
 #include <sys/stat.h>
 
 #include <assert.h>
-#include <err.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <syslog.h>
 #include <unistd.h>
 
 #include "iwmbt_fw.h"
@@ -53,19 +53,19 @@ iwmbt_fw_read(struct iwmbt_firmware *fw, const char *fwname)
 
 	fd = open(fwname, O_RDONLY);
 	if (fd < 0) {
-		warn("%s: open: %s", __func__, fwname);
+		iwmbt_err("open: %s: %s", fwname, strerror(errno));
 		return (0);
 	}
 
 	if (fstat(fd, &sb) != 0) {
-		warn("%s: stat: %s", __func__, fwname);
+		iwmbt_err("stat: %s: %s", fwname, strerror(errno));
 		close(fd);
 		return (0);
 	}
 
 	buf = calloc(1, sb.st_size);
 	if (buf == NULL) {
-		warn("%s: calloc", __func__);
+		iwmbt_err("calloc: %s", strerror(errno));
 		close(fd);
 		return (0);
 	}
@@ -73,7 +73,7 @@ iwmbt_fw_read(struct iwmbt_firmware *fw, const char *fwname)
 	/* XXX handle partial reads */
 	r = read(fd, buf, sb.st_size);
 	if (r < 0) {
-		warn("%s: read", __func__);
+		iwmbt_err("read: %s: %s", fwname, strerror(errno));
 		free(buf);
 		close(fd);
 		return (0);

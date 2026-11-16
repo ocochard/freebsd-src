@@ -39,6 +39,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <syslog.h>
 #include <unistd.h>
 
 #include <libusb.h>
@@ -712,6 +713,9 @@ main(int argc, char *argv[])
 	char *firmware_dir = NULL;
 	int retcode = 1;
 	enum iwmbt_device iwmbt_device;
+
+	/* devd(8) runs us with stderr on /dev/null: report errors to syslog. */
+	openlog("iwmbtfw", LOG_CONS | LOG_NDELAY | LOG_PID, LOG_USER);
 
 	/* Parse command line arguments */
 	while ((n = getopt(argc, argv, "Dd:f:hI")) != -1) {

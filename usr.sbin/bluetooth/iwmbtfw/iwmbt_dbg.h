@@ -31,8 +31,10 @@
 extern	int iwmbt_do_debug;
 extern	int iwmbt_do_info;
 
-#define	iwmbt_err(fmt, ...)						\
-	fprintf(stderr, "iwmbtfw: %s: "fmt"\n", __func__, ##__VA_ARGS__)
+#define	iwmbt_err(fmt, ...)	do {					\
+	fprintf(stderr, "iwmbtfw: %s: "fmt"\n", __func__, ##__VA_ARGS__);\
+	syslog(LOG_ERR, "%s: "fmt, __func__, ##__VA_ARGS__);		\
+} while (0)
 #define	iwmbt_info(fmt, ...)	do {					\
 	if (iwmbt_do_info)						\
 		fprintf(stderr, "%s: "fmt"\n", __func__, ##__VA_ARGS__);\
