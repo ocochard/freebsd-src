@@ -389,6 +389,7 @@ x86/x86/cpu_machdep.c		standard
 x86/x86/dbreg.c			optional	ddb | gdb
 x86/x86/dump_machdep.c		standard
 x86/x86/fdt_machdep.c		optional	fdt
+x86/x86/gpio_intr.c		standard
 x86/x86/identcpu.c		standard
 x86/x86/intr_machdep.c		standard
 x86/x86/legacy.c		standard

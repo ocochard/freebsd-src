@@ -165,5 +165,24 @@ int	msix_release(int irq);
 void	xen_intr_alloc_irqs(void);
 #endif
 
+/*
+ * Interrupt sources for GPIO pins.  A GPIO controller driver registers the
+ * operations below; every method may be called from interrupt context, so
+ * they may only take spin locks.
+ */
+struct gpio_intr_ctlr;
+struct gpio_intr_ops {
+	int	(*gio_config)(device_t dev, u_int pin, uint32_t mode);
+	void	(*gio_mask)(device_t dev, u_int pin);
+	void	(*gio_unmask)(device_t dev, u_int pin);
+};
+
+int	gpio_intr_deregister(struct gpio_intr_ctlr *ctlr);
+int	gpio_intr_dispatch(struct gpio_intr_ctlr *ctlr, u_int pin);
+void	gpio_intr_init(void);
+int	gpio_intr_map(device_t dev, u_int pin, uint32_t mode, u_int *irqp);
+struct gpio_intr_ctlr *gpio_intr_register(device_t dev, u_int npins,
+    const struct gpio_intr_ops *ops);
+
 #endif	/* _KERNEL */
 #endif	/* !__X86_INTR_MACHDEP_H__ */

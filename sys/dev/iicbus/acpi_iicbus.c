@@ -28,6 +28,7 @@
 #include <sys/param.h>
 #include <sys/bus.h>
 #include <sys/endian.h>
+#include <sys/gpio.h>
 #include <sys/kernel.h>
 #include <sys/malloc.h>
 #include <sys/module.h>
@@ -35,6 +36,9 @@
 #include <sys/sbuf.h>
 
 #include <machine/resource.h>
+#if defined(__amd64__) || defined(__i386__)
+#include <machine/intr_machdep.h>
+#endif
 
 #include <contrib/dev/acpica/include/acpi.h>
 #include <contrib/dev/acpica/include/accommon.h>
@@ -391,6 +395,101 @@ acpi_iicbus_get_i2cres(ACPI_HANDLE handle, ACPI_RESOURCE_I2C_SERIALBUS *sb)
 	    acpi_iicbus_get_i2cres_cb, sb));
 }
 
+#if defined(__amd64__) || defined(__i386__)
+/*
+ * Map a GpioInt resource to an IRQ through the GPIO controller it names.
+ * The controller driver must already be attached.
+ */
+static int
+acpi_iicbus_map_gpioint(ACPI_RESOURCE_GPIO *gpio, u_int *irqp)
+{
+	ACPI_HANDLE handle;
+	device_t ctlr;
+	uint32_t mode;
+
+	if (gpio->PinTableLength < 1 || gpio->ResourceSource.StringPtr == NULL)
+		return (EINVAL);
+	if (ACPI_FAILURE(AcpiGetHandle(NULL, gpio->ResourceSource.StringPtr,
+	    &handle)))
+		return (ENOENT);
+	ctlr = acpi_get_device(handle);
+	if (ctlr == NULL || !device_is_attached(ctlr))
+		return (ENXIO);
+
+	if (gpio->Triggering == ACPI_LEVEL_SENSITIVE)
+		mode = gpio->Polarity == ACPI_ACTIVE_HIGH ?
+		    GPIO_INTR_LEVEL_HIGH : GPIO_INTR_LEVEL_LOW;
+	else if (gpio->Polarity == ACPI_ACTIVE_BOTH)
+		mode = GPIO_INTR_EDGE_BOTH;
+	else
+		mode = gpio->Polarity == ACPI_ACTIVE_HIGH ?
+		    GPIO_INTR_EDGE_RISING : GPIO_INTR_EDGE_FALLING;
+
+	return (gpio_intr_map(ctlr, gpio->PinTable[0], mode, irqp));
+}
+
+struct acpi_iicbus_gpioint {
+	bool	found;
+	int	error;
+	u_int	irq;
+};
+
+/*
+ * Like acpi_iicbus_parse_resources_cb(), stop at the first interrupt
+ * resource, and map it if it is a GpioInt.
+ */
+static ACPI_STATUS
+acpi_iicbus_gpioint_cb(ACPI_RESOURCE *res, void *context)
+{
+	struct acpi_iicbus_gpioint *gi = context;
+
+	if (res->Type == ACPI_RESOURCE_TYPE_EXTENDED_IRQ &&
+	    res->Data.ExtendedIrq.InterruptCount > 0)
+		return (AE_CTRL_TERMINATE);
+	if (res->Type != ACPI_RESOURCE_TYPE_GPIO ||
+	    res->Data.Gpio.ConnectionType != ACPI_RESOURCE_GPIO_TYPE_INT)
+		return (AE_OK);
+	gi->found = true;
+	gi->error = acpi_iicbus_map_gpioint(&res->Data.Gpio, &gi->irq);
+	return (AE_CTRL_TERMINATE);
+}
+
+/*
+ * The GPIO controller named by a GpioInt resource may attach after this
+ * bus enumerated its children, or detach and attach again, so map the
+ * interrupt each time the child allocates it.  Without a controller, drop
+ * the IRQ so the child can fall back to polling.
+ */
+static struct resource *
+acpi_iicbus_alloc_resource(device_t bus, device_t child, int type, int rid,
+    rman_res_t start, rman_res_t end, rman_res_t count, u_int flags)
+{
+	struct acpi_iicbus_ivars *devi;
+	struct acpi_iicbus_gpioint gi;
+	struct resource_list *rl;
+	struct resource_list_entry *rle;
+
+	if (type == SYS_RES_IRQ && rid == 0 &&
+	    device_get_parent(child) == bus) {
+		devi = device_get_ivars(child);
+		rl = &devi->super_ivar.rl;
+		rle = resource_list_find(rl, SYS_RES_IRQ, 0);
+		gi.found = false;
+		/* An allocated entry is left alone: the allocation fails. */
+		if (devi->handle != NULL && (rle == NULL || rle->res == NULL))
+			AcpiWalkResources(devi->handle, "_CRS",
+			    acpi_iicbus_gpioint_cb, &gi);
+		if (gi.found && gi.error == 0)
+			resource_list_add(rl, SYS_RES_IRQ, 0, gi.irq, gi.irq,
+			    1);
+		else if (gi.found)
+			resource_list_delete(rl, SYS_RES_IRQ, 0);
+	}
+	return (bus_generic_rl_alloc_resource(bus, child, type, rid, start, end,
+	    count, flags));
+}
+#endif
+
 static ACPI_STATUS
 acpi_iicbus_parse_resources_cb(ACPI_RESOURCE *res, void *context)
 {
@@ -412,7 +511,10 @@ acpi_iicbus_parse_resources_cb(ACPI_RESOURCE *res, void *context)
 	case ACPI_RESOURCE_TYPE_GPIO:
 		if (res->Data.Gpio.ConnectionType ==
 		    ACPI_RESOURCE_GPIO_TYPE_INT) {
-			/* Not supported by FreeBSD yet */
+			/*
+			 * x86 maps it on demand in acpi_iicbus_alloc_resource(),
+			 * other platforms do not support it yet.
+			 */
 			gpio_pin = res->Data.Gpio.PinTable[0];
 			if (bootverbose)
 				printf("  GPIO IRQ pin:      %d\n", gpio_pin);
@@ -757,6 +859,9 @@ static device_method_t acpi_iicbus_methods[] = {
 
 	/* Bus interface */
 	DEVMETHOD(bus_add_child,	acpi_iicbus_add_child),
+#if defined(__amd64__) || defined(__i386__)
+	DEVMETHOD(bus_alloc_resource,	acpi_iicbus_alloc_resource),
+#endif
 	DEVMETHOD(bus_probe_nomatch,	acpi_iicbus_probe_nomatch),
 	DEVMETHOD(bus_driver_added,	acpi_iicbus_driver_added),
 	DEVMETHOD(bus_child_deleted,	acpi_iicbus_child_deleted),
