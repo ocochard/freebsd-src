@@ -258,7 +258,7 @@ static driver_t amdtemp_driver = {
 DRIVER_MODULE(amdtemp, hostb, amdtemp_driver, NULL, NULL);
 MODULE_VERSION(amdtemp, 1);
 MODULE_DEPEND(amdtemp, amdsmn, 1, 1, 1);
-MODULE_PNP_INFO("U16:vendor;U16:device", pci, amdtemp, amdtemp_products,
+MODULE_PNP_INFO("U16:vendor;U16:device", hostb, amdtemp, amdtemp_products,
     nitems(amdtemp_products));
 
 static bool

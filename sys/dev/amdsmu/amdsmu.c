@@ -592,5 +592,5 @@ static driver_t amdsmu_driver = {
 DRIVER_MODULE(amdsmu, hostb, amdsmu_driver, NULL, NULL);
 MODULE_VERSION(amdsmu, 1);
 MODULE_DEPEND(amdsmu, amdsmn, 1, 1, 1);
-MODULE_PNP_INFO("U16:vendor;U16:device", pci, amdsmu, amdsmu_products,
+MODULE_PNP_INFO("U16:vendor;U16:device", hostb, amdsmu, amdsmu_products,
     nitems(amdsmu_products));
