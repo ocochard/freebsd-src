@@ -338,6 +338,8 @@ struct amdgpio_softc {
 	const struct pin_info	*sc_pin_info;
 	const struct amd_pingroup *sc_groups;
 	void			*sc_intr_handle;
+	struct gpio_intr_ctlr	*sc_gpio_intr;
+	uint32_t		sc_saved[AMD_GPIO_PINS_MAX]; /* Over suspend. */
 	struct amdgpio_wake_pin	sc_wake[AMDGPIO_WAKE_PINS_MAX];
 	int			sc_nwake;
 	bool			sc_wake_irq;
