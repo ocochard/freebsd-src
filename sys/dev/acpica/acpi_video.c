@@ -195,6 +195,18 @@ static driver_t acpi_video_driver = {
 };
 
 DRIVER_MODULE(acpi_video, vgapci, acpi_video_driver, acpi_video_modevent, NULL);
+
+/*
+ * No device ID identifies ACPI video: let devmatch(8) load the module for
+ * any display controller, the probe then looks for the ACPI methods.
+ */
+static const struct {
+	const char	*desc;
+} acpi_video_pnp[] = {
+	{ "display controller" },
+};
+MODULE_PNP_INFO("D:#;T:class=0x03", vgapci, acpi_video, acpi_video_pnp,
+    nitems(acpi_video_pnp));
 MODULE_DEPEND(acpi_video, acpi, 1, 1, 1);
 #ifdef EVDEV_SUPPORT
 MODULE_DEPEND(acpi_video, evdev, 1, 1, 1);
