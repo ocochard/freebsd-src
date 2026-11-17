@@ -38,6 +38,10 @@
 #include <sys/module.h>
 #include <sys/sbuf.h>
 
+#if defined(__amd64__) || defined(__i386__)
+#include <machine/intr_machdep.h>
+#endif
+
 #include <dev/gpio/gpiobusvar.h>
 #include <dev/gpio/gpiobus_internal.h>
 
@@ -113,6 +117,18 @@ gpio_alloc_intr_resource(device_t consumer_dev, int rid, u_int alloc_flags,
 		return (NULL);
 	}
 	return (res);
+}
+#elif defined(__amd64__) || defined(__i386__)
+struct resource *
+gpio_alloc_intr_resource(device_t consumer_dev, int rid, u_int alloc_flags,
+    gpio_pin_t pin, uint32_t intr_mode)
+{
+	u_int irq;
+
+	if (gpio_intr_map(pin->dev, pin->pin, intr_mode, &irq) != 0)
+		return (NULL);
+	return (bus_alloc_resource(consumer_dev, SYS_RES_IRQ, rid, irq, irq, 1,
+	    alloc_flags));
 }
 #else
 struct resource *

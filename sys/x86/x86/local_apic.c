@@ -2247,6 +2247,9 @@ apic_setup_io(void *dummy __unused)
 	/* Enable the MSI "pic". */
 	msi_init();
 
+	/* Reserve IRQs for GPIO pin interrupts. */
+	gpio_intr_init();
+
 #ifdef XENHVM
 	xen_intr_alloc_irqs();
 #endif
