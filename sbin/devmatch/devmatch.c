@@ -478,13 +478,21 @@ find_unmatched(struct devinfo_dev *dev, void *arg)
 {
 	struct devinfo_dev *parent;
 	char *bus, *p;
+	bool hostb;
 
+	/*
+	 * hostb(4) attaches to host bridges only to be the bus of the drivers
+	 * for their functions, such as amdtemp(4), which add their own child
+	 * once their module is loaded.  Match a host bridge as if it had no
+	 * driver, so those modules load.
+	 */
+	hostb = !unbound_flag && strcmp(dev->dd_drivername, "hostb") == 0;
 	do {
-		if (!all_flag && dev->dd_name[0] != '\0')
+		if (!all_flag && !hostb && dev->dd_name[0] != '\0')
 			break;
 		if (!(dev->dd_flags & DF_ENABLED))
 			break;
-		if (!all_flag && dev->dd_flags & DF_ATTACHED_ONCE)
+		if (!all_flag && !hostb && dev->dd_flags & DF_ATTACHED_ONCE)
 			break;
 		parent = devinfo_handle_to_device(dev->dd_parent);
 		bus = strdup(parent->dd_name);
