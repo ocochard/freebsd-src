@@ -1138,6 +1138,8 @@ cs35l54_attach(device_t dev)
 	    "I", "Amplifier volume in dB (-100 to 12)");
 	SYSCTL_ADD_BOOL(ctx, tree, OID_AUTO, "loaded", CTLFLAG_RD,
 	    &sc->loaded, 0, "DSP firmware downloaded");
+	SYSCTL_ADD_STRING(ctx, tree, OID_AUTO, "subsystem", CTLFLAG_RD,
+	    sc->sub, 0, "Subsystem id of the HDA codec served (ACPI _SUB)");
 
 	/*
 	 * The download takes seconds, and raw firmware files and on-demand

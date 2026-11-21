@@ -24,7 +24,7 @@
 .\" OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
 .\" SUCH DAMAGE.
 .\"
-.Dd November 11, 2026
+.Dd November 21, 2026
 .Dt SND_CS35L54 4
 .Os
 .Sh NAME
@@ -109,6 +109,10 @@ Read-only, 1 once the firmware is downloaded.
 .It Va dev.cs35l54.%d.play
 1 while the amplifiers play.
 Writing 1 or 0 starts or pauses them by hand, for tests.
+.It Va dev.cs35l54.%d.subsystem
+Read-only, the platform subsystem id from ACPI, in lower case:
+the amplifiers follow the speaker stream of the HDA codec with this
+subsystem id.
 .It Va dev.cs35l54.%d.volume
 Amplifier volume in dB, from -100 to 12.
 The default is -30.
