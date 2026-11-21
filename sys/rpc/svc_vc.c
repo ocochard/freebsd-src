@@ -356,6 +356,7 @@ svc_vc_create_backchannel(SVCPOOL *pool)
 	xprt->xp_p1 = cd;
 	xprt->xp_p2 = NULL;
 	xprt->xp_ops = &svc_vc_backchannel_ops;
+	xprt->xp_backchannel = TRUE;
 	return (xprt);
 }
 

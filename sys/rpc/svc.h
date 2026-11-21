@@ -157,6 +157,7 @@ typedef struct __rpc_svcxprt {
 	gid_t		*xp_gidp;
 	int		xp_doneddp;
 	bool_t		xp_extpg;	/* Can use M_EXTPG mbufs. */
+	bool_t		xp_backchannel;	/* Backchannel of a client connection */
 } SVCXPRT;
 
 /*
