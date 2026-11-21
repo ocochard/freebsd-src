@@ -53,6 +53,7 @@ static int nfs_cbproc(struct nfsrv_descript *, u_int32_t);
 extern u_long sb_max_adj;
 extern int nfs_numnfscbd;
 extern int nfscl_debuglevel;
+extern int nfscl_enablecallb;
 
 /*
  * NFS client system calls for handling callbacks.
@@ -229,6 +230,7 @@ int
 nfscbd_nfsd(struct thread *td, struct nfsd_nfscbd_args *args)
 {
 	char principal[128];
+	SVCXPRT *xprt;
 	int error;
 
 	if (args != NULL) {
@@ -252,6 +254,17 @@ nfscbd_nfsd(struct thread *td, struct nfsd_nfscbd_args *args)
 		nfs_numnfscbd++;
 
 		NFSD_UNLOCK();
+
+		/*
+		 * Register the callback program on the pool itself, since an
+		 * NFSv4.1 backchannel has no socket of its own and a jail
+		 * cannot add the UDP one.
+		 */
+		xprt = svc_vc_create_backchannel(nfscbd_pool);
+		if (svc_reg(xprt, NFS_CALLBCKPROG, NFSV4_CBVERS, nfscb_program,
+		    NULL))
+			nfscl_enablecallb = 1;
+		SVC_RELEASE(xprt);
 
 		if (principal[0] != '\0')
 			rpc_gss_set_svc_name_call(principal, "kerberosv5",

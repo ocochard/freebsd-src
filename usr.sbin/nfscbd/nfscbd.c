@@ -33,6 +33,7 @@
 #include <sys/socket.h>
 #include <sys/socketvar.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
 #include <sys/ucred.h>
 #include <sys/uio.h>
 #include <sys/vnode.h>
@@ -99,12 +100,13 @@ main(int argc, char *argv[])
 	struct sockaddr_in inetaddr, inetpeer;
 	fd_set ready, sockbits;
 	int ch, connect_type_cnt, maxsock, msgsock, error;
-	int nfssvc_flag, on, sock, tcpsock, ret, mustfreeai = 0;
+	int jailed, nfssvc_flag, on, sock, tcpsock, ret, mustfreeai = 0;
 	char *cp, princname[128];
 	char myname[MAXHOSTNAMELEN], *myfqdnname = NULL;
 	struct addrinfo *aip, hints;
 	pid_t pid;
 	short myport = NFSV4_CBPORT;
+	size_t jailed_size;
 	socklen_t len;
 
 	if (modfind("nfscl") < 0) {
@@ -225,8 +227,14 @@ main(int argc, char *argv[])
 	inetaddr.sin_port = htons(myport);
 	inetaddr.sin_len = sizeof(inetaddr);
 	ret = bind(sock, (struct sockaddr *)&inetaddr, sizeof(inetaddr));
-	/* If bind() fails, this is a restart, so just skip UDP. */
-	if (ret == 0) {
+	/*
+	 * If bind() fails, this is a restart, so just skip UDP.
+	 * The kernel does not serve UDP for a jail.
+	 */
+	jailed = 0;
+	jailed_size = sizeof(jailed);
+	sysctlbyname("security.jail.jailed", &jailed, &jailed_size, NULL, 0);
+	if (ret == 0 && jailed == 0) {
 		len = sizeof(inetaddr);
 		if (getsockname(sock, (struct sockaddr *)&inetaddr, &len) < 0){
 			syslog(LOG_ERR, "can't get bound addr");
