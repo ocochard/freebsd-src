@@ -1133,6 +1133,7 @@ nfsrpc_setclient(struct nfsmount *nmp, struct nfsclclient *clp, int reclaim,
 				 */
 				tsep = NFSMNT_MDSSESSION(nmp);
 				tsep->nfsess_defunct = 1;
+				tsep->nfsess_retired = NFSD_MONOSEC;
 			}
 			TAILQ_INSERT_HEAD(&nmp->nm_sess, dsp,
 			    nfsclds_list);
@@ -7678,6 +7679,48 @@ nfscl_freenfsclds(struct nfsclds *dsp)
 			    dsp->nfsclds_sess.nfsess_cbslots[i].nfssl_reply);
 	}
 	free(dsp, M_NFSCLDS);
+}
+
+/*
+ * Free the MDS sessions that recovery has replaced, once no RPC holds a
+ * reference on them and they were retired more than "grace" seconds ago.
+ * The grace period covers code that looks the MDS session up without a
+ * reference, which only reads a few fields from it.
+ */
+void
+nfscl_freeretiredsess(struct nfsmount *nmp, time_t grace)
+{
+	struct nfsclds *dsp, *ndsp;
+	TAILQ_HEAD(, nfsclds) freeq;
+
+	/*
+	 * A pNFS device can point at an MDS session that is also its DS
+	 * (nfsrpc_fillsa()) without a reference: keep them until unmount.
+	 */
+	if (NFSHASPNFS(nmp))
+		return;
+	TAILQ_INIT(&freeq);
+	NFSLOCKMNT(nmp);
+	/* Skip the first entry, which is the live MDS session. */
+	dsp = TAILQ_FIRST(&nmp->nm_sess);
+	if (dsp != NULL)
+		dsp = TAILQ_NEXT(dsp, nfsclds_list);
+	while (dsp != NULL) {
+		ndsp = TAILQ_NEXT(dsp, nfsclds_list);
+		if (dsp->nfsclds_sess.nfsess_retired != 0 &&
+		    dsp->nfsclds_sess.nfsess_refcnt == 0 &&
+		    dsp->nfsclds_sess.nfsess_retired + grace < NFSD_MONOSEC) {
+			TAILQ_REMOVE(&nmp->nm_sess, dsp, nfsclds_list);
+			TAILQ_INSERT_TAIL(&freeq, dsp, nfsclds_list);
+		}
+		dsp = ndsp;
+	}
+	NFSUNLOCKMNT(nmp);
+	TAILQ_FOREACH_SAFE(dsp, &freeq, nfsclds_list, ndsp) {
+		if (dsp->nfsclds_sockp != NULL)
+			newnfs_disconnect(NULL, dsp->nfsclds_sockp);
+		nfscl_freenfsclds(dsp);
+	}
 }
 
 static enum nfsclds_state

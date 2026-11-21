@@ -686,6 +686,7 @@ struct nfsrv_descript {
 	uint32_t		*nd_slotseq;	/* ptr to slot seq# in req */
 	uint8_t			nd_sessionid[NFSX_V4SESSIONID];	/* Session id */
 	uint32_t		nd_slotid;	/* Slotid for this RPC */
+	struct nfsclsession	*nd_sep;	/* Held MDS session (client) */
 	SVCXPRT			*nd_xprt;	/* Server RPC handle */
 	uint32_t		*nd_sequence;	/* Sequence Op. ptr */
 	nfsv4stateid_t		nd_curstateid;	/* Current StateID */
@@ -748,6 +749,7 @@ struct nfsrv_descript {
 #define	ND_MACHCRED		0x80000000000
 #define	ND_CANEXTPG		0x100000000000
 #define	ND_RDMA			0x200000000000
+#define	ND_HOLDSESS		0x400000000000	/* nd_sep holds a reference */
 
 /*
  * ND_GSS should be the "or" of all GSS type authentications.

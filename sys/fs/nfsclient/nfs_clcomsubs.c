@@ -453,11 +453,21 @@ nfsv4_freeunsentslot(struct nfsmount *nmp, struct nfsclsession *sep,
     struct nfsrv_descript *nd)
 {
 
-	if (nmp == NULL || (nd->nd_flag & (ND_NFSV41 | ND_HASSLOTID)) !=
-	    (ND_NFSV41 | ND_HASSLOTID))
+	if (nmp == NULL)
 		return;
-	if (sep == NULL)
-		sep = nfsmnt_mdssession(nmp);
-	if (sep != NULL)
-		nfsv4_freeslot(sep, nd->nd_slotid, true);
+	if ((nd->nd_flag & (ND_NFSV41 | ND_HASSLOTID)) ==
+	    (ND_NFSV41 | ND_HASSLOTID)) {
+		if (sep == NULL && (nd->nd_flag & ND_HOLDSESS) != 0)
+			sep = nd->nd_sep;
+		if (sep == NULL)
+			sep = nfsmnt_mdssession(nmp);
+		if (sep != NULL)
+			nfsv4_freeslot(sep, nd->nd_slotid, true);
+	}
+	/* The RPC is not sent: drop the reference newnfs_request() would. */
+	if ((nd->nd_flag & ND_HOLDSESS) != 0) {
+		nfsmnt_relsession(nmp, nd->nd_sep);
+		nd->nd_flag &= ~ND_HOLDSESS;
+		nd->nd_sep = NULL;
+	}
 }

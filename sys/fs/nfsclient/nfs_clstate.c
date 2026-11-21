@@ -2848,6 +2848,8 @@ checkdsrenew:
 				dsp = TAILQ_NEXT(dsp, nfsclds_list);
 			}
 			NFSUNLOCKMNT(clp->nfsc_nmp);
+			nfscl_freeretiredsess(clp->nfsc_nmp,
+			    2 * clp->nfsc_renew);
 		}
 
 		TAILQ_INIT(&dh);

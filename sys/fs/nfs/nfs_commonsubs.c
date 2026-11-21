@@ -368,6 +368,7 @@ nfscl_reqstart(struct nfsrv_descript *nd, int procnum, struct nfsmount *nmp,
 	 * First, fill in some of the fields of nd.
 	 */
 	nd->nd_slotseq = NULL;
+	nd->nd_sep = NULL;
 	NFSBZERO(nd->nd_sessionid, NFSX_V4SESSIONID);
 	if (vers == NFS_VER4) {
 		nd->nd_flag = ND_NFSV4 | ND_NFSCL;
@@ -454,7 +455,14 @@ nfscl_reqstart(struct nfsrv_descript *nd, int procnum, struct nfsmount *nmp,
 			NFSM_BUILD(tl, u_int32_t *, NFSX_UNSIGNED);
 			*tl = txdr_unsigned(NFSV4OP_SEQUENCE);
 			if (sep == NULL) {
-				sep = nfsmnt_mdssession(nmp);
+				/*
+				 * Hold the MDS session until newnfs_request()
+				 * is done with it, even if a recovery
+				 * replaces it in the meantime.
+				 */
+				sep = nfsmnt_holdmdssession(nmp);
+				nd->nd_sep = sep;
+				nd->nd_flag |= ND_HOLDSESS;
 				/*
 				 * For MDS mount sessions, check for bad
 				 * slots.  If the caller does not want this

@@ -74,6 +74,8 @@ struct nfsclsession {
 	uint16_t	nfsess_backslots;
 	uint8_t		nfsess_sessionid[NFSX_V4SESSIONID];
 	uint8_t		nfsess_defunct;		/* Non-zero for old sessions */
+	u_int		nfsess_refcnt;		/* RPCs using it, NFSLOCKMNT */
+	time_t		nfsess_retired;		/* When replaced by recovery */
 };
 
 /*

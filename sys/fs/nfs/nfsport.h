@@ -1210,6 +1210,36 @@ nfsmnt_mdssession(struct nfsmount *nmp)
 	return (tsep);
 }
 
+/*
+ * Same as nfsmnt_mdssession(), but also acquire a reference on the session,
+ * so that it is not free'd by nfscl_freeretiredsess() while an RPC uses it.
+ * Release it with nfsmnt_relsession().
+ */
+static __inline struct nfsclsession *
+nfsmnt_holdmdssession(struct nfsmount *nmp)
+{
+	struct nfsclsession *tsep;
+
+	tsep = NULL;
+	mtx_lock(&nmp->nm_mtx);
+	if (TAILQ_FIRST(&nmp->nm_sess) != NULL) {
+		tsep = NFSMNT_MDSSESSION(nmp);
+		tsep->nfsess_refcnt++;
+	}
+	mtx_unlock(&nmp->nm_mtx);
+	return (tsep);
+}
+
+static __inline void
+nfsmnt_relsession(struct nfsmount *nmp, struct nfsclsession *tsep)
+{
+
+	mtx_lock(&nmp->nm_mtx);
+	KASSERT(tsep->nfsess_refcnt > 0, ("nfsmnt_relsession: refcnt 0"));
+	tsep->nfsess_refcnt--;
+	mtx_unlock(&nmp->nm_mtx);
+}
+
 #endif	/* _KERNEL */
 
 #endif	/* _NFS_NFSPORT_H */

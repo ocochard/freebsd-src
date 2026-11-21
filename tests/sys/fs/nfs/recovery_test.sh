@@ -132,7 +132,6 @@ session_leak_body()
 	[ $(grep -c 'learn session' proxy.log) -ge 4 ] ||
 	    atf_fail "not every reset caused a recovery"
 	n=$(nfs_sessions)
-	atf_expect_fail "Sessions replaced by recovery are freed only at unmount"
 	[ ${n} -le $((n0 + 1)) ] ||
 	    atf_fail "$((n - n0)) sessions in use for one mount"
 }

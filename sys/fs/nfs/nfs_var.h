@@ -567,6 +567,7 @@ int nfscl_doiods(vnode_t, struct uio *, int *, int *, uint32_t, int,
 int nfscl_findlayoutforio(struct nfscllayout *, uint64_t, uint32_t,
     struct nfsclflayout **);
 void nfscl_freenfsclds(struct nfsclds *);
+void nfscl_freeretiredsess(struct nfsmount *, time_t);
 int nfsrpc_allocate(vnode_t, off_t, off_t, struct nfsvattr *, int *,
     struct ucred *, NFSPROC_T *);
 int nfsrpc_deallocate(vnode_t, off_t, off_t, struct nfsvattr *, int *,

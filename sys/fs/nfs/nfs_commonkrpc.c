@@ -129,6 +129,8 @@ static void	nfs_down(struct nfsmount *, struct thread *, const char *,
 static void	nfs_up(struct nfsmount *, struct thread *, const char *,
     int, int);
 static int	nfs_msg(struct thread *, const char *, const char *, int);
+static struct nfsclsession *nfs_reqsession(struct nfsmount *,
+    struct nfsrv_descript *);
 
 struct nfs_cached_auth {
 	int		ca_refs; /* refcount, including 1 from the cache */
@@ -711,8 +713,8 @@ nfs_feedback(int type, int proc, void *arg)
  *	- break down rpc header and return with nfs reply
  * nb: always frees up nd_mreq mbuf list
  */
-int
-newnfs_request(struct nfsrv_descript *nd, struct nfsmount *nmp,
+static int
+newnfs_dorequest(struct nfsrv_descript *nd, struct nfsmount *nmp,
     struct nfsclient *clp, struct nfssockreq *nrp, vnode_t vp,
     struct thread *td, struct ucred *cred, u_int32_t prog, u_int32_t vers,
     u_char *retsum, int toplevel, u_int64_t *xidp, struct nfsclsession *dssep)
@@ -1093,7 +1095,7 @@ tryagain:
 			 * free'd, threads can get stuck waiting for a slot.
 			 */
 			if (sep == NULL)
-				sep = nfsmnt_mdssession(nmp);
+				sep = nfs_reqsession(nmp, nd);
 			/*
 			 * Bump the sequence# out of range, so that reuse of
 			 * this slot will result in an NFSERR_SEQMISORDERED
@@ -1123,7 +1125,7 @@ tryagain:
 			 * Free the slot, resetting the slot's sequence#.
 			 */
 			if (sep == NULL)
-				sep = nfsmnt_mdssession(nmp);
+				sep = nfs_reqsession(nmp, nd);
 			nfsv4_freeslot(sep, nd->nd_slotid, true);
 		}
 		NFSINCRGLOBAL(nfsstatsv1.rpcinvalid);
@@ -1160,7 +1162,7 @@ tryagain:
 	    nd->nd_procnum != NFSV4PROC_CBNULL) {
 		/* If sep == NULL, set it to the default in nmp. */
 		if (sep == NULL && nmp != NULL)
-			sep = nfsmnt_mdssession(nmp);
+			sep = nfs_reqsession(nmp, nd);
 		/*
 		 * and now the actual NFS xdr.
 		 */
@@ -1363,6 +1365,13 @@ tryagain:
 				 * has been created during the sleep.
 				 */
 				sep = NFSMNT_MDSSESSION(nmp);
+				/* Move the reference to the new session. */
+				if ((nd->nd_flag & ND_HOLDSESS) != 0 &&
+				    nd->nd_sep != sep) {
+					nd->nd_sep->nfsess_refcnt--;
+					sep->nfsess_refcnt++;
+					nd->nd_sep = sep;
+				}
 				NFSUNLOCKMNT(nmp);
 				if ((nd->nd_flag & ND_LOOPBADSESS) != 0) {
 					reterr = nfsv4_sequencelookup(nmp, sep,
@@ -1561,6 +1570,42 @@ nfsmout:
 	if (set_sigset)
 		newnfs_restore_sigmask(td, &oldset);
 	return (error);
+}
+
+/*
+ * Do the RPC, then release the MDS session reference that nfscl_reqstart()
+ * acquired for it, whichever way newnfs_dorequest() returns.
+ */
+int
+newnfs_request(struct nfsrv_descript *nd, struct nfsmount *nmp,
+    struct nfsclient *clp, struct nfssockreq *nrp, vnode_t vp,
+    struct thread *td, struct ucred *cred, u_int32_t prog, u_int32_t vers,
+    u_char *retsum, int toplevel, u_int64_t *xidp, struct nfsclsession *dssep)
+{
+	int error;
+
+	error = newnfs_dorequest(nd, nmp, clp, nrp, vp, td, cred, prog, vers,
+	    retsum, toplevel, xidp, dssep);
+	if ((nd->nd_flag & ND_HOLDSESS) != 0) {
+		KASSERT(nmp != NULL, ("newnfs_request: ND_HOLDSESS without nmp"));
+		nfsmnt_relsession(nmp, nd->nd_sep);
+		nd->nd_flag &= ~ND_HOLDSESS;
+		nd->nd_sep = NULL;
+	}
+	return (error);
+}
+
+/*
+ * The MDS session of an RPC: the one it holds a reference on, which is
+ * still the right one after a recovery replaced the MDS session.
+ */
+static struct nfsclsession *
+nfs_reqsession(struct nfsmount *nmp, struct nfsrv_descript *nd)
+{
+
+	if ((nd->nd_flag & ND_HOLDSESS) != 0)
+		return (nd->nd_sep);
+	return (nfsmnt_mdssession(nmp));
 }
 
 /*
