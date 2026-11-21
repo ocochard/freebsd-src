@@ -82,8 +82,12 @@ sys_nfssvc(struct thread *td, struct nfssvc_args *uap)
 
 	AUDIT_ARG_CMD(uap->flag);
 
-	/* Allow anyone to get the stats. */
-	if ((uap->flag & ~(NFSSVC_GETSTATS | NFSSVC_NEWSTRUCT)) != 0) {
+	/*
+	 * Allow anyone to get the stats and the options of an NFS mount
+	 * they can look up.
+	 */
+	if ((uap->flag & ~(NFSSVC_GETSTATS | NFSSVC_NEWSTRUCT |
+	    NFSSVC_DUMPMNTOPTS)) != 0) {
 		error = priv_check(td, PRIV_NFS_DAEMON);
 		if (error != 0)
 			return (error);

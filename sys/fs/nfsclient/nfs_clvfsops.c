@@ -157,7 +157,7 @@ static struct vfsops nfs_vfsops = {
  * for "nfscl" and is needed so that a custom event handling
  * function gets called.  MODULE_DEPEND() macros are found there.
  */
-VFS_SET(nfs_vfsops, nfs, VFCF_NETWORK | VFCF_SBDRY);
+VFS_SET(nfs_vfsops, nfs, VFCF_NETWORK | VFCF_SBDRY | VFCF_JAIL);
 
 MODULE_VERSION(nfs, 1);
 
@@ -972,6 +972,14 @@ nfs_mount(struct mount *mp)
 	}
 
 	td = curthread;
+	/*
+	 * A jail without its own vnet would make its RPCs, and its gssd and
+	 * rpc.tlsclntd upcalls, with the host's network and identities.
+	 */
+	if (jailed_without_vnet(td->td_ucred)) {
+		error = EPERM;
+		goto out;
+	}
 	if ((mp->mnt_flag & (MNT_ROOTFS | MNT_UPDATE)) == MNT_ROOTFS &&
 	    nfs_diskless_valid != 0) {
 		error = nfs_mountroot(mp);

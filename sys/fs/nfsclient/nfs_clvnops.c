@@ -3448,7 +3448,12 @@ nfs_advlock(struct vop_advlock_args *ap)
 			NFSVOPUNLOCK(vp);
 			error = lf_advlock(ap, &(vp->v_lockf), size);
 		} else {
-			if (nfs_advlock_p != NULL)
+			/*
+			 * The NLM serves the host only: a jail's request would
+			 * go out with the host's address and name.
+			 */
+			if (nfs_advlock_p != NULL &&
+			    !jailed(vp->v_mount->mnt_cred))
 				error = nfs_advlock_p(ap);
 			else {
 				NFSVOPUNLOCK(vp);
