@@ -265,7 +265,8 @@ clnt_nl_call(CLIENT *cl, struct rpc_callextra *ext, rpcproc_t proc,
 	XDR xdrs;
 	void *mem;
 	uint32_t len, xlen;
-	u_int retries = 0;
+	u_int retries = 0, tries;
+	int timo;
 	bool rv __diagused;
 
 	CURVNET_ASSERT_SET();
@@ -330,11 +331,21 @@ retry:
 
 	nlmsg_flush(&nw);
 
+	/*
+	 * A call that asks for less than one attempt of the handle gets a
+	 * single attempt of its own length.
+	 */
+	tries = nl->nl_retries;
+	timo = (nl->nl_timo ? nl->nl_timo : tvtohz(&utimeout)) / tries;
+	if (nl->nl_timo != 0 && timevalisset(&utimeout) &&
+	    tvtohz(&utimeout) < timo) {
+		timo = tvtohz(&utimeout);
+		tries = 1;
+	}
 	mtx_lock(&nl->nl_lock);
 	if (__predict_true(cr->cr_error == ETIMEDOUT))
 		(void)msleep(cr, &nl->nl_lock, nl->nl_prio, nl->nl_wchan,
-		    (nl->nl_timo ? nl->nl_timo : tvtohz(&utimeout)) /
-		    nl->nl_retries);
+		    timo);
 	TAILQ_REMOVE(&nl->nl_pending, cr, cr_link);
 	mtx_unlock(&nl->nl_lock);
 
@@ -377,7 +388,7 @@ retry:
 		MPASS(cr->cr_mrep == NULL);
 		errp->re_errno = cr->cr_error;
 		stat = errp->re_status = RPC_CANTRECV;
-		if (cr->cr_error == ETIMEDOUT && ++retries < nl->nl_retries) {
+		if (cr->cr_error == ETIMEDOUT && ++retries < tries) {
 			cr->cr_xid = atomic_fetchadd_32(&nl->nl_xid, 1);
 			goto retry;
 		}

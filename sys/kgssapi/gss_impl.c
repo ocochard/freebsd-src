@@ -39,6 +39,7 @@
 
 #include <kgssapi/gssapi.h>
 #include <kgssapi/gssapi_impl.h>
+#include <net/vnet.h>
 #include <rpc/rpc.h>
 #include <rpc/rpc_com.h>
 #include <rpc/rpcsec_gss.h>
@@ -53,11 +54,19 @@ struct mtx kgss_gssd_lock;
 
 CLIENT *kgss_gssd_handle;
 
+/*
+ * Each vnet runs its own gssd(8), or none, so whether gssd answered is
+ * per vnet.
+ */
+VNET_DEFINE_STATIC(bool, kgss_gssd_seen);
+#define	V_kgss_gssd_seen	VNET(kgss_gssd_seen)
+VNET_DEFINE_STATIC(time_t, kgss_nextrpc);
+#define	V_kgss_nextrpc		VNET(kgss_nextrpc)
+
 static int
 kgss_load(void)
 {
 	CLIENT *cl;
-	struct timeval nulltimo = {.tv_sec = 0, .tv_usec = 200000};
 
 	LIST_INIT(&kgss_mechs);
 
@@ -65,17 +74,13 @@ kgss_load(void)
 	KASSERT(cl, ("%s: netlink client already exist", __func__));
 
 	/*
-	 * The transport default is no retries at all, since there could
-	 * be no userland listener to our messages.  Initially, a short timeout
-	 * is set, so that a Null RPC upcall will fail quickly if the daemon
-	 * is not running.  After the Null RPC succeeds, we will retry for 5
-	 * minutes with 10 second interval.  This will potentially cure hosts
-	 * with misconfigured startup, where kernel starts sending GSS queries
-	 * before userland had started up the gssd(8) daemon.
-	 * The initial timeout of 200usec is for the Null RPC.
+	 * Retry for 5 minutes with a 10 second interval: some gssd(8)
+	 * calls take about 30 seconds, and this rides out a gssd restart.
+	 * The handle is shared by all vnets; the Null RPC that checks
+	 * that the gssd of a vnet runs asks for a short timeout per call.
 	 */
 	clnt_control(cl, CLSET_RETRIES, &(int){30});
-	clnt_control(cl, CLSET_TIMEOUT, &nulltimo);
+	clnt_control(cl, CLSET_TIMEOUT, &(struct timeval){.tv_sec = 300});
 
 	/*
 	 * We literally wait on gssd(8), let's see that in top(1).
@@ -243,13 +248,11 @@ kgss_gssd_client(void)
 	CLIENT *cl;
 	struct rpc_callextra ext;
 	enum clnt_stat stat;
-	struct timeval rpctimo = {.tv_sec = 300, .tv_usec = 0};
-	static time_t nextrpc = 0;
-	static bool done_upcall = false;
+	struct timeval nulltimo = {.tv_sec = 0, .tv_usec = 200000};
 
 	mtx_lock(&kgss_gssd_lock);
 	cl = kgss_gssd_handle;
-	if (!done_upcall) {
+	if (!V_kgss_gssd_seen) {
 		mtx_unlock(&kgss_gssd_lock);
 		/*
 		 * Can only be NULL if client_nl_create() called from
@@ -257,26 +260,25 @@ kgss_gssd_client(void)
 		 */
 		if (cl == NULL)
 			return (cl);
-		if (time_uptime < nextrpc)
+		if (time_uptime < V_kgss_nextrpc)
 			return (NULL);
 		/*
 		 * Do a Null RPC with a short timeout.  If the RPC succeeds,
-		 * the gssd daemon is running.  If the Null RPC fails, don't
-		 * again for 5sec.
+		 * the gssd daemon of this vnet is running.  If the Null RPC
+		 * fails, don't try again for 5sec.
 		 */
 		memset(&ext, 0, sizeof(ext));
 		ext.rc_auth = authnone_create();
 		stat = clnt_call_private(cl, &ext, NULLPROC,
 		    (xdrproc_t)xdr_void, NULL, (xdrproc_t)xdr_void, NULL,
-		    rpctimo);	/* rpctimo is ignored by clnt_nl_call(). */
+		    nulltimo);
 		AUTH_DESTROY(ext.rc_auth);
 		if (stat != RPC_SUCCESS) {
-			nextrpc = time_uptime + 5;
+			V_kgss_nextrpc = time_uptime + 5;
 			return (NULL);
 		}
-		CLNT_CONTROL(cl, CLSET_TIMEOUT, &rpctimo);
 		mtx_lock(&kgss_gssd_lock);
-		done_upcall = true;
+		V_kgss_gssd_seen = true;
 	}
 	if (cl != NULL)
 		CLNT_ACQUIRE(cl);
