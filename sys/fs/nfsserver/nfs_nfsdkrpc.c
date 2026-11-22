@@ -116,6 +116,7 @@ VNET_DECLARE(struct proc *, nfsd_master_proc);
 
 VNET_DEFINE(SVCPOOL *, nfsrvd_pool);
 VNET_DEFINE(int, nfsrv_numnfsd) = 0;
+VNET_DEFINE(bool, nfsrv_exiting) = false;
 VNET_DEFINE(struct nfsv4lock, nfsd_suspend_lock);
 
 VNET_DEFINE_STATIC(bool, nfsrvd_inited) = false;
@@ -636,6 +637,12 @@ nfsrvd_nfsd(struct thread *td, struct nfsd_nfsd_args *args)
 	 * use.
 	 */
 	NFSD_LOCK();
+	/* The state of a dying jail may be thrown away at any time. */
+	if (!prison_isalive(td->td_ucred->cr_prison)) {
+		NFSD_UNLOCK();
+		error = EPERM;
+		goto out;
+	}
 	if (VNET(nfsrv_numnfsd) == 0) {
 		nfsdev_time = time_second;
 		p = td->td_proc;
@@ -708,9 +715,12 @@ nfsrvd_nfsd(struct thread *td, struct nfsd_nfsd_args *args)
 			}
 		}
 		NFSD_LOCK();
+		/* nfsrvd_init() still walks the clients. */
+		VNET(nfsrv_exiting) = true;
 		newnfs_numnfsd--;
 		VNET(nfsrv_numnfsd)--;
 		nfsrvd_init(1);
+		VNET(nfsrv_exiting) = false;
 		PROC_LOCK(p);
 		p->p_flag2 &= ~P2_AST_SU;
 		PROC_UNLOCK(p);

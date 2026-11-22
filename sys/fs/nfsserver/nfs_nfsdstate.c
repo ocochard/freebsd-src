@@ -6041,11 +6041,11 @@ nfsrv_unlocklf(struct nfslockfile *lfp)
 }
 
 /*
- * Clear out all state for the NFSv4 server.
+ * Clear out the client and lock file state of the vnet.
  * Must be called by a thread that can sleep when no nfsds are running.
  */
-void
-nfsrv_throwawayallstate(NFSPROC_T *p)
+static void
+nfsrv_throwawayclients(NFSPROC_T *p)
 {
 	struct nfsclient *clp, *nclp;
 	struct nfslockfile *lfp, *nlfp;
@@ -6060,8 +6060,8 @@ nfsrv_throwawayallstate(NFSPROC_T *p)
 			nfsrv_cleanclient(clp, p, false, NULL);
 			nfsrv_freedeleglist(&clp->lc_deleg);
 			nfsrv_freedeleglist(&clp->lc_olddeleg);
-			free(clp->lc_stateid, M_NFSDCLIENT);
-			free(clp, M_NFSDCLIENT);
+			LIST_REMOVE(clp, lc_hash);
+			nfsrv_zapclient(clp, p);
 		}
 	}
 
@@ -6075,9 +6075,42 @@ nfsrv_throwawayallstate(NFSPROC_T *p)
 			nfsrv_freenfslockfile(lfp);
 		}
 	}
+}
+
+/*
+ * Clear out all state for the NFSv4 server.
+ * Must be called by a thread that can sleep when no nfsds are running.
+ */
+void
+nfsrv_throwawayallstate(NFSPROC_T *p)
+{
+
+	nfsrv_throwawayclients(p);
 
 	/* And get rid of the deviceid structures and layouts. */
 	nfsrv_freealllayoutsanddevids();
+}
+
+/*
+ * Clear out the client state of a dying jail, which cannot run nfsd again:
+ * the clients hold credentials that keep the jail from going away.
+ * Must be called when no nfsds are running in the vnet.
+ */
+void
+nfsrv_throwawaydyingstate(NFSPROC_T *p)
+{
+	int igotlock;
+
+	NFSLOCKV4ROOTMUTEX();
+	do {
+		igotlock = nfsv4_lock(&nfsv4rootfs_lock, 1, NULL,
+		    NFSV4ROOTLOCKMUTEXPTR, NULL);
+	} while (!igotlock);
+	NFSUNLOCKV4ROOTMUTEX();
+	nfsrv_throwawayclients(p);
+	NFSLOCKV4ROOTMUTEX();
+	nfsv4_unlock(&nfsv4rootfs_lock, 0);
+	NFSUNLOCKV4ROOTMUTEX();
 }
 
 /*

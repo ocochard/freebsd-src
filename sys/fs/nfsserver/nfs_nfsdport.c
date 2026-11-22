@@ -51,6 +51,7 @@
 #include <sys/netexport.h>
 #include <sys/osd.h>
 #include <sys/sysctl.h>
+#include <sys/taskqueue.h>
 #include <nlm/nlm_prot.h>
 #include <nlm/nlm.h>
 #include <vm/vm_param.h>
@@ -76,6 +77,7 @@ uint64_t nfsrv_stripesiz = 0;
 static int nfsrv_maxstripecnt = 1;
 
 VNET_DECLARE(int, nfsrv_numnfsd);
+VNET_DECLARE(bool, nfsrv_exiting);
 VNET_DECLARE(struct nfsrv_stablefirst, nfsrv_stablefirst);
 VNET_DECLARE(SVCPOOL *, nfsrvd_pool);
 VNET_DECLARE(struct nfsclienthashhead *, nfsclienthash);
@@ -4804,6 +4806,9 @@ nfssvc_nfsd(struct thread *td, struct nfssvc_args *uap)
 		nfsd_timer(TD_TO_VNET(td));
 		error = nfsrvd_nfsd(td, &nfsdarg);
 		callout_drain(&VNET(nfsd_callout));
+		if (!prison_isalive(td->td_ucred->cr_prison) &&
+		    VNET(nfsrv_numnfsd) == 0)
+			nfsrv_throwawaydyingstate(td);
 		free(nfsdarg.addr, M_TEMP);
 		free(nfsdarg.dnshost, M_TEMP);
 		free(nfsdarg.dspath, M_TEMP);
@@ -8680,14 +8685,69 @@ VNET_SYSUNINIT(nfsrv_cleanup, SI_SUB_VNET_DONE, SI_ORDER_ANY,
 
 extern int (*nfsd_call_nfsd)(struct thread *, struct nfssvc_args *);
 
+static struct taskqueue *nfsrv_dyingtq;
+
+struct nfsrv_dyingtask {
+	struct task	dt_task;
+	struct prison	*dt_pr;
+};
+
+static void
+nfsrv_dyingtask(void *arg, int pending __unused)
+{
+	struct nfsrv_dyingtask *dt = arg;
+
+	CURVNET_SET(dt->dt_pr->pr_vnet);
+	nfsrv_throwawaydyingstate(curthread);
+	CURVNET_RESTORE();
+	prison_free(dt->dt_pr);
+	free(dt, M_TEMP);
+}
+
+/*
+ * A vnet jail being removed while no nfsd runs in it, after nfsd was
+ * stopped, still has its client state; nfsrvd_nfsd() refuses to start an
+ * nfsd in it from now on, so the state can be thrown away.  Do it from a
+ * task: an nfsd thread holding a reference on nfsv4rootfs_lock may need
+ * allprison_lock, which is held here.
+ */
+static int
+nfsrv_prison_remove(void *obj, void *data __unused)
+{
+	struct prison *pr = obj;
+	struct nfsrv_dyingtask *dt;
+	bool idle;
+
+	if ((pr->pr_flags & PR_VNET) == 0)
+		return (0);
+	CURVNET_SET(pr->pr_vnet);
+	NFSD_LOCK();
+	idle = VNET(nfsrv_mntinited) && VNET(nfsrv_numnfsd) == 0 &&
+	    !VNET(nfsrv_exiting);
+	NFSD_UNLOCK();
+	if (idle && VNET(nfsstatsv1_p)->srvclients > 0) {
+		dt = malloc(sizeof(*dt), M_TEMP, M_WAITOK);
+		prison_hold(pr);
+		dt->dt_pr = pr;
+		TASK_INIT(&dt->dt_task, 0, nfsrv_dyingtask, dt);
+		taskqueue_enqueue(nfsrv_dyingtq, &dt->dt_task);
+	}
+	CURVNET_RESTORE();
+	return (0);
+}
+
 /*
  * Called once to initialize data structures...
  */
 static int
 nfsd_modevent(module_t mod, int type, void *data)
 {
+	osd_method_t methods[PR_MAXMETHOD] = {
+	    [PR_METHOD_REMOVE] =	nfsrv_prison_remove,
+	};
 	int error = 0, i;
 	static int loaded = 0;
+	static int prison_slot;
 
 	switch (type) {
 	case MOD_LOAD:
@@ -8704,6 +8764,10 @@ nfsd_modevent(module_t mod, int type, void *data)
 #endif
 		nfsd_call_nfsd = nfssvc_nfsd;
 		nfs_enable_extpg_cache();
+		nfsrv_dyingtq = taskqueue_create("nfsd jail", M_WAITOK,
+		    taskqueue_thread_enqueue, &nfsrv_dyingtq);
+		taskqueue_start_threads(&nfsrv_dyingtq, 1, PWAIT, "nfsd jail");
+		prison_slot = osd_jail_register(NULL, methods);
 		loaded = 1;
 		break;
 
@@ -8718,6 +8782,8 @@ nfsd_modevent(module_t mod, int type, void *data)
 		vn_deleg_ops.vndeleg_disable = NULL;
 #endif
 		nfsd_call_nfsd = NULL;
+		osd_jail_deregister(prison_slot);
+		taskqueue_free(nfsrv_dyingtq);
 		mtx_destroy(&nfsrc_udpmtx);
 		mtx_destroy(&nfs_v4root_mutex);
 		mtx_destroy(&nfsrv_dontlistlock_mtx);

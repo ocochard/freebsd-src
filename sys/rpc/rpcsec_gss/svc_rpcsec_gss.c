@@ -74,6 +74,7 @@
 #include <sys/mutex.h>
 #include <sys/proc.h>
 #include <sys/sx.h>
+#include <sys/taskqueue.h>
 #include <sys/ucred.h>
 
 #include <rpc/rpc.h>
@@ -198,13 +199,26 @@ SYSCTL_UINT(_kern_rpc_gss, OID_AUTO, client_count, CTLFLAG_RD,
 VNET_DEFINE(struct svc_rpc_gss_client_list *, svc_rpc_gss_client_hash);
 VNET_DEFINE(struct svc_rpc_gss_client_list, svc_rpc_gss_clients);
 VNET_DEFINE_STATIC(uint32_t, svc_rpc_gss_next_clientid) = 1;
+static int svc_rpc_gss_prison_slot;
+static struct taskqueue *svc_rpc_gss_dyingtq;
+
+static void svc_rpc_gss_forget_all_clients(void);
+static int svc_rpc_gss_prison_remove(void *obj, void *data);
 
 static void
 svc_rpc_gss_init(void *unused __unused)
 {
+	osd_method_t methods[PR_MAXMETHOD] = {
+	    [PR_METHOD_REMOVE] =	svc_rpc_gss_prison_remove,
+	};
 
 	svc_auth_reg(RPCSEC_GSS, svc_rpc_gss, rpc_gss_svc_getcred);
 	sx_init(&svc_rpc_gss_lock, "gsslock");
+	svc_rpc_gss_dyingtq = taskqueue_create("rpcsec_gss jail", M_WAITOK,
+	    taskqueue_thread_enqueue, &svc_rpc_gss_dyingtq);
+	taskqueue_start_threads(&svc_rpc_gss_dyingtq, 1, PWAIT,
+	    "rpcsec_gss jail");
+	svc_rpc_gss_prison_slot = osd_jail_register(NULL, methods);
 }
 SYSINIT(svc_rpc_gss_init, SI_SUB_VFS, SI_ORDER_ANY,
     svc_rpc_gss_init, NULL);
@@ -213,6 +227,8 @@ static void
 svc_rpc_gss_cleanup(void *unused __unused)
 {
 
+	osd_jail_deregister(svc_rpc_gss_prison_slot);
+	taskqueue_free(svc_rpc_gss_dyingtq);
 	sx_destroy(&svc_rpc_gss_lock);
 }
 SYSUNINIT(svc_rpc_gss_cleanup, SI_SUB_VFS, SI_ORDER_ANY,
@@ -237,6 +253,7 @@ static void
 svc_rpc_gss_vnet_cleanup(void *unused __unused)
 {
 
+	svc_rpc_gss_forget_all_clients();
 	mem_free(VNET(svc_rpc_gss_client_hash),
 	    sizeof(struct svc_rpc_gss_client_list) *
 	    svc_rpc_gss_client_hash_size);
@@ -661,6 +678,13 @@ svc_rpc_gss_create_client(void)
 	list = &VNET(svc_rpc_gss_client_hash)
 	    [client->cl_id.ci_id % svc_rpc_gss_client_hash_size];
 	sx_xlock(&svc_rpc_gss_lock);
+	/* A dying jail has had its clients forgotten, or soon will. */
+	if (!prison_isalive(curthread->td_ucred->cr_prison)) {
+		sx_xunlock(&svc_rpc_gss_lock);
+		sx_destroy(&client->cl_lock);
+		mem_free(client, sizeof(*client));
+		return (NULL);
+	}
 	TAILQ_INSERT_HEAD(list, client, cl_link);
 	TAILQ_INSERT_HEAD(&VNET(svc_rpc_gss_clients), client, cl_alllink);
 	svc_rpc_gss_client_count++;
@@ -787,6 +811,64 @@ again:
 		}
 	}
 	sx_xunlock(&svc_rpc_gss_lock);
+}
+
+/*
+ * Forget every client of the current vnet.
+ */
+static void
+svc_rpc_gss_forget_all_clients(void)
+{
+	struct svc_rpc_gss_client *client;
+
+	sx_xlock(&svc_rpc_gss_lock);
+	while ((client = TAILQ_FIRST(&VNET(svc_rpc_gss_clients))) != NULL) {
+		svc_rpc_gss_forget_client_locked(client);
+		sx_xunlock(&svc_rpc_gss_lock);
+		svc_rpc_gss_release_client(client);
+		sx_xlock(&svc_rpc_gss_lock);
+	}
+	sx_xunlock(&svc_rpc_gss_lock);
+}
+
+struct svc_rpc_gss_dyingtask {
+	struct task	dt_task;
+	struct prison	*dt_pr;
+};
+
+static void
+svc_rpc_gss_dyingtask(void *arg, int pending __unused)
+{
+	struct svc_rpc_gss_dyingtask *dt = arg;
+
+	CURVNET_SET(dt->dt_pr->pr_vnet);
+	svc_rpc_gss_forget_all_clients();
+	CURVNET_RESTORE();
+	prison_free(dt->dt_pr);
+	mem_free(dt, sizeof(*dt));
+}
+
+/*
+ * A client holds a credential, so a reference on the jail of the service
+ * that created it, and clients expire only when a request arrives: forget
+ * them when a vnet jail is removed, or the jail could never go away.  Do
+ * it from a task: freeing a context still being set up calls gssd, which
+ * must not be waited for with allprison_lock held.
+ */
+static int
+svc_rpc_gss_prison_remove(void *obj, void *data __unused)
+{
+	struct prison *pr = obj;
+	struct svc_rpc_gss_dyingtask *dt;
+
+	if ((pr->pr_flags & PR_VNET) == 0)
+		return (0);
+	dt = mem_alloc(sizeof(*dt));
+	prison_hold(pr);
+	dt->dt_pr = pr;
+	TASK_INIT(&dt->dt_task, 0, svc_rpc_gss_dyingtask, dt);
+	taskqueue_enqueue(svc_rpc_gss_dyingtq, &dt->dt_task);
+	return (0);
 }
 
 #ifdef DEBUG
@@ -1449,6 +1531,10 @@ svc_rpc_gss(struct svc_req *rqst, struct rpc_msg *msg)
 			goto out;
 		}
 		client = svc_rpc_gss_create_client();
+		if (client == NULL) {
+			result = AUTH_REJECTEDCRED;
+			goto out;
+		}
 	} else {
 		struct svc_rpc_gss_clientid *p;
 		if (gc.gc_handle.length != sizeof(*p)) {

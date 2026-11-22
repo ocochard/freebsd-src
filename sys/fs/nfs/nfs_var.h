@@ -137,6 +137,7 @@ int nfsrv_checkgetattr(struct nfsrv_descript *, vnode_t,
 int nfsrv_nfsuserdport(struct nfsuserd_args *, NFSPROC_T *);
 void nfsrv_nfsuserddelport(void);
 void nfsrv_throwawayallstate(NFSPROC_T *);
+void nfsrv_throwawaydyingstate(NFSPROC_T *);
 int nfsrv_checksequence(struct nfsrv_descript *, uint32_t, uint32_t *,
     uint32_t *, int, uint32_t *, NFSPROC_T *);
 int nfsrv_checkreclaimcomplete(struct nfsrv_descript *, int);
