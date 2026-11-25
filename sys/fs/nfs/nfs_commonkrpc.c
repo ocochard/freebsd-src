@@ -129,6 +129,8 @@ static void	nfs_down(struct nfsmount *, struct thread *, const char *,
 static void	nfs_up(struct nfsmount *, struct thread *, const char *,
     int, int);
 static int	nfs_msg(struct thread *, const char *, const char *, int);
+static struct nfsclsession *nfs_reqsession(struct nfsmount *,
+    struct nfsrv_descript *);
 
 struct nfs_cached_auth {
 	int		ca_refs; /* refcount, including 1 from the cache */
@@ -1093,7 +1095,7 @@ tryagain:
 			 * free'd, threads can get stuck waiting for a slot.
 			 */
 			if (sep == NULL)
-				sep = nfsmnt_mdssession(nmp);
+				sep = nfs_reqsession(nmp, nd);
 			/*
 			 * Bump the sequence# out of range, so that reuse of
 			 * this slot will result in an NFSERR_SEQMISORDERED
@@ -1123,7 +1125,7 @@ tryagain:
 			 * Free the slot, resetting the slot's sequence#.
 			 */
 			if (sep == NULL)
-				sep = nfsmnt_mdssession(nmp);
+				sep = nfs_reqsession(nmp, nd);
 			nfsv4_freeslot(sep, nd->nd_slotid, true);
 		}
 		NFSINCRGLOBAL(nfsstatsv1.rpcinvalid);
@@ -1160,7 +1162,7 @@ tryagain:
 	    nd->nd_procnum != NFSV4PROC_CBNULL) {
 		/* If sep == NULL, set it to the default in nmp. */
 		if (sep == NULL && nmp != NULL)
-			sep = nfsmnt_mdssession(nmp);
+			sep = nfs_reqsession(nmp, nd);
 		/*
 		 * and now the actual NFS xdr.
 		 */
@@ -1382,6 +1384,8 @@ tryagain:
 						*tl = txdr_unsigned(maxslot);
 						nd->nd_slotid = slotpos;
 						nd->nd_flag |= ND_HASSLOTID;
+						if ((nd->nd_flag & ND_MDSSESS) != 0)
+							nd->nd_sep = sep;
 					}
 					if (reterr == NFSERR_BADSESSION ||
 					    reterr == 0) {
@@ -1561,6 +1565,19 @@ nfsmout:
 	if (set_sigset)
 		newnfs_restore_sigmask(td, &oldset);
 	return (error);
+}
+
+/*
+ * The MDS session that the slot of an RPC belongs to.  After a recovery
+ * replaced the MDS session, it is not the current one.
+ */
+static struct nfsclsession *
+nfs_reqsession(struct nfsmount *nmp, struct nfsrv_descript *nd)
+{
+
+	if ((nd->nd_flag & ND_MDSSESS) != 0)
+		return (nd->nd_sep);
+	return (nfsmnt_mdssession(nmp));
 }
 
 /*

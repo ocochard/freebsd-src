@@ -455,6 +455,8 @@ nfscl_reqstart(struct nfsrv_descript *nd, int procnum, struct nfsmount *nmp,
 			*tl = txdr_unsigned(NFSV4OP_SEQUENCE);
 			if (sep == NULL) {
 				sep = nfsmnt_mdssession(nmp);
+				nd->nd_sep = sep;
+				nd->nd_flag |= ND_MDSSESS;
 				/*
 				 * For MDS mount sessions, check for bad
 				 * slots.  If the caller does not want this

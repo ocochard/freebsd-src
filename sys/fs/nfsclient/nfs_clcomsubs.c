@@ -456,6 +456,8 @@ nfsv4_freeunsentslot(struct nfsmount *nmp, struct nfsclsession *sep,
 	if (nmp == NULL || (nd->nd_flag & (ND_NFSV41 | ND_HASSLOTID)) !=
 	    (ND_NFSV41 | ND_HASSLOTID))
 		return;
+	if (sep == NULL && (nd->nd_flag & ND_MDSSESS) != 0)
+		sep = nd->nd_sep;
 	if (sep == NULL)
 		sep = nfsmnt_mdssession(nmp);
 	if (sep != NULL)
